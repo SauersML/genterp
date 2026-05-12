@@ -7,12 +7,12 @@ dependencies = [
   "torch>=2.4",
   "einops>=0.8",
   "numpy>=1.26",
+  "polars>=1.0",
+  "pyarrow>=15",
   "transformers>=4.46",
   "accelerate>=1.0",
   "datasets>=3.0",
-  "meds-reader>=0.1.10",
-  "meds>=0.3.3",
-  "google-cloud-bigquery>=3.25",
+  "google-cloud-bigquery[bqstorage]>=3.25",
   "pytest>=8",
 ]
 
