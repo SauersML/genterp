@@ -1,4 +1,3 @@
-from genterp.crosscoder import CrosscoderConfig, MultiLayerCrosscoder, harvest_activations
 from genterp.modeling import (
     AncestorEmbedding,
     Genterp,
@@ -6,14 +5,15 @@ from genterp.modeling import (
     GompertzRoPE,
     SetTransformer,
 )
+from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts
 
 __all__ = [
     "AncestorEmbedding",
-    "CrosscoderConfig",
+    "CLTConfig",
+    "CrossLayerTranscoder",
     "Genterp",
     "GenterpConfig",
     "GompertzRoPE",
-    "MultiLayerCrosscoder",
     "SetTransformer",
-    "harvest_activations",
+    "harvest_transcoder_acts",
 ]

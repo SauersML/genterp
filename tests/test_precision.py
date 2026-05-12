@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from genterp import CrosscoderConfig, Genterp, MultiLayerCrosscoder, harvest_activations
+from genterp import CLTConfig, CrossLayerTranscoder, Genterp, harvest_transcoder_acts
 from tests._factories import make_batch, tiny_config
 
 
@@ -31,25 +31,25 @@ def test_cpu_fp32_bf16_consistency():
     assert drift < 2.0 and rel < 0.5, f"unexpected fp32↔bf16 drift {drift} (rel {rel})"
 
 
-def test_crosscoder_under_bf16():
+def test_clt_under_bf16():
     cfg = tiny_config()
     model = Genterp(cfg).eval()
     for p in model.parameters():
         p.requires_grad_(False)
     batch = make_batch(n_atoms=cfg.n_atoms)
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        acts = harvest_activations(model, batch)
-    assert torch.isfinite(acts).all()
+        pre_mlp, mlp_out = harvest_transcoder_acts(model, batch)
+    assert torch.isfinite(pre_mlp).all() and torch.isfinite(mlp_out).all()
 
-    cc = MultiLayerCrosscoder(CrosscoderConfig(n_layers=acts.shape[1], dim=acts.shape[2], n_features=64, l1_coef=1e-3))
-    opt = torch.optim.Adam(cc.parameters(), lr=5e-3)
-    init = cc.loss(acts)["recon"].item()
-    for _ in range(30):
-        out = cc.loss(acts)
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=pre_mlp.shape[1], dim=pre_mlp.shape[2], n_features=64, l0_coef=1e-3))
+    opt = torch.optim.Adam(clt.parameters(), lr=5e-3)
+    init = clt.loss(pre_mlp, mlp_out)["recon"].item()
+    for _ in range(50):
+        out = clt.loss(pre_mlp, mlp_out)
         opt.zero_grad()
         out["loss"].backward()
         opt.step()
-    assert cc.loss(acts)["recon"].item() < init
+    assert clt.loss(pre_mlp, mlp_out)["recon"].item() < init
 
 
 def test_cuda_bf16():

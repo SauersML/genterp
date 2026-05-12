@@ -116,9 +116,11 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, mlp_mult)
 
-    def forward(self, x: torch.Tensor, angles: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, angles: torch.Tensor, attn_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (post_block_residual, pre_mlp_residual, mlp_additive_output)."""
         x = x + self.attn(self.norm1(x), angles, attn_mask)
-        return x + self.mlp(self.norm2(x))
+        mlp_out = self.mlp(self.norm2(x))
+        return x + mlp_out, x, mlp_out
 
 
 class _MAB(nn.Module):
@@ -234,7 +236,7 @@ class Genterp(nn.Module):
         event_ages: torch.Tensor,
         event_pad: torch.Tensor,
         sex: torch.Tensor,
-        return_hidden_states: bool = False,
+        return_transcoder_acts: bool = False,
     ):
         B, M = static_shape
         T = event_ages.shape[1]
@@ -251,13 +253,15 @@ class Genterp(nn.Module):
         angles = self.rope.angles(ages_full, beta, is_static)
         mask = self._attn_mask(K, T, event_pad, device)
 
-        hiddens: list[torch.Tensor] = []
+        pre_mlps: list[torch.Tensor] = []
+        mlp_outs: list[torch.Tensor] = []
         for blk in self.blocks:
-            x = blk(x, angles, mask)
-            if return_hidden_states:
-                hiddens.append(x[:, K:])
+            x, pre_mlp, mlp_out = blk(x, angles, mask)
+            if return_transcoder_acts:
+                pre_mlps.append(pre_mlp[:, K:])
+                mlp_outs.append(mlp_out[:, K:])
 
         logits = self.head(self.norm(x[:, K:]))
-        if return_hidden_states:
-            return logits, torch.stack(hiddens, dim=1)
+        if return_transcoder_acts:
+            return logits, torch.stack(pre_mlps, dim=1), torch.stack(mlp_outs, dim=1)
         return logits

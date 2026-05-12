@@ -29,13 +29,15 @@ def test_forward_backward():
     assert grad_norm > 0
 
 
-def test_hidden_states():
+def test_transcoder_acts():
     cfg = tiny_config()
     model = Genterp(cfg)
     batch = make_batch(n_atoms=cfg.n_atoms)
 
-    logits, hidden = model(**batch, return_hidden_states=True)
+    logits, pre_mlp, mlp_out = model(**batch, return_transcoder_acts=True)
     B, T = batch["event_ages"].shape
-    assert hidden.shape == (B, cfg.n_layers, T, cfg.dim)
-    assert torch.isfinite(hidden).all()
+    assert pre_mlp.shape == (B, cfg.n_layers, T, cfg.dim)
+    assert mlp_out.shape == (B, cfg.n_layers, T, cfg.dim)
+    assert torch.isfinite(pre_mlp).all()
+    assert torch.isfinite(mlp_out).all()
     assert logits.shape == (B, T, cfg.n_atoms)
