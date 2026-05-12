@@ -23,6 +23,7 @@ def test_collate_shapes_and_targets():
             "static_bags": [[7, 11], [13]],
             "event_bags": [[21, 22], [23], [24, 25, 26]],
             "event_ages": np.array([100.0, 200.0, 365.25 * 20], dtype=np.float32),
+            "event_values": np.array([1.5, np.nan, -2.0], dtype=np.float32),
             "censor_age_days": 30000.0,
         },
         {
@@ -30,6 +31,7 @@ def test_collate_shapes_and_targets():
             "static_bags": [[31]],
             "event_bags": [[41]],
             "event_ages": np.array([50.0], dtype=np.float32),
+            "event_values": np.array([0.25], dtype=np.float32),
             "censor_age_days": 25000.0,
         },
     ]
@@ -38,6 +40,9 @@ def test_collate_shapes_and_targets():
     assert out["static_shape"] == (2, 2)
     assert out["event_ages"].shape == (2, 3)
     assert out["target_atoms"].tolist() == [[21, 23, 24], [41, 0, 0]]
+    assert torch.allclose(out["event_values"][0], torch.tensor([1.5, torch.nan, -2.0]), equal_nan=True)
+    assert out["event_values"][1, 0].item() == 0.25
+    assert torch.isnan(out["event_values"][1, 1:]).all()
     assert out["event_pad"].tolist() == [[False, False, False], [False, True, True]]
     assert out["static_pad"][:, 0].tolist() == [False, False]
     assert out["sex"].tolist() == [1, 0]
@@ -51,6 +56,7 @@ def test_collate_empty_static_is_nan_safe():
             "static_bags": [],
             "event_bags": [[1]],
             "event_ages": np.array([10.0], dtype=np.float32),
+            "event_values": np.array([np.nan], dtype=np.float32),
             "censor_age_days": 100.0,
         }
     ]

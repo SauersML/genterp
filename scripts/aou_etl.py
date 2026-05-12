@@ -14,20 +14,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from genterp.vocab import collapse_vocabulary  # noqa: E402
-
-import numpy as np  # noqa: E402
 import polars as pl  # noqa: E402
 from google.cloud import bigquery  # noqa: E402
 
+from genterp.vocab import collapse_vocabulary  # noqa: E402
 
 THRESHOLD = 500
-N_QUANTILES = 10
 
 NON_DRUG_TABLES = [
     ("condition_occurrence", "condition_concept_id", "condition_start_datetime"),
@@ -36,6 +35,37 @@ NON_DRUG_TABLES = [
     ("visit_occurrence", "visit_concept_id", "visit_start_datetime"),
     ("device_exposure", "device_concept_id", "device_exposure_start_datetime"),
 ]
+
+
+def _cache_key(cdr: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
+    return f"{key}_threshold-{THRESHOLD}_values-v2"
+
+
+def _write_json(path: Path, data: object) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFrame:
+    if path.exists():
+        return pl.read_parquet(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = build()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    data.write_parquet(tmp)
+    tmp.replace(path)
+    return data
+
+
+def _cache_json(path: Path, build: Callable[[], object]) -> object:
+    if path.exists():
+        return json.loads(path.read_text())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = build()
+    _write_json(path, data)
+    return data
 
 
 def _non_drug_events_cte(cdr: str, with_time: bool) -> str:
@@ -55,7 +85,8 @@ def _drug_events_arrow(client: bigquery.Client, cdr: str):
       CAST(de.person_id AS INT64) AS subject_id,
       UNIX_SECONDS(de.drug_exposure_start_datetime) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
-      ds.ingredient_concept_id AS cid
+      ds.ingredient_concept_id AS cid,
+      CAST(NULL AS FLOAT64) AS value
     FROM `{cdr}.drug_exposure` de
     JOIN `{cdr}.drug_strength` ds ON ds.drug_concept_id = de.drug_concept_id
     JOIN `{cdr}.concept` c ON c.concept_id = ds.ingredient_concept_id
@@ -73,7 +104,8 @@ def _non_drug_events_arrow(client: bigquery.Client, cdr: str):
       CAST(events.person_id AS INT64) AS subject_id,
       UNIX_SECONDS(events.t) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
-      events.cid AS cid
+      events.cid AS cid,
+      CAST(NULL AS FLOAT64) AS value
     FROM events JOIN `{cdr}.concept` c ON c.concept_id = events.cid
     """
     return client.query(sql).to_arrow()
@@ -140,57 +172,76 @@ def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int
     return {int(r["concept_id"]): f"{r['vocabulary_id']}/{r['concept_code']}" for r in rows}
 
 
-def _bucket_measurements(meas: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, list[float]]]:
-    """Replace measurement codes with VOCAB/CODE@Q{n}. Returns (transformed events, per-code quantile edges)."""
-    with_value = meas.filter(pl.col("value").is_not_null())
-    edges_by_code: dict[str, list[float]] = {}
-    parts = []
-    for code, group in with_value.group_by("code"):
-        code_str = code[0] if isinstance(code, tuple) else code
-        vals = group["value"].to_numpy()
-        vals = vals[np.isfinite(vals)]
-        if len(vals) < THRESHOLD:
-            continue
-        edges = np.quantile(vals, np.linspace(0, 1, N_QUANTILES + 1)).tolist()
-        edges_by_code[code_str] = edges
-        inner = np.asarray(edges[1:-1])
-        bins = np.searchsorted(inner, group["value"].to_numpy(), side="right")
-        parts.append(group.with_columns(
-            (pl.lit(code_str) + "@Q" + pl.Series(bins, dtype=pl.Int32).cast(pl.Utf8)).alias("code")
-        ))
-    bucketed = pl.concat(parts) if parts else with_value.head(0)
-    no_value = meas.filter(pl.col("value").is_null())
-    out = pl.concat([
-        bucketed.select(["subject_id", "time_seconds", "code"]),
-        no_value.select(["subject_id", "time_seconds", "code"]),
-    ])
-    return out, edges_by_code
+def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: str, cohort_ids: list[int], cache_dir: Path):
+    def build() -> dict[str, list]:
+        coverage, ancestors = _coverage_and_ancestors(client(), cdr, cohort_ids)
+        return {
+            "coverage": [[cid, count] for cid, count in sorted(coverage.items())],
+            "ancestors": [
+                [desc, [[anc, hops] for anc, hops in sorted(desc_ancestors.items())]]
+                for desc, desc_ancestors in sorted(ancestors.items())
+            ],
+        }
+
+    payload = _cache_json(
+        cache_dir / "coverage_and_ancestors.json",
+        build,
+    )
+    return (
+        {int(cid): int(count) for cid, count in payload["coverage"]},
+        {
+            int(desc): {int(anc): int(hops) for anc, hops in ancestors}
+            for desc, ancestors in payload["ancestors"]
+        },
+    )
+
+
+def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: set[int], cache_dir: Path) -> dict[int, str]:
+    path = cache_dir / "concept_codes.json"
+    cached = {int(cid): str(code) for cid, code in json.loads(path.read_text())} if path.exists() else {}
+    missing = ids - set(cached)
+    if not missing:
+        return cached
+
+    cached.update(_concept_codes(client(), cdr, missing))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, [[cid, code] for cid, code in sorted(cached.items())])
+    return cached
 
 
 def main() -> None:
     cdr = os.environ["WORKSPACE_CDR"]
     out_dir = Path.home() / "genterp" / "etl"
     out_dir.mkdir(parents=True, exist_ok=True)
-    client = bigquery.Client()
+    cache_dir = out_dir / "cache" / _cache_key(cdr)
+    client_instance: bigquery.Client | None = None
 
-    non_drug = pl.from_arrow(_non_drug_events_arrow(client, cdr))
-    drug = pl.from_arrow(_drug_events_arrow(client, cdr))
-    meas_raw = pl.from_arrow(_measurement_events_arrow(client, cdr))
-    meas, q_edges = _bucket_measurements(meas_raw)
+    def client() -> bigquery.Client:
+        nonlocal client_instance
+        if client_instance is None:
+            client_instance = bigquery.Client()
+        return client_instance
 
-    events_all = pl.concat([
-        non_drug.select(["subject_id", "time_seconds", "code", "cid"]),
-        drug.select(["subject_id", "time_seconds", "code", "cid"]),
-        meas_raw.select(["subject_id", "time_seconds", "code", "cid"]),
-    ])
+    non_drug = _cache_parquet(cache_dir / "non_drug_events.parquet", lambda: pl.from_arrow(_non_drug_events_arrow(client(), cdr)))
+    drug = _cache_parquet(cache_dir / "drug_events.parquet", lambda: pl.from_arrow(_drug_events_arrow(client(), cdr)))
+    meas = _cache_parquet(cache_dir / "measurement_events.parquet", lambda: pl.from_arrow(_measurement_events_arrow(client(), cdr)))
+
+    events_all = _cache_parquet(
+        cache_dir / "all_source_events.parquet",
+        lambda: pl.concat([
+            non_drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
+            drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
+            meas.select(["subject_id", "time_seconds", "code", "cid", "value"]),
+        ]),
+    )
     own_by_cid = {
         int(r["cid"]): int(r["n"])
         for r in events_all.group_by("cid").agg(pl.col("subject_id").n_unique().alias("n")).iter_rows(named=True)
     }
-    cov, anc = _coverage_and_ancestors(client, cdr, list(own_by_cid))
+    cov, anc = _cached_coverage_and_ancestors(client, cdr, list(own_by_cid), cache_dir)
 
     all_ids = set(own_by_cid) | set(cov) | {a for d in anc.values() for a in d}
-    code_of = _concept_codes(client, cdr, all_ids)
+    code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
     own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
     cov_by_code = {code_of[c]: n for c, n in cov.items() if c in code_of}
     anc_by_code = {
@@ -198,49 +249,59 @@ def main() -> None:
         for d, ancs in anc.items() if d in code_of
     }
 
-    quantile_own = (
-        meas.filter(pl.col("code").str.contains("@Q"))
-        .group_by("code").agg(pl.col("subject_id").n_unique().alias("n"))
-    )
-    for r in quantile_own.iter_rows(named=True):
-        qtoken = r["code"]
-        bare = qtoken.split("@Q")[0]
-        own_by_code[qtoken] = int(r["n"])
-        cov_by_code[qtoken] = int(r["n"])
-        if bare in anc_by_code:
-            anc_by_code[qtoken] = {bare: 1, **{a: h + 1 for a, h in anc_by_code[bare].items()}}
-
     atom_idx, ancestor_codes = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
-    (out_dir / "vocab.json").write_text(json.dumps(atom_idx, indent=2, sort_keys=True))
-    (out_dir / "ancestors.json").write_text(json.dumps(ancestor_codes, indent=2, sort_keys=True))
-    (out_dir / "measurement_quantiles.json").write_text(json.dumps(q_edges, indent=2, sort_keys=True))
+    _write_json(out_dir / "vocab.json", atom_idx)
+    _write_json(out_dir / "ancestors.json", ancestor_codes)
 
-    final_events = pl.concat([
-        non_drug.select(["subject_id", "time_seconds", "code"]),
-        drug.select(["subject_id", "time_seconds", "code"]),
-        meas,
-    ])
-    final_events = final_events.filter(pl.col("code").is_in(set(atom_idx.keys()))).sort(["subject_id", "time_seconds"])
+    stats_df = (
+        events_all.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
+        .group_by("code")
+        .agg(
+            pl.col("value").mean().alias("mu"),
+            pl.col("value").std().alias("sigma"),
+            pl.len().alias("n"),
+        )
+        .filter(pl.col("n") >= THRESHOLD)
+    )
+    stats = {
+        r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
+        for r in stats_df.iter_rows(named=True)
+        if r["code"] in atom_idx
+    }
+    _write_json(out_dir / "value_stats.json", stats)
+
+    final_events = _cache_parquet(
+        cache_dir / "events.parquet",
+        lambda: events_all.select(["subject_id", "time_seconds", "code", "value"])
+        .filter(pl.col("code").is_in(set(atom_idx.keys())))
+        .sort(["subject_id", "time_seconds"]),
+    )
     final_events.write_parquet(out_dir / "events.parquet")
 
-    persons = pl.from_arrow(
-        client.query(
-            f"""SELECT
-              CAST(person_id AS INT64) AS subject_id,
-              IF(gender_concept_id = 8507, 1, 0) AS sex,
-              UNIX_SECONDS(COALESCE(
-                birth_datetime,
-                TIMESTAMP(DATE(year_of_birth, COALESCE(month_of_birth, 1), COALESCE(day_of_birth, 1)))
-              )) AS birth_seconds
-            FROM `{cdr}.person`"""
-        ).to_arrow()
+    persons = _cache_parquet(
+        cache_dir / "persons.parquet",
+        lambda: pl.from_arrow(
+            client().query(
+                f"""SELECT
+                  CAST(person_id AS INT64) AS subject_id,
+                  IF(gender_concept_id = 8507, 1, 0) AS sex,
+                  UNIX_SECONDS(COALESCE(
+                    birth_datetime,
+                    TIMESTAMP(DATE(year_of_birth, COALESCE(month_of_birth, 1), COALESCE(day_of_birth, 1)))
+                  )) AS birth_seconds
+                FROM `{cdr}.person`"""
+            ).to_arrow()
+        ),
     )
-    censor = pl.from_arrow(
-        client.query(
-            f"""SELECT CAST(person_id AS INT64) AS subject_id,
-                       UNIX_SECONDS(TIMESTAMP(MAX(observation_period_end_date))) AS censor_seconds
-                FROM `{cdr}.observation_period` GROUP BY person_id"""
-        ).to_arrow()
+    censor = _cache_parquet(
+        cache_dir / "censor.parquet",
+        lambda: pl.from_arrow(
+            client().query(
+                f"""SELECT CAST(person_id AS INT64) AS subject_id,
+                           UNIX_SECONDS(TIMESTAMP(MAX(observation_period_end_date))) AS censor_seconds
+                    FROM `{cdr}.observation_period` GROUP BY person_id"""
+            ).to_arrow()
+        ),
     )
 
     offsets = final_events.with_row_index("row").group_by("subject_id", maintain_order=True).agg(
@@ -252,13 +313,14 @@ def main() -> None:
         .join(censor, on="subject_id", how="inner")
         .sort("subject_id")
     )
+    _cache_parquet(cache_dir / "subjects.parquet", lambda: subjects)
     subjects.write_parquet(out_dir / "subjects.parquet")
 
     print(
         f"vocab={len(set(atom_idx.values())):,}  "
         f"events={final_events.height:,}  "
         f"subjects={subjects.height:,}  "
-        f"measurement_concepts_with_quantiles={len(q_edges):,}  "
+        f"magnitude_atoms={len(stats):,}  "
         f"-> {out_dir}"
     )
 

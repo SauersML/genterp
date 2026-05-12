@@ -179,6 +179,88 @@ class AncestorEmbedding(nn.Module):
         return self.bag(atoms, offsets)
 
 
+def _log1p_signed(z: torch.Tensor) -> torch.Tensor:
+    return z.sign() * torch.log1p(z.abs())
+
+
+class ValueModulator(nn.Module):
+    """Per-event multiplicative value modulation.
+
+      e_token = e_concept * (tanh(MLP(log1p_signed(z))) if has_magnitude else 1)
+
+    where z = (value - μ[leaf_atom]) / σ[leaf_atom] and has_magnitude is a per-
+    event mask derived from the atom-level flag AND value-finiteness. (μ, σ,
+    atom_has_mag) are populated from the ETL stats file before training. Last-
+    layer bias = 2 → tanh ≈ 0.96 at init so magnitude events start near identity
+    multiplication and the value MLP learns the modulation pattern from there.
+    """
+
+    def __init__(self, dim: int, n_atoms: int, hidden: int = 64):
+        super().__init__()
+        self.value_mlp = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+        nn.init.normal_(self.value_mlp[-1].weight, std=0.02)
+        nn.init.constant_(self.value_mlp[-1].bias, 2.0)
+        self.register_buffer("value_mu", torch.zeros(n_atoms))
+        self.register_buffer("value_sigma", torch.ones(n_atoms))
+        self.register_buffer("atom_has_mag", torch.zeros(n_atoms, dtype=torch.bool))
+
+    @torch.no_grad()
+    def set_stats(self, value_mu: torch.Tensor, value_sigma: torch.Tensor, atom_has_mag: torch.Tensor) -> None:
+        self.value_mu.copy_(value_mu.to(self.value_mu.dtype))
+        self.value_sigma.copy_(value_sigma.to(self.value_sigma.dtype).clamp(min=1e-6))
+        self.atom_has_mag.copy_(atom_has_mag.to(torch.bool))
+
+    def event_has_magnitude(self, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return self.atom_has_mag[leaf_atom] & torch.isfinite(value)
+
+    def z_score(self, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        mu = self.value_mu[leaf_atom]
+        sigma = self.value_sigma[leaf_atom].clamp(min=1e-6)
+        z = (value.float() - mu) / sigma
+        z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+        return _log1p_signed(z)
+
+    def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        has_mag = self.event_has_magnitude(leaf_atom, value)
+        if not has_mag.any():
+            return e_concept
+
+        out = e_concept.clone()
+        x = self.z_score(leaf_atom[has_mag], value[has_mag]).unsqueeze(-1)
+        modulation = torch.tanh(self.value_mlp(x)).to(e_concept.dtype)
+        out[has_mag] = e_concept[has_mag] * modulation
+        return out
+
+
+class ValueHead(nn.Module):
+    """Gaussian over log1p-signed z, conditioned on (hidden, predicted-leaf-atom embedding)."""
+
+    def __init__(self, dim: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 2),
+        )
+
+    def params(self, hidden: torch.Tensor, concept_emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mu, log_sigma = self.net(torch.cat([hidden, concept_emb], dim=-1)).chunk(2, dim=-1)
+        return mu.squeeze(-1), log_sigma.squeeze(-1).clamp(-5.0, 5.0)
+
+    def nll(self, hidden: torch.Tensor, concept_emb: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
+        mu, log_sigma = self.params(hidden, concept_emb)
+        return 0.5 * ((z_target - mu) * (-log_sigma).exp()).pow(2) + log_sigma + 0.5 * math.log(2 * math.pi)
+
+    @torch.no_grad()
+    def sample(self, hidden: torch.Tensor, concept_emb: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        mu, log_sigma = self.params(hidden, concept_emb)
+        return mu + log_sigma.exp() * torch.randn(mu.shape, device=mu.device, dtype=mu.dtype, generator=generator)
+
+
 class MarkedTPPHead(nn.Module):
     """Marked temporal point process: log-normal mixture for Δt, conditional softmax mark|Δt.
 
@@ -255,15 +337,18 @@ class GenterpConfig:
     n_time_mix: int = 8
     mark_rank: int = 64
     time_phi_dim: int = 32
+    value_mlp_hidden: int = 64
+    value_head_hidden: int = 64
 
 
 class Genterp(nn.Module):
-    """Clinical FM: ancestor-bag tokens, Set-Transformer static prefix, Gompertz two-band RoPE, marked-TPP head."""
+    """Clinical FM: ancestor-bag tokens, value-modulated, Set-Transformer static prefix, Gompertz two-band RoPE, marked-TPP head, gaussian value head."""
 
     def __init__(self, cfg: GenterpConfig):
         super().__init__()
         self.cfg = cfg
         self.embed = AncestorEmbedding(cfg.n_atoms, cfg.dim, padding_idx=cfg.pad_atom_idx)
+        self.value_mod = ValueModulator(cfg.dim, cfg.n_atoms, cfg.value_mlp_hidden)
         self.static_encoder = SetTransformer(cfg.dim, cfg.n_heads, cfg.n_static_blocks, cfg.k_static_summary, cfg.mlp_mult)
         self.rope = GompertzRoPE(cfg.dim // cfg.n_heads)
         self.blocks = nn.ModuleList(
@@ -271,6 +356,7 @@ class Genterp(nn.Module):
         )
         self.norm = RMSNorm(cfg.dim)
         self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, cfg.n_time_mix, cfg.mark_rank, cfg.time_phi_dim)
+        self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
         self.register_buffer("_beta_by_sex", torch.tensor([GM_BETA_FEMALE, GM_BETA_MALE]), persistent=False)
 
     def _embed(self, atoms: torch.Tensor, offsets: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
@@ -300,6 +386,8 @@ class Genterp(nn.Module):
         event_ages: torch.Tensor,
         event_pad: torch.Tensor,
         sex: torch.Tensor,
+        target_atoms: torch.Tensor,
+        event_values: torch.Tensor,
         return_transcoder_acts: bool = False,
         **_unused,
     ) -> dict[str, torch.Tensor]:
@@ -310,6 +398,7 @@ class Genterp(nn.Module):
 
         summary = self.static_encoder(self._embed(static_atoms, static_offsets, (B, M)), static_pad)
         events = self._embed(event_atoms, event_offsets, (B, T))
+        events = self.value_mod(events, target_atoms, event_values)
         x = torch.cat([summary, events], dim=1)
 
         beta = self._beta_by_sex[sex]
@@ -339,55 +428,118 @@ class Genterp(nn.Module):
         target_atoms: torch.Tensor,
         event_pad: torch.Tensor,
         censor_age: torch.Tensor,
+        event_values: torch.Tensor,
         **batch,
     ) -> dict[str, torch.Tensor]:
-        out = self.forward(event_ages=event_ages, event_pad=event_pad, **batch)
-        return marked_tpp_loss(self.tpp, out["hidden"], event_ages, target_atoms, event_pad, censor_age)
+        out = self.forward(
+            event_ages=event_ages,
+            event_pad=event_pad,
+            target_atoms=target_atoms,
+            event_values=event_values,
+            **batch,
+        )
+        return marked_tpp_value_loss(
+            self.tpp,
+            self.value_mod,
+            self.value_head,
+            self.embed.bag.weight,
+            out["hidden"],
+            event_ages,
+            target_atoms,
+            event_values,
+            event_pad,
+            censor_age,
+        )
 
 
-def marked_tpp_loss(
+def marked_tpp_value_loss(
     tpp: MarkedTPPHead,
+    value_mod: ValueModulator,
+    value_head: ValueHead,
+    atom_embedding: torch.Tensor,
     hidden: torch.Tensor,
     event_ages: torch.Tensor,
     target_atoms: torch.Tensor,
+    event_values: torch.Tensor,
     event_pad: torch.Tensor,
     censor_age: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Joint marked-TPP NLL with right-censoring.
+    """Joint NLL: marked-TPP (time + mark) + value (z-space gaussian) + right-censoring.
 
-    Real next event at position t: -log p(Δt|h_t) - log p(m|h_t, Δt)
-    Censoring (no event in [last_event, censor_age]): -log S(Δt_c|h_last)
+    Real next event at t:    -log p(Δt|h_t) - log p(m|h_t, Δt) - has_mag · log p(z|h_t, e_m)
+    Censoring:               -log S(Δt_c|h_last)
     """
     h_pred = hidden[:, :-1]
     delta_real = event_ages[:, 1:] - event_ages[:, :-1]
     delta_censor = censor_age.unsqueeze(-1) - event_ages[:, :-1]
     target_real = target_atoms[:, 1:].clamp(min=0)
+    value_real = event_values[:, 1:]
     real_mask = (~event_pad[:, :-1]) & (~event_pad[:, 1:])
     censor_mask = (~event_pad[:, :-1]) & event_pad[:, 1:]
     any_mask = real_mask | censor_mask
-    if any_mask.sum() == 0:
+    n_real = real_mask.sum()
+    n_censor = censor_mask.sum()
+    n_any = n_real + n_censor
+    if n_any == 0:
         zero = hidden.sum() * 0
-        return {"loss": zero, "time_nll": zero, "mark_nll": zero, "censor_nll": zero, "n_real": torch.tensor(0), "n_censor": torch.tensor(0)}
+        return {
+            "loss": zero, "time_nll": zero, "mark_nll": zero, "value_nll": zero, "censor_nll": zero,
+            "n_real": torch.tensor(0), "n_censor": torch.tensor(0), "n_mag": torch.tensor(0),
+        }
 
-    delta_t = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)
+    delta_any = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)[any_mask]
+    log_w, mu, log_sigma = tpp.time_params(h_pred[any_mask])
+    log_dt = delta_any.log().unsqueeze(-1)
+    inv_sigma = (-log_sigma).exp()
+    log_pdf = -log_dt - log_sigma - 0.5 * math.log(2 * math.pi) - 0.5 * ((log_dt - mu) * inv_sigma).pow(2)
+    time_lp = torch.logsumexp(log_w + log_pdf, dim=-1)
+    z = (log_dt - mu) * inv_sigma
+    time_ls = torch.logsumexp(log_w + torch.special.log_ndtr(-z), dim=-1)
 
-    time_lp = tpp.time_log_prob(h_pred, delta_t)
-    time_ls = tpp.time_log_survival(h_pred, delta_t)
-    mark_lp = tpp.mark_log_probs(h_pred, delta_t).gather(-1, target_real.unsqueeze(-1)).squeeze(-1)
+    real_any = real_mask[any_mask]
+    real_time_lp = time_lp[real_any]
+    censor_time_ls = time_ls[~real_any]
 
-    time_nll = (-time_lp).masked_fill(~real_mask, 0.0).sum() / real_mask.sum().clamp(min=1)
-    mark_nll = (-mark_lp).masked_fill(~real_mask, 0.0).sum() / real_mask.sum().clamp(min=1)
-    censor_nll = (-time_ls).masked_fill(~censor_mask, 0.0).sum() / censor_mask.sum().clamp(min=1)
+    mag_mask = real_mask & value_mod.event_has_magnitude(target_real, value_real)
+    n_mag = mag_mask.sum()
 
-    real_term = (-(time_lp + mark_lp)).masked_fill(~real_mask, 0.0)
-    censor_term = (-time_ls).masked_fill(~censor_mask, 0.0)
-    total = (real_term + censor_term).sum() / any_mask.sum()
+    if n_real > 0:
+        delta_mark = delta_real.clamp(min=1e-6)[real_mask]
+        mark_lp = (
+            tpp.mark_log_probs(h_pred[real_mask], delta_mark)
+            .gather(-1, target_real[real_mask].unsqueeze(-1))
+            .squeeze(-1)
+        )
+        mark_nll = -mark_lp.sum() / n_real
+        mark_loss = -mark_lp.sum()
+    else:
+        mark_nll = hidden.sum() * 0
+        mark_loss = mark_nll
+
+    if n_mag > 0:
+        h_mag = h_pred[mag_mask]
+        leaf_mag = target_real[mag_mask]
+        val_mag = value_real[mag_mask]
+        z_target = value_mod.z_score(leaf_mag, val_mag)
+        concept_emb = atom_embedding[leaf_mag]
+        value_nll_tokens = value_head.nll(h_mag, concept_emb, z_target)
+        value_nll = value_nll_tokens.sum() / n_mag
+        value_loss = value_nll_tokens.sum()
+    else:
+        value_nll = hidden.sum() * 0
+        value_loss = value_nll
+
+    time_nll = -real_time_lp.sum() / n_real.clamp(min=1)
+    censor_nll = -censor_time_ls.sum() / n_censor.clamp(min=1)
+    total = (-real_time_lp.sum() + mark_loss + value_loss - censor_time_ls.sum()) / n_any
 
     return {
         "loss": total,
         "time_nll": time_nll,
         "mark_nll": mark_nll,
+        "value_nll": value_nll,
         "censor_nll": censor_nll,
-        "n_real": real_mask.sum(),
-        "n_censor": censor_mask.sum(),
+        "n_real": n_real,
+        "n_censor": n_censor,
+        "n_mag": n_mag,
     }

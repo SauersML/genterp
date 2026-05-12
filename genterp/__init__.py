@@ -5,7 +5,9 @@ from genterp.modeling import (
     GompertzRoPE,
     MarkedTPPHead,
     SetTransformer,
-    marked_tpp_loss,
+    ValueHead,
+    ValueModulator,
+    marked_tpp_value_loss,
 )
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts
 
@@ -18,6 +20,8 @@ __all__ = [
     "GompertzRoPE",
     "MarkedTPPHead",
     "SetTransformer",
+    "ValueHead",
+    "ValueModulator",
     "harvest_transcoder_acts",
-    "marked_tpp_loss",
+    "marked_tpp_value_loss",
 ]

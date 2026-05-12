@@ -57,7 +57,10 @@ class CohortDataset(Dataset):
 
     def __init__(self, data_dir: str | Path, ancestors: AncestorMap, max_events: int = 4096):
         data_dir = Path(data_dir)
-        self.events = pq.read_table(data_dir / "events.parquet", memory_map=True)
+        events = pq.read_table(data_dir / "events.parquet", columns=["time_seconds", "code", "value"], memory_map=True)
+        self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
+        self.event_codes = events.column("code").to_pylist()
+        self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
         self.start = subjects["start"].to_numpy()
         self.end = subjects["end"].to_numpy()
@@ -72,28 +75,31 @@ class CohortDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         s, e = int(self.start[idx]), int(self.end[idx])
-        slice_ = self.events.slice(s, e - s + 1)
-        times = slice_.column("time_seconds").to_numpy().tolist()
-        codes = slice_.column("code").to_pylist()
+        stop = e + 1
+        times = self.event_times[s:stop]
+        codes = self.event_codes
         birth = float(self.birth_seconds[idx])
+        ancestors = self.ancestors
+        max_events = self.max_events
 
         static_bags: list[list[int]] = []
         event_bags: list[list[int]] = []
         event_ages: list[float] = []
-        for t, code in zip(times, codes):
-            bag = self.ancestors.bag(code)
+        event_values: list[float] = []
+        values = self.event_values
+        for offset, t in enumerate(times, start=s):
+            bag = ancestors.bag(codes[offset])
             if not bag:
                 continue
             delta_days = (t - birth) / 86400.0
             if delta_days <= 0.5:
                 static_bags.append(bag)
-            else:
+            elif len(event_bags) < max_events:
                 event_bags.append(bag)
                 event_ages.append(delta_days)
-
-        if len(event_bags) > self.max_events:
-            event_bags = event_bags[: self.max_events]
-            event_ages = event_ages[: self.max_events]
+                event_values.append(float(values[offset]))
+                if len(event_bags) == max_events:
+                    break
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
@@ -101,6 +107,7 @@ class CohortDataset(Dataset):
             "static_bags": static_bags,
             "event_bags": event_bags,
             "event_ages": np.asarray(event_ages, dtype=np.float32),
+            "event_values": np.asarray(event_values, dtype=np.float32),
             "censor_age_days": float(censor_age_days),
         }
 
@@ -138,6 +145,7 @@ def collate(batch: list[dict]) -> dict:
     static_pad = torch.ones(B, M, dtype=torch.bool)
     event_pad = torch.ones(B, T, dtype=torch.bool)
     event_ages = torch.zeros(B, T, dtype=torch.float32)
+    event_values = torch.full((B, T), float("nan"), dtype=torch.float32)
     target_atoms = torch.zeros(B, T, dtype=torch.long)
     for i, b in enumerate(batch):
         static_pad[i, : len(b["static_bags"])] = False
@@ -145,6 +153,7 @@ def collate(batch: list[dict]) -> dict:
         event_pad[i, :n_ev] = False
         if n_ev:
             event_ages[i, :n_ev] = torch.from_numpy(b["event_ages"])
+            event_values[i, :n_ev] = torch.from_numpy(b["event_values"])
             target_atoms[i, :n_ev] = torch.tensor([bag[0] for bag in b["event_bags"]], dtype=torch.long)
     static_pad[:, 0] = False
 
@@ -157,6 +166,7 @@ def collate(batch: list[dict]) -> dict:
         "event_offsets": event_offsets,
         "event_pad": event_pad,
         "event_ages": event_ages,
+        "event_values": event_values,
         "target_atoms": target_atoms,
         "censor_age": torch.tensor([b["censor_age_days"] for b in batch], dtype=torch.float32),
         "sex": torch.tensor([b["sex"] for b in batch], dtype=torch.long),

@@ -9,9 +9,10 @@ from typing import Any
 
 import torch
 import transformers
+from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AncestorMap, AtomVocab, CohortDataset, collate
-from genterp.modeling import Genterp, GenterpConfig, marked_tpp_loss
+from genterp.modeling import Genterp, GenterpConfig, marked_tpp_value_loss
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -31,14 +32,20 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         self.model = Genterp(GenterpConfig(**config.genterp_cfg))
 
     def forward(self, target_atoms: torch.Tensor | None = None, censor_age: torch.Tensor | None = None, **batch: Any):
-        out = self.model(**batch)
+        if target_atoms is None:
+            raise ValueError("target_atoms is required for value-modulated Genterp forward")
+        out = self.model(target_atoms=target_atoms, **batch)
         loss = None
-        if target_atoms is not None and censor_age is not None:
-            ld = marked_tpp_loss(
+        if censor_age is not None:
+            ld = marked_tpp_value_loss(
                 self.model.tpp,
+                self.model.value_mod,
+                self.model.value_head,
+                self.model.embed.bag.weight,
                 out["hidden"],
                 batch["event_ages"],
                 target_atoms,
+                batch["event_values"],
                 batch["event_pad"],
                 censor_age,
             )
@@ -46,19 +53,45 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         return transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=out["hidden"])
 
 
+def latest_checkpoint(output_dir: str | Path) -> str | None:
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir():
+        return None
+    return get_last_checkpoint(str(output_dir))
+
+
+def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n = len(vocab)
+    mu = torch.zeros(n)
+    sigma = torch.ones(n)
+    has_mag = torch.zeros(n, dtype=torch.bool)
+    if path.exists():
+        for code, s in json.loads(path.read_text()).items():
+            a = vocab.encode(code)
+            if a == 0:
+                continue
+            mu[a] = float(s["mu"])
+            sigma[a] = max(float(s["sigma"]), 1e-6)
+            has_mag[a] = True
+    return mu, sigma, has_mag
+
+
 def main() -> None:
     etl = Path.home() / "genterp" / "etl"
+    output_dir = Path.home() / "genterp" / "runs"
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
     ancestors = AncestorMap.from_omop_concept_ancestor(vocab, json.loads((etl / "ancestors.json").read_text()))
     dataset = CohortDataset(etl, ancestors)
 
     cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
     model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))
+    mu, sigma, has_mag = _load_value_stats(etl / "value_stats.json", vocab)
+    model.model.value_mod.set_stats(mu, sigma, has_mag)
 
     trainer = transformers.Trainer(
         model=model,
         args=transformers.TrainingArguments(
-            output_dir=str(Path.home() / "genterp" / "runs"),
+            output_dir=str(output_dir),
             per_device_train_batch_size=4,
             learning_rate=3e-4,
             warmup_steps=500,
@@ -69,14 +102,17 @@ def main() -> None:
             save_steps=2_000,
             logging_steps=50,
             dataloader_num_workers=4,
+            dataloader_persistent_workers=True,
             remove_unused_columns=False,
             report_to="none",
+            restore_callback_states_from_checkpoint=True,
+            save_safetensors=True,
         ),
         train_dataset=dataset,
         data_collator=collate,
     )
-    trainer.train()
-    trainer.save_model(str(Path.home() / "genterp" / "runs" / "final"))
+    trainer.train(resume_from_checkpoint=latest_checkpoint(output_dir))
+    trainer.save_model(str(output_dir / "final"))
 
 
 if __name__ == "__main__":
