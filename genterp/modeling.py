@@ -179,6 +179,68 @@ class AncestorEmbedding(nn.Module):
         return self.bag(atoms, offsets)
 
 
+class MarkedTPPHead(nn.Module):
+    """Marked temporal point process: log-normal mixture for Δt, conditional softmax mark|Δt.
+
+    p(Δt | h) = Σ_k w_k(h) · LogNormal(Δt; μ_k(h), σ_k(h))
+    p(m  | h, Δt) = softmax(W_out @ (W_h h + W_φ φ(Δt)))
+
+    φ(Δt) is a fixed log-spaced sinusoidal embedding of Δt.
+    """
+
+    def __init__(self, dim: int, n_marks: int, n_mix: int = 8, mark_rank: int = 64, time_dim: int = 32):
+        super().__init__()
+        assert time_dim % 2 == 0
+        self.n_marks = n_marks
+        self.n_mix = n_mix
+        self.time_proj = nn.Linear(dim, 3 * n_mix)
+        self.mark_h_proj = nn.Linear(dim, mark_rank, bias=False)
+        self.mark_time_proj = nn.Linear(time_dim, mark_rank, bias=False)
+        self.mark_out = nn.Linear(mark_rank, n_marks, bias=False)
+        nn.init.normal_(self.mark_h_proj.weight, std=0.02)
+        nn.init.normal_(self.mark_time_proj.weight, std=0.02)
+        nn.init.normal_(self.mark_out.weight, std=0.02)
+        freqs = torch.exp(torch.linspace(math.log(0.01), math.log(100.0), time_dim // 2))
+        self.register_buffer("time_freqs", freqs, persistent=False)
+
+    def _phi(self, delta_t: torch.Tensor) -> torch.Tensor:
+        log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
+        phases = log_dt * self.time_freqs
+        return torch.cat([phases.sin(), phases.cos()], dim=-1)
+
+    def time_params(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        log_w_raw, mu, log_sigma = self.time_proj(hidden).chunk(3, dim=-1)
+        return log_w_raw.log_softmax(dim=-1), mu, log_sigma.clamp(-5.0, 5.0)
+
+    def time_log_prob(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        log_w, mu, log_sigma = self.time_params(hidden)
+        log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
+        log_pdf = -log_dt - log_sigma - 0.5 * math.log(2 * math.pi) - 0.5 * ((log_dt - mu) * (-log_sigma).exp()).pow(2)
+        return torch.logsumexp(log_w + log_pdf, dim=-1)
+
+    def time_log_survival(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        log_w, mu, log_sigma = self.time_params(hidden)
+        log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
+        z = (log_dt - mu) * (-log_sigma).exp()
+        log_surv_per_k = torch.special.log_ndtr(-z)
+        return torch.logsumexp(log_w + log_surv_per_k, dim=-1)
+
+    def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        phi = self._phi(delta_t)
+        return self.mark_out(self.mark_h_proj(hidden) + self.mark_time_proj(phi)).log_softmax(dim=-1)
+
+    @torch.no_grad()
+    def sample(self, hidden: torch.Tensor, generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        log_w, mu, log_sigma = self.time_params(hidden)
+        k = torch.distributions.Categorical(logits=log_w).sample()
+        mu_k = mu.gather(-1, k.unsqueeze(-1)).squeeze(-1)
+        sigma_k = log_sigma.gather(-1, k.unsqueeze(-1)).squeeze(-1).exp()
+        noise = torch.randn(mu_k.shape, generator=generator, device=mu_k.device, dtype=mu_k.dtype)
+        delta_t = (mu_k + sigma_k * noise).exp()
+        mark = torch.distributions.Categorical(logits=self.mark_log_probs(hidden, delta_t)).sample()
+        return delta_t, mark
+
+
 @dataclass
 class GenterpConfig:
     n_atoms: int = 65536
@@ -190,10 +252,13 @@ class GenterpConfig:
     mlp_mult: int = 4
     dropout: float = 0.0
     pad_atom_idx: int = 0
+    n_time_mix: int = 8
+    mark_rank: int = 64
+    time_phi_dim: int = 32
 
 
 class Genterp(nn.Module):
-    """Causal clinical FM: ancestor-bag tokens, Set-Transformer static prefix, Gompertz two-band RoPE."""
+    """Clinical FM: ancestor-bag tokens, Set-Transformer static prefix, Gompertz two-band RoPE, marked-TPP head."""
 
     def __init__(self, cfg: GenterpConfig):
         super().__init__()
@@ -205,8 +270,7 @@ class Genterp(nn.Module):
             Block(cfg.dim, cfg.n_heads, self.rope, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
         )
         self.norm = RMSNorm(cfg.dim)
-        self.head = nn.Linear(cfg.dim, cfg.n_atoms, bias=False)
-        nn.init.normal_(self.head.weight, std=0.02)
+        self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, cfg.n_time_mix, cfg.mark_rank, cfg.time_phi_dim)
         self.register_buffer("_beta_by_sex", torch.tensor([GM_BETA_FEMALE, GM_BETA_MALE]), persistent=False)
 
     def _embed(self, atoms: torch.Tensor, offsets: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
@@ -237,7 +301,8 @@ class Genterp(nn.Module):
         event_pad: torch.Tensor,
         sex: torch.Tensor,
         return_transcoder_acts: bool = False,
-    ):
+        **_unused,
+    ) -> dict[str, torch.Tensor]:
         B, M = static_shape
         T = event_ages.shape[1]
         K = self.cfg.k_static_summary
@@ -261,7 +326,68 @@ class Genterp(nn.Module):
                 pre_mlps.append(pre_mlp[:, K:])
                 mlp_outs.append(mlp_out[:, K:])
 
-        logits = self.head(self.norm(x[:, K:]))
+        hidden = self.norm(x[:, K:])
+        out: dict[str, torch.Tensor] = {"hidden": hidden}
         if return_transcoder_acts:
-            return logits, torch.stack(pre_mlps, dim=1), torch.stack(mlp_outs, dim=1)
-        return logits
+            out["pre_mlp"] = torch.stack(pre_mlps, dim=1)
+            out["mlp_out"] = torch.stack(mlp_outs, dim=1)
+        return out
+
+    def loss(
+        self,
+        event_ages: torch.Tensor,
+        target_atoms: torch.Tensor,
+        event_pad: torch.Tensor,
+        censor_age: torch.Tensor,
+        **batch,
+    ) -> dict[str, torch.Tensor]:
+        out = self.forward(event_ages=event_ages, event_pad=event_pad, **batch)
+        return marked_tpp_loss(self.tpp, out["hidden"], event_ages, target_atoms, event_pad, censor_age)
+
+
+def marked_tpp_loss(
+    tpp: MarkedTPPHead,
+    hidden: torch.Tensor,
+    event_ages: torch.Tensor,
+    target_atoms: torch.Tensor,
+    event_pad: torch.Tensor,
+    censor_age: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Joint marked-TPP NLL with right-censoring.
+
+    Real next event at position t: -log p(Δt|h_t) - log p(m|h_t, Δt)
+    Censoring (no event in [last_event, censor_age]): -log S(Δt_c|h_last)
+    """
+    h_pred = hidden[:, :-1]
+    delta_real = event_ages[:, 1:] - event_ages[:, :-1]
+    delta_censor = censor_age.unsqueeze(-1) - event_ages[:, :-1]
+    target_real = target_atoms[:, 1:].clamp(min=0)
+    real_mask = (~event_pad[:, :-1]) & (~event_pad[:, 1:])
+    censor_mask = (~event_pad[:, :-1]) & event_pad[:, 1:]
+    any_mask = real_mask | censor_mask
+    if any_mask.sum() == 0:
+        zero = hidden.sum() * 0
+        return {"loss": zero, "time_nll": zero, "mark_nll": zero, "censor_nll": zero, "n_real": torch.tensor(0), "n_censor": torch.tensor(0)}
+
+    delta_t = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)
+
+    time_lp = tpp.time_log_prob(h_pred, delta_t)
+    time_ls = tpp.time_log_survival(h_pred, delta_t)
+    mark_lp = tpp.mark_log_probs(h_pred, delta_t).gather(-1, target_real.unsqueeze(-1)).squeeze(-1)
+
+    time_nll = (-time_lp).masked_fill(~real_mask, 0.0).sum() / real_mask.sum().clamp(min=1)
+    mark_nll = (-mark_lp).masked_fill(~real_mask, 0.0).sum() / real_mask.sum().clamp(min=1)
+    censor_nll = (-time_ls).masked_fill(~censor_mask, 0.0).sum() / censor_mask.sum().clamp(min=1)
+
+    real_term = (-(time_lp + mark_lp)).masked_fill(~real_mask, 0.0)
+    censor_term = (-time_ls).masked_fill(~censor_mask, 0.0)
+    total = (real_term + censor_term).sum() / any_mask.sum()
+
+    return {
+        "loss": total,
+        "time_nll": time_nll,
+        "mark_nll": mark_nll,
+        "censor_nll": censor_nll,
+        "n_real": real_mask.sum(),
+        "n_censor": censor_mask.sum(),
+    }

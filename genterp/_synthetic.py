@@ -23,6 +23,8 @@ def make_batch(B: int = 4, M: int = 4, T: int = 16, n_atoms: int = 256, seed: in
             e_atoms.extend(bag)
             e_pos += k
     ages = torch.linspace(20 * 365.25, 70 * 365.25, T).unsqueeze(0).expand(B, T).contiguous()
+    target_atoms = torch.tensor(e_atoms, dtype=torch.long)[torch.tensor(e_off, dtype=torch.long)].view(B, T)
+    censor_age = ages[:, -1] + 30.0
     return {
         "static_atoms": torch.tensor(s_atoms, dtype=torch.long),
         "static_offsets": torch.tensor(s_off, dtype=torch.long),
@@ -32,5 +34,7 @@ def make_batch(B: int = 4, M: int = 4, T: int = 16, n_atoms: int = 256, seed: in
         "event_offsets": torch.tensor(e_off, dtype=torch.long),
         "event_pad": torch.zeros(B, T, dtype=torch.bool),
         "event_ages": ages,
+        "target_atoms": target_atoms,
+        "censor_age": censor_age,
         "sex": torch.tensor([i % 2 for i in range(B)], dtype=torch.long),
     }

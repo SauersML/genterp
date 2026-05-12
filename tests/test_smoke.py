@@ -1,11 +1,10 @@
-"""Base model forward + backward + hidden states."""
+"""Forward + backward through Genterp with joint marked-TPP loss; dict return; transcoder acts."""
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
-from genterp import Genterp
+from genterp import Genterp, marked_tpp_loss
 from tests._factories import make_batch, tiny_config
 
 
@@ -14,16 +13,15 @@ def test_forward_backward():
     model = Genterp(cfg)
     batch = make_batch(n_atoms=cfg.n_atoms)
 
-    logits = model(**batch)
+    out = model(**batch)
     B, T = batch["event_ages"].shape
-    assert logits.shape == (B, T, cfg.n_atoms)
+    assert out["hidden"].shape == (B, T, cfg.dim)
 
-    target = torch.randint(0, cfg.n_atoms, (B, T))
-    pad = batch["event_pad"][:, 1:]
-    ce = F.cross_entropy(logits[:, :-1].reshape(-1, cfg.n_atoms), target[:, 1:].reshape(-1), reduction="none").view(pad.shape)
-    loss = ce.masked_fill(pad, 0).sum() / (~pad).sum().clamp(min=1)
-    assert torch.isfinite(loss)
-    loss.backward()
+    ld = marked_tpp_loss(
+        model.tpp, out["hidden"], batch["event_ages"], batch["target_atoms"], batch["event_pad"], batch["censor_age"]
+    )
+    assert torch.isfinite(ld["loss"])
+    ld["loss"].backward()
 
     grad_norm = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
     assert grad_norm > 0
@@ -34,10 +32,23 @@ def test_transcoder_acts():
     model = Genterp(cfg)
     batch = make_batch(n_atoms=cfg.n_atoms)
 
-    logits, pre_mlp, mlp_out = model(**batch, return_transcoder_acts=True)
+    out = model(**batch, return_transcoder_acts=True)
     B, T = batch["event_ages"].shape
-    assert pre_mlp.shape == (B, cfg.n_layers, T, cfg.dim)
-    assert mlp_out.shape == (B, cfg.n_layers, T, cfg.dim)
-    assert torch.isfinite(pre_mlp).all()
-    assert torch.isfinite(mlp_out).all()
-    assert logits.shape == (B, T, cfg.n_atoms)
+    assert out["hidden"].shape == (B, T, cfg.dim)
+    assert out["pre_mlp"].shape == (B, cfg.n_layers, T, cfg.dim)
+    assert out["mlp_out"].shape == (B, cfg.n_layers, T, cfg.dim)
+    assert torch.isfinite(out["pre_mlp"]).all()
+    assert torch.isfinite(out["mlp_out"]).all()
+
+
+def test_tpp_sample():
+    cfg = tiny_config()
+    model = Genterp(cfg).eval()
+    batch = make_batch(n_atoms=cfg.n_atoms)
+    with torch.no_grad():
+        out = model(**batch)
+        delta_t, mark = model.tpp.sample(out["hidden"][:, -1])
+    assert delta_t.shape == (out["hidden"].shape[0],)
+    assert mark.shape == (out["hidden"].shape[0],)
+    assert (delta_t > 0).all()
+    assert (mark >= 0).all() and (mark < cfg.n_atoms).all()

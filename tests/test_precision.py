@@ -12,12 +12,12 @@ def _to_device(batch: dict, device: torch.device) -> dict:
     return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
 
-def _forward_finite(model: Genterp, batch: dict, autocast_dtype: torch.dtype | None, device_type: str) -> torch.Tensor:
+def _forward_finite(model: Genterp, batch: dict, autocast_dtype: torch.dtype | None, device_type: str):
     ctx = torch.autocast(device_type=device_type, dtype=autocast_dtype) if autocast_dtype else torch.autocast(device_type=device_type, enabled=False)
     with torch.no_grad(), ctx:
         out = model(**batch)
-    assert torch.isfinite(out).all()
-    return out
+    assert torch.isfinite(out["hidden"]).all()
+    return out["hidden"]
 
 
 def test_cpu_fp32_bf16_consistency():
@@ -45,9 +45,9 @@ def test_clt_under_bf16():
     opt = torch.optim.Adam(clt.parameters(), lr=5e-3)
     init = clt.loss(pre_mlp, mlp_out)["recon"].item()
     for _ in range(50):
-        out = clt.loss(pre_mlp, mlp_out)
+        ld = clt.loss(pre_mlp, mlp_out)
         opt.zero_grad()
-        out["loss"].backward()
+        ld["loss"].backward()
         opt.step()
     assert clt.loss(pre_mlp, mlp_out)["recon"].item() < init
 
@@ -72,5 +72,5 @@ def test_mps():
     batch = _to_device(make_batch(n_atoms=cfg.n_atoms), device)
     with torch.no_grad():
         out = model(**batch)
-    assert out.device.type == "mps"
-    assert torch.isfinite(out).all()
+    assert out["hidden"].device.type == "mps"
+    assert torch.isfinite(out["hidden"]).all()

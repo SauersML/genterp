@@ -1,4 +1,4 @@
-"""Train Genterp on AoU MEDS."""
+"""Train Genterp on AoU OMOP."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 import transformers
 
 from genterp.data import AncestorMap, AtomVocab, CohortDataset, collate
-from genterp.modeling import Genterp, GenterpConfig
+from genterp.modeling import Genterp, GenterpConfig, marked_tpp_loss
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -31,18 +30,20 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         super().__init__(config)
         self.model = Genterp(GenterpConfig(**config.genterp_cfg))
 
-    def forward(self, target_atoms: torch.Tensor | None = None, **batch: Any):
-        logits = self.model(**batch)
-        loss = _next_atom_loss(logits, target_atoms, batch["event_pad"]) if target_atoms is not None else None
-        return transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=logits)
-
-
-def _next_atom_loss(logits: torch.Tensor, targets: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
-    pred = logits[:, :-1]
-    tgt = targets[:, 1:]
-    tgt_pad = pad[:, 1:]
-    ce = F.cross_entropy(pred.reshape(-1, pred.size(-1)), tgt.reshape(-1), reduction="none").view(tgt.shape)
-    return ce.masked_fill(tgt_pad, 0.0).sum() / (~tgt_pad).sum().clamp(min=1)
+    def forward(self, target_atoms: torch.Tensor | None = None, censor_age: torch.Tensor | None = None, **batch: Any):
+        out = self.model(**batch)
+        loss = None
+        if target_atoms is not None and censor_age is not None:
+            ld = marked_tpp_loss(
+                self.model.tpp,
+                out["hidden"],
+                batch["event_ages"],
+                target_atoms,
+                batch["event_pad"],
+                censor_age,
+            )
+            loss = ld["loss"]
+        return transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=out["hidden"])
 
 
 def main() -> None:

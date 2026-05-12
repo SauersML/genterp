@@ -23,12 +23,14 @@ def test_collate_shapes_and_targets():
             "static_bags": [[7, 11], [13]],
             "event_bags": [[21, 22], [23], [24, 25, 26]],
             "event_ages": np.array([100.0, 200.0, 365.25 * 20], dtype=np.float32),
+            "censor_age_days": 30000.0,
         },
         {
             "sex": 0,
             "static_bags": [[31]],
             "event_bags": [[41]],
             "event_ages": np.array([50.0], dtype=np.float32),
+            "censor_age_days": 25000.0,
         },
     ]
     out = collate(batch)
@@ -39,6 +41,7 @@ def test_collate_shapes_and_targets():
     assert out["event_pad"].tolist() == [[False, False, False], [False, True, True]]
     assert out["static_pad"][:, 0].tolist() == [False, False]
     assert out["sex"].tolist() == [1, 0]
+    assert out["censor_age"].tolist() == [30000.0, 25000.0]
 
 
 def test_collate_empty_static_is_nan_safe():
@@ -48,6 +51,7 @@ def test_collate_empty_static_is_nan_safe():
             "static_bags": [],
             "event_bags": [[1]],
             "event_ages": np.array([10.0], dtype=np.float32),
+            "censor_age_days": 100.0,
         }
     ]
     out = collate(batch)

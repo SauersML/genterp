@@ -135,10 +135,10 @@ def harvest_transcoder_acts(model: Genterp, batch: dict) -> tuple[torch.Tensor, 
     was_training = model.training
     model.eval()
     try:
-        _, pre_mlp, mlp_out = model(**batch, return_transcoder_acts=True)
+        out = model(**batch, return_transcoder_acts=True)
         keep = ~batch["event_pad"].reshape(-1)
-        pre_mlp_flat = rearrange(pre_mlp, "b l t d -> (b t) l d")[keep]
-        mlp_out_flat = rearrange(mlp_out, "b l t d -> (b t) l d")[keep]
+        pre_mlp_flat = rearrange(out["pre_mlp"], "b l t d -> (b t) l d")[keep]
+        mlp_out_flat = rearrange(out["mlp_out"], "b l t d -> (b t) l d")[keep]
         return pre_mlp_flat, mlp_out_flat
     finally:
         model.train(was_training)

@@ -63,6 +63,7 @@ class CohortDataset(Dataset):
         self.end = subjects["end"].to_numpy()
         self.sex = subjects["sex"].to_numpy()
         self.birth_seconds = subjects["birth_seconds"].to_numpy()
+        self.censor_seconds = subjects["censor_seconds"].to_numpy()
         self.ancestors = ancestors
         self.max_events = max_events
 
@@ -94,11 +95,13 @@ class CohortDataset(Dataset):
             event_bags = event_bags[: self.max_events]
             event_ages = event_ages[: self.max_events]
 
+        censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
             "sex": int(self.sex[idx]),
             "static_bags": static_bags,
             "event_bags": event_bags,
             "event_ages": np.asarray(event_ages, dtype=np.float32),
+            "censor_age_days": float(censor_age_days),
         }
 
 
@@ -155,5 +158,6 @@ def collate(batch: list[dict]) -> dict:
         "event_pad": event_pad,
         "event_ages": event_ages,
         "target_atoms": target_atoms,
+        "censor_age": torch.tensor([b["censor_age_days"] for b in batch], dtype=torch.float32),
         "sex": torch.tensor([b["sex"] for b in batch], dtype=torch.long),
     }
