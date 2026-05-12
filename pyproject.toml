@@ -1,22 +1,20 @@
 [project]
 name = "genterp"
 version = "0.0.1"
-description = "Clinical foundation model: ancestor-bag tokens, Set-Transformer static prefix, Gompertz two-band continuous-time RoPE."
+description = "Clinical foundation model trained on All of Us OMOP."
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.4",
   "einops>=0.8",
   "numpy>=1.26",
+  "transformers>=4.46",
+  "accelerate>=1.0",
+  "datasets>=3.0",
+  "meds-reader>=0.1.10",
+  "meds>=0.3.3",
+  "google-cloud-bigquery>=3.25",
+  "pytest>=8",
 ]
-
-[project.optional-dependencies]
-train = ["transformers>=4.46", "accelerate>=1.0", "datasets>=3.0"]
-data = ["meds-reader>=0.1.10", "meds>=0.3.3"]
-cuda = ["xformers>=0.0.28", "flash-attn>=2.6"]
-dev = ["pytest>=8", "ruff>=0.6"]
-
-[project.scripts]
-genterp = "genterp.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]

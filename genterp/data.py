@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+import meds_reader
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -103,8 +104,6 @@ class MEDSDataset(Dataset):
         male_codes: Iterable[str] = _OMOP_MALE,
         female_codes: Iterable[str] = _OMOP_FEMALE,
     ):
-        import meds_reader  # noqa: PLC0415 — optional heavy dep, only needed when MEDSDataset is constructed
-
         self.db = meds_reader.SubjectDatabase(str(db_path))
         self.vocab = vocab
         self.ancestors = ancestors
