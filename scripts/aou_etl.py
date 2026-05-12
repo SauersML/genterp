@@ -107,7 +107,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--out-dir", required=True)
     p.add_argument("--cdr", default=os.environ.get("WORKSPACE_CDR"))
-    p.add_argument("--threshold", type=int, default=50, help="minimum distinct patients to keep a concept")
+    p.add_argument("--threshold", type=int, default=500, help="minimum distinct patients to keep a concept")
     args = p.parse_args()
     if not args.cdr:
         raise SystemExit("WORKSPACE_CDR not set and --cdr not provided")
