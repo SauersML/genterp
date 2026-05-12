@@ -33,6 +33,8 @@ NON_DRUG_TABLES = [
     ("condition_occurrence", "condition_concept_id", "condition_start_datetime"),
     ("procedure_occurrence", "procedure_concept_id", "procedure_datetime"),
     ("observation", "observation_concept_id", "observation_datetime"),
+    ("visit_occurrence", "visit_concept_id", "visit_start_datetime"),
+    ("device_exposure", "device_concept_id", "device_exposure_start_datetime"),
 ]
 
 
