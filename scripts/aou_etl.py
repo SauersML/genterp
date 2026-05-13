@@ -597,14 +597,26 @@ def _coverage_sql(cdr: str) -> str:
 
 
 def _ancestor_closure_sql(cdr: str) -> str:
+    """Transitive ancestor closure for cohort descendants.
+
+    OMOP's ``concept_ancestor`` table is already the full transitive closure: for any
+    descendant D, the rows where ``descendant_concept_id=D`` enumerate *every*
+    ancestor of D at any depth, with ``min_levels_of_separation`` recording the
+    shortest path length. So a single filter on ``descendant_concept_id IN @cohort``
+    yields every (descendant, ancestor, hops) edge ``collapse_vocabulary`` needs.
+
+    The previous version UNIONed in "ancestors of cohort" as additional descendants
+    and re-walked from there — redundant for transitive-closure tables, and the
+    correlated ``IN (SELECT … FROM relevant)`` form was rejected by the BQ planner
+    ("Correlated subqueries that reference other tables are not supported").
+    """
     return f"""
-    WITH relevant AS (
-      SELECT DISTINCT cid FROM UNNEST(@cohort) AS cid
-      UNION DISTINCT SELECT DISTINCT ancestor_concept_id FROM `{cdr}.concept_ancestor` WHERE descendant_concept_id IN UNNEST(@cohort)
-    )
-    SELECT descendant_concept_id AS d, ancestor_concept_id AS a, min_levels_of_separation AS hops
+    SELECT descendant_concept_id AS d,
+           ancestor_concept_id   AS a,
+           min_levels_of_separation AS hops
     FROM `{cdr}.concept_ancestor`
-    WHERE descendant_concept_id IN (SELECT cid FROM relevant) AND min_levels_of_separation > 0
+    WHERE descendant_concept_id IN UNNEST(@cohort)
+      AND min_levels_of_separation > 0
     """
 
 
