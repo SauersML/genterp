@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +12,6 @@ import polars as pl
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
-
 
 PAD_ATOM = 0
 
@@ -38,7 +39,7 @@ class CodeAtomMap:
         return self.code_to_atom.get(code, PAD_ATOM)
 
     @classmethod
-    def from_vocab(cls, vocab: AtomVocab) -> "CodeAtomMap":
+    def from_vocab(cls, vocab: AtomVocab) -> CodeAtomMap:
         return cls({code: atom for code, atom in vocab.code_to_atom.items() if atom != PAD_ATOM})
 
 
@@ -47,9 +48,11 @@ class CohortDataset(Dataset):
 
     def __init__(self, data_dir: str | Path, code_atoms: CodeAtomMap, max_events: int = 4096):
         data_dir = Path(data_dir)
-        events = pq.read_table(data_dir / "events.parquet", columns=["time_seconds", "code", "value"], memory_map=True)
+        events_path = data_dir / "events.parquet"
+        events = pq.read_table(events_path, columns=["time_seconds", "code", "value"], memory_map=True)
         self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
-        self.event_codes = events.column("code").to_pylist()
+        event_codes = events.column("code").to_pylist()
+        self.event_atoms = _cached_event_atoms(data_dir, events_path, event_codes, code_atoms)
         self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
         self.start = subjects["start"].to_numpy()
@@ -57,8 +60,8 @@ class CohortDataset(Dataset):
         self.sex = subjects["sex"].to_numpy()
         self.birth_seconds = subjects["birth_seconds"].to_numpy()
         self.censor_seconds = subjects["censor_seconds"].to_numpy()
-        self.code_atoms = code_atoms
         self.max_events = max_events
+        self.lengths = np.minimum(np.maximum(self.end - self.start + 1, 1), max_events).astype(np.int64).tolist()
 
     def __len__(self) -> int:
         return len(self.start)
@@ -67,9 +70,8 @@ class CohortDataset(Dataset):
         s, e = int(self.start[idx]), int(self.end[idx])
         stop = e + 1
         times = self.event_times[s:stop]
-        codes = self.event_codes
         birth = float(self.birth_seconds[idx])
-        code_atoms = self.code_atoms
+        atoms = self.event_atoms
         max_events = self.max_events
 
         static_atoms: list[int] = []
@@ -78,7 +80,7 @@ class CohortDataset(Dataset):
         event_values: list[float] = []
         values = self.event_values
         for offset, t in enumerate(times, start=s):
-            atom = code_atoms.atom(codes[offset])
+            atom = int(atoms[offset])
             if atom == PAD_ATOM:
                 continue
             delta_days = (t - birth) / 86400.0
@@ -99,7 +101,38 @@ class CohortDataset(Dataset):
             "event_ages": np.asarray(event_ages, dtype=np.float32),
             "event_values": np.asarray(event_values, dtype=np.float32),
             "censor_age_days": float(censor_age_days),
+            "length": len(event_atoms),
         }
+
+
+def _code_atoms_fingerprint(code_atoms: CodeAtomMap) -> str:
+    payload = json.dumps(sorted(code_atoms.code_to_atom.items()), separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _events_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    payload = f"{stat.st_size}:{stat.st_mtime_ns}".encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _cached_event_atoms(data_dir: Path, events_path: Path, codes: list[str], code_atoms: CodeAtomMap) -> np.ndarray:
+    cache_dir = data_dir / ".genterp_cache"
+    cache_name = f"event_atoms-{_events_fingerprint(events_path)}-{_code_atoms_fingerprint(code_atoms)}.npy"
+    cache_path = cache_dir / cache_name
+    if cache_path.exists():
+        cached = np.load(cache_path, mmap_mode="r")
+        if cached.shape == (len(codes),):
+            return cached
+        cache_path.unlink()
+
+    encoded = np.fromiter((code_atoms.atom(code) for code in codes), dtype=np.uint32, count=len(codes))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with tmp.open("wb") as f:
+        np.save(f, encoded)
+    tmp.replace(cache_path)
+    return np.load(cache_path, mmap_mode="r")
 
 
 def _pad_atoms(seqs: list[list[int]]) -> torch.Tensor:
@@ -145,4 +178,5 @@ def collate(batch: list[dict]) -> dict:
         "target_atoms": target_atoms,
         "censor_age": torch.tensor([b["censor_age_days"] for b in batch], dtype=torch.float32),
         "sex": torch.tensor([b["sex"] for b in batch], dtype=torch.long),
+        "length": torch.tensor([b.get("length", len(b["event_atoms"])) for b in batch], dtype=torch.long),
     }

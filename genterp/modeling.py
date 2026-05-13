@@ -169,6 +169,13 @@ def _log1p_signed(z: torch.Tensor) -> torch.Tensor:
     return z.sign() * torch.log1p(z.abs())
 
 
+def _log_ndtr(x: torch.Tensor) -> torch.Tensor:
+    x = x.float()
+    direct = torch.log((0.5 * torch.erfc(-x / math.sqrt(2.0))).clamp_min(torch.finfo(x.dtype).tiny))
+    tail = -0.5 * x.pow(2) - torch.log((-x).clamp_min(1e-12)) - 0.5 * math.log(2 * math.pi)
+    return torch.where(x > -10.0, direct, tail)
+
+
 class ValueModulator(nn.Module):
     """Per-event multiplicative value modulation.
 
@@ -212,9 +219,12 @@ class ValueModulator(nn.Module):
 
     def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         has_mag = self.event_has_magnitude(leaf_atom, value)
-        x = self.z_score(leaf_atom, value).unsqueeze(-1)
-        modulation = torch.tanh(self.value_mlp(x)).to(e_concept.dtype)
-        return torch.where(has_mag.unsqueeze(-1), e_concept * modulation, e_concept)
+        out = e_concept.clone()
+        selected = has_mag.nonzero(as_tuple=True)
+        selected_z = self.z_score(leaf_atom[selected], value[selected]).unsqueeze(-1)
+        modulation = torch.tanh(self.value_mlp(selected_z)).to(e_concept.dtype)
+        out[selected] = e_concept[selected] * modulation
+        return out
 
 
 class ValueHead(nn.Module):
@@ -325,19 +335,42 @@ class Genterp(nn.Module):
         self.norm = RMSNorm(cfg.dim)
         self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, cfg.n_time_mix, cfg.mark_rank, cfg.time_phi_dim)
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
+        self._attn_base_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
+        self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
 
     def _embed(self, atoms: torch.Tensor) -> torch.Tensor:
         return self.embed(atoms)
 
-    def _attn_mask(self, K: int, T: int, event_pad: torch.Tensor | None, device: torch.device) -> torch.Tensor:
+    @staticmethod
+    def _device_key(device: torch.device) -> tuple[str, int | None]:
+        return device.type, device.index
+
+    def _static_mask(self, B: int, K: int, T: int, device: torch.device) -> torch.Tensor:
+        cache_key = (K, T, *self._device_key(device))
+        cached = self._static_mask_cache.get(cache_key)
+        if cached is None:
+            cached = torch.arange(K + T, device=device).lt(K).unsqueeze(0)
+            self._static_mask_cache[cache_key] = cached
+        return cached.expand(B, -1)
+
+    def _attn_base_mask(self, K: int, T: int, device: torch.device) -> torch.Tensor:
+        cache_key = (K, T, *self._device_key(device))
+        cached = self._attn_base_cache.get(cache_key)
+        if cached is not None:
+            return cached
         S = K + T
         i = torch.arange(S, device=device).unsqueeze(1)
         j = torch.arange(S, device=device).unsqueeze(0)
         allow = ~(((j >= K) & (j > i)) | ((i < K) & (j >= K)))
         mask = allow.unsqueeze(0).unsqueeze(0)
+        self._attn_base_cache[cache_key] = mask
+        return mask
+
+    def _attn_mask(self, K: int, T: int, event_pad: torch.Tensor | None, device: torch.device) -> torch.Tensor:
+        mask = self._attn_base_mask(K, T, device)
         if event_pad is not None:
             B = event_pad.shape[0]
-            pad_full = torch.zeros(B, S, dtype=torch.bool, device=device)
+            pad_full = torch.zeros(B, K + T, dtype=torch.bool, device=device)
             pad_full[:, K:] = event_pad
             mask = mask & ~pad_full[:, None, None, :]
         return mask
@@ -365,7 +398,7 @@ class Genterp(nn.Module):
         events = self.value_mod(events, target_atoms, event_values)
         x = torch.cat([summary, events], dim=1)
 
-        is_static = (torch.arange(K + T, device=device) < K).expand(B, -1)
+        is_static = self._static_mask(B, K, T, device)
         ages_full = F.pad(event_ages, (K, 0), value=0.0)
         angles = self.rope.angles(ages_full, is_static)
         mask = self._attn_mask(K, T, event_pad, device)
@@ -451,7 +484,7 @@ def marked_tpp_value_loss(
     log_pdf = -log_dt - log_sigma - 0.5 * math.log(2 * math.pi) - 0.5 * ((log_dt - mu) * inv_sigma).pow(2)
     time_lp = torch.logsumexp(log_w + log_pdf, dim=-1)
     z = (log_dt - mu) * inv_sigma
-    time_ls = torch.logsumexp(log_w + torch.special.log_ndtr(-z), dim=-1)
+    time_ls = torch.logsumexp(log_w + _log_ndtr(-z), dim=-1)
 
     real_any = real_mask[any_mask]
     real_time_lp = time_lp[real_any]

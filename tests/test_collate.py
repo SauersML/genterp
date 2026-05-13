@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
+import polars as pl
 import torch
 
-from genterp.data import AtomVocab, CodeAtomMap, _pad_atoms, collate
+from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, _pad_atoms, collate
 
 
 def test_code_atom_map_uses_single_collapsed_atom():
@@ -73,3 +74,37 @@ def test_collate_empty_static_is_nan_safe():
     out = collate(batch)
     assert not out["static_pad"][0, 0].item(), "first static slot must be attendable to avoid all-masked softmax NaN"
     assert torch.isfinite(out["event_ages"]).all()
+
+
+def test_cohort_dataset_persists_encoded_atom_cache(tmp_path):
+    pl.DataFrame(
+        {
+            "subject_id": [1, 1, 1],
+            "time_seconds": [0, 86400, 172800],
+            "code": ["A", "B", "missing"],
+            "value": [None, 1.5, None],
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "start": [0],
+            "end": [2],
+            "sex": [1],
+            "birth_seconds": [0],
+            "censor_seconds": [86400 * 10],
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+
+    first = CohortDataset(tmp_path, CodeAtomMap({"A": 5, "B": 6}))[0]
+
+    cache_files = sorted((tmp_path / ".genterp_cache").glob("event_atoms-*.npy"))
+    assert len(cache_files) == 1
+    assert first["static_atoms"] == [5]
+    assert first["event_atoms"] == [6]
+
+    second = CohortDataset(tmp_path, CodeAtomMap({"A": 7, "B": 8}))[0]
+
+    assert len(sorted((tmp_path / ".genterp_cache").glob("event_atoms-*.npy"))) == 2
+    assert second["static_atoms"] == [7]
+    assert second["event_atoms"] == [8]

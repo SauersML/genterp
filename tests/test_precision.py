@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from genterp import CLTConfig, CrossLayerTranscoder, Genterp, harvest_transcoder_acts
+from genterp.modeling import _log_ndtr
 from tests._factories import make_batch, tiny_config
 
 
@@ -52,6 +53,13 @@ def test_clt_under_bf16():
     assert clt.loss(pre_mlp, mlp_out)["recon"].item() < init
 
 
+def test_log_ndtr_matches_torch_special():
+    x = torch.linspace(-40.0, 5.0, 128)
+    expected = torch.special.log_ndtr(x)
+    actual = _log_ndtr(x)
+    assert torch.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
 def test_cuda_bf16():
     if not torch.cuda.is_available():
         return
@@ -74,3 +82,15 @@ def test_mps():
         out = model(**batch)
     assert out["hidden"].device.type == "mps"
     assert torch.isfinite(out["hidden"]).all()
+
+
+def test_mps_loss():
+    if not torch.backends.mps.is_available():
+        return
+    device = torch.device("mps")
+    cfg = tiny_config()
+    model = Genterp(cfg).to(device).eval()
+    batch = _to_device(make_batch(n_atoms=cfg.n_atoms), device)
+    ld = model.loss(**batch)
+    assert ld["loss"].device.type == "mps"
+    assert torch.isfinite(ld["loss"])

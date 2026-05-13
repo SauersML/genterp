@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,17 @@ def _write_json(path: Path, data: object) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
+
+
+def _stable_json_fingerprint(data: object) -> str:
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _path_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    payload = f"{stat.st_size}:{stat.st_mtime_ns}".encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFrame:
@@ -170,6 +182,8 @@ def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int
 
 
 def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: str, cohort_ids: list[int], cache_dir: Path):
+    cohort_key = _stable_json_fingerprint(sorted(cohort_ids))
+
     def build() -> dict[str, list]:
         coverage, ancestors = _coverage_and_ancestors(client(), cdr, cohort_ids)
         return {
@@ -181,7 +195,7 @@ def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: s
         }
 
     payload = _cache_json(
-        cache_dir / "coverage_and_ancestors.json",
+        cache_dir / f"coverage_and_ancestors-{cohort_key}.json",
         build,
     )
     return (
@@ -206,6 +220,45 @@ def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: 
     return cached
 
 
+def _cached_own_counts(events_all: pl.DataFrame, cache_dir: Path, source_key: str) -> dict[int, int]:
+    payload = _cache_json(
+        cache_dir / f"own_counts-{source_key}.json",
+        lambda: [
+            [int(r["cid"]), int(r["n"])]
+            for r in events_all.group_by("cid").agg(pl.col("subject_id").n_unique().alias("n")).iter_rows(named=True)
+        ],
+    )
+    return {int(cid): int(n) for cid, n in payload}
+
+
+def _cached_value_stats(
+    events_all: pl.DataFrame,
+    atom_idx: dict[str, int],
+    cache_dir: Path,
+    source_key: str,
+    vocab_key: str,
+) -> dict[str, dict[str, float]]:
+    def build() -> dict[str, dict[str, float]]:
+        stats_df = (
+            events_all.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
+            .group_by("code")
+            .agg(
+                pl.col("value").mean().alias("mu"),
+                pl.col("value").std().alias("sigma"),
+                pl.len().alias("n"),
+            )
+            .filter(pl.col("n") >= THRESHOLD)
+        )
+        return {
+            r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
+            for r in stats_df.iter_rows(named=True)
+            if r["code"] in atom_idx
+        }
+
+    payload = _cache_json(cache_dir / f"value_stats-{source_key}-{vocab_key}.json", build)
+    return {str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])} for code, stats in payload.items()}
+
+
 def main() -> None:
     cdr = os.environ["WORKSPACE_CDR"]
     out_dir = Path.home() / "genterp" / "etl"
@@ -223,51 +276,43 @@ def main() -> None:
     drug = _cache_parquet(cache_dir / "drug_events.parquet", lambda: pl.from_arrow(_drug_events_arrow(client(), cdr)))
     meas = _cache_parquet(cache_dir / "measurement_events.parquet", lambda: pl.from_arrow(_measurement_events_arrow(client(), cdr)))
 
+    source_events_path = cache_dir / "all_source_events.parquet"
     events_all = _cache_parquet(
-        cache_dir / "all_source_events.parquet",
+        source_events_path,
         lambda: pl.concat([
             non_drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
             drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
             meas.select(["subject_id", "time_seconds", "code", "cid", "value"]),
         ]),
     )
-    own_by_cid = {
-        int(r["cid"]): int(r["n"])
-        for r in events_all.group_by("cid").agg(pl.col("subject_id").n_unique().alias("n")).iter_rows(named=True)
-    }
-    cov, anc = _cached_coverage_and_ancestors(client, cdr, list(own_by_cid), cache_dir)
+    source_key = _path_fingerprint(source_events_path)
+    own_by_cid = _cached_own_counts(events_all, cache_dir, source_key)
 
-    all_ids = set(own_by_cid) | set(cov) | {a for d in anc.values() for a in d}
-    code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
-    own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
-    cov_by_code = {code_of[c]: n for c, n in cov.items() if c in code_of}
-    anc_by_code = {
-        code_of[d]: {code_of[a]: h for a, h in ancs.items() if a in code_of}
-        for d, ancs in anc.items() if d in code_of
-    }
+    vocab_cache = cache_dir / f"collapsed_vocab-{source_key}.json"
+    if vocab_cache.exists():
+        atom_idx = {str(code): int(atom) for code, atom in json.loads(vocab_cache.read_text()).items()}
+    else:
+        cov, anc = _cached_coverage_and_ancestors(client, cdr, list(own_by_cid), cache_dir)
 
-    atom_idx = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
+        all_ids = set(own_by_cid) | set(cov) | {a for d in anc.values() for a in d}
+        code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
+        own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
+        cov_by_code = {code_of[c]: n for c, n in cov.items() if c in code_of}
+        anc_by_code = {
+            code_of[d]: {code_of[a]: h for a, h in ancs.items() if a in code_of}
+            for d, ancs in anc.items() if d in code_of
+        }
+
+        atom_idx = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
+        _write_json(vocab_cache, atom_idx)
     _write_json(out_dir / "vocab.json", atom_idx)
 
-    stats_df = (
-        events_all.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
-        .group_by("code")
-        .agg(
-            pl.col("value").mean().alias("mu"),
-            pl.col("value").std().alias("sigma"),
-            pl.len().alias("n"),
-        )
-        .filter(pl.col("n") >= THRESHOLD)
-    )
-    stats = {
-        r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
-        for r in stats_df.iter_rows(named=True)
-        if r["code"] in atom_idx
-    }
+    vocab_key = _stable_json_fingerprint(atom_idx)
+    stats = _cached_value_stats(events_all, atom_idx, cache_dir, source_key, vocab_key)
     _write_json(out_dir / "value_stats.json", stats)
 
     final_events = _cache_parquet(
-        cache_dir / "events.parquet",
+        cache_dir / f"events-{source_key}-{vocab_key}.parquet",
         lambda: events_all.select(["subject_id", "time_seconds", "code", "value"])
         .filter(pl.col("code").is_in(set(atom_idx.keys())))
         .sort(["subject_id", "time_seconds"]),
@@ -309,7 +354,7 @@ def main() -> None:
         .join(censor, on="subject_id", how="inner")
         .sort("subject_id")
     )
-    _cache_parquet(cache_dir / "subjects.parquet", lambda: subjects)
+    subjects = _cache_parquet(cache_dir / f"subjects-{source_key}-{vocab_key}.parquet", lambda: subjects)
     subjects.write_parquet(out_dir / "subjects.parquet")
 
     print(
