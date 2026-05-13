@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -12,12 +10,12 @@ from typing import Any
 
 import torch
 import transformers
-from transformers.trainer_pt_utils import DistributedLengthGroupedSampler, LengthGroupedSampler
+from transformers.trainer_pt_utils import LengthGroupedSampler
 from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
-from genterp.runtime import accelerator_label, configure_torch_runtime, should_launch_distributed
+from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -42,6 +40,12 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
 
 
 class GenterpTrainer(transformers.Trainer):
+    def __init__(self, *args, runtime: TorchRuntime | None = None, **kwargs):
+        self.runtime = runtime
+        super().__init__(*args, **kwargs)
+        if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
+            self.args._n_gpu = 1
+
     def _get_train_sampler(self, train_dataset=None) -> torch.utils.data.Sampler | None:
         train_dataset = self.train_dataset if train_dataset is None else train_dataset
         if (
@@ -50,15 +54,6 @@ class GenterpTrainer(transformers.Trainer):
             and hasattr(train_dataset, "lengths")
         ):
             batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
-            if self.args.world_size > 1:
-                return DistributedLengthGroupedSampler(
-                    batch_size,
-                    num_replicas=self.args.world_size,
-                    rank=self.args.process_index,
-                    seed=self.args.seed,
-                    drop_last=self.args.dataloader_drop_last,
-                    lengths=train_dataset.lengths,
-                )
             return LengthGroupedSampler(
                 batch_size,
                 lengths=train_dataset.lengths,
@@ -67,7 +62,8 @@ class GenterpTrainer(transformers.Trainer):
 
     def _prepare_input(self, data: Any) -> Any:
         if isinstance(data, torch.Tensor):
-            return data.to(self.args.device, non_blocking=self.args.device.type == "cuda")
+            device = self.runtime.device if self.runtime is not None else self.args.device
+            return data.to(device, non_blocking=device.type == "cuda")
         if isinstance(data, Mapping):
             return type(data)((key, self._prepare_input(value)) for key, value in data.items())
         if isinstance(data, tuple):
@@ -75,6 +71,11 @@ class GenterpTrainer(transformers.Trainer):
         if isinstance(data, list):
             return [self._prepare_input(value) for value in data]
         return data
+
+    def _move_model_to_device(self, model: torch.nn.Module, device: torch.device) -> None:
+        if self.runtime is not None:
+            device = self.runtime.device
+        super()._move_model_to_device(model, device)
 
 
 def latest_checkpoint(output_dir: str | Path) -> str | None:
@@ -104,26 +105,6 @@ def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch
         sigma[a] = max(float(s["sigma"]), 1e-6)
         has_mag[a] = True
     return mu, sigma, has_mag
-
-
-def distributed_launch_command(module: str = "genterp.train") -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc-per-node={torch.cuda.device_count()}",
-        "-m",
-        module,
-    ]
-
-
-def launch_distributed_if_needed() -> bool:
-    if not should_launch_distributed():
-        return False
-    command = distributed_launch_command()
-    print(f"genterp train launching {torch.cuda.device_count()} GPU workers automatically")
-    raise SystemExit(subprocess.run(command).returncode)
 
 
 def main() -> None:
@@ -172,8 +153,6 @@ def main() -> None:
         restore_callback_states_from_checkpoint=True,
         save_safetensors=True,
         auto_find_batch_size=runtime.auto_find_batch_size,
-        ddp_find_unused_parameters=runtime.ddp_find_unused_parameters,
-        ddp_bucket_cap_mb=runtime.ddp_bucket_cap_mb,
     )
     if runtime.torch_compile:
         training_args["torch_compile_backend"] = runtime.torch_compile_backend
@@ -184,11 +163,11 @@ def main() -> None:
         args=transformers.TrainingArguments(**training_args),
         train_dataset=dataset,
         data_collator=collate,
+        runtime=runtime,
     )
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(str(output_dir / "final"))
 
 
 if __name__ == "__main__":
-    launch_distributed_if_needed()
     main()
