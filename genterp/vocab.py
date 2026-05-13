@@ -7,7 +7,7 @@ def collapse_vocabulary(
     own_counts: dict[str, int],
     coverage: dict[str, int],
     ancestors: dict[str, dict[str, int]],
-    threshold: int = 50,
+    threshold: int = 500,
 ) -> dict[str, int]:
     """Roll rare cohort concepts up the IS-A DAG.
 

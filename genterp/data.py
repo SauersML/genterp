@@ -13,6 +13,8 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
+from genterp.progress import ProgressLogger
+
 PAD_ATOM = 0
 
 
@@ -58,13 +60,27 @@ class CohortDataset(Dataset):
         split: str | None = None,
     ):
         data_dir = Path(data_dir)
+        logger = ProgressLogger(f"cohort_dataset:{split or 'all'}", total_units=7)
         events_path = data_dir / "events.parquet"
+        logger.start_unit("read events parquet", f"path={events_path} columns=time_seconds,code,value")
         events = pq.read_table(events_path, columns=["time_seconds", "code", "value"], memory_map=True)
+        logger.finish_unit("read events parquet", f"rows={events.num_rows:,}")
+
+        logger.start_unit("materialize event columns", "combining Arrow chunks into numpy/list columns")
         self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
         event_codes = events.column("code").to_pylist()
-        self.event_atoms = _cached_event_atoms(data_dir, events_path, event_codes, code_atoms)
         self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
+        logger.finish_unit("materialize event columns", f"codes={len(event_codes):,} values={len(self.event_values):,}")
+
+        logger.start_unit("encode event atom cache", "mapping OMOP code strings to collapsed atom ids")
+        self.event_atoms = _cached_event_atoms(data_dir, events_path, event_codes, code_atoms, logger)
+        logger.finish_unit("encode event atom cache", f"atoms={len(self.event_atoms):,}")
+
+        logger.start_unit("read subjects parquet", f"path={data_dir / 'subjects.parquet'}")
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
+        logger.finish_unit("read subjects parquet", f"subjects={subjects.height:,}")
+
+        logger.start_unit("apply subject split filter", f"requested split={split!r}")
         if split is not None:
             if "split" not in subjects.columns:
                 raise ValueError(
@@ -73,14 +89,22 @@ class CohortDataset(Dataset):
             subjects = subjects.filter(pl.col("split") == split)
             if subjects.height == 0:
                 raise ValueError(f"no subjects in split={split!r}")
+        logger.finish_unit("apply subject split filter", f"remaining_subjects={subjects.height:,}")
+
+        logger.start_unit("materialize subject arrays", "start/end offsets, sex, birth time, censor time")
         self.split = split
         self.start = subjects["start"].to_numpy()
         self.end = subjects["end"].to_numpy()
         self.sex = subjects["sex"].to_numpy()
         self.birth_seconds = subjects["birth_seconds"].to_numpy()
         self.censor_seconds = subjects["censor_seconds"].to_numpy()
+        logger.finish_unit("materialize subject arrays", f"subjects={len(self.start):,}")
+
+        logger.start_unit("compute per-subject sequence lengths", f"max_events={max_events:,}")
         self.max_events = max_events
         self.lengths = np.minimum(np.maximum(self.end - self.start + 1, 1), max_events).astype(np.int64).tolist()
+        mean_length = float(np.mean(self.lengths)) if self.lengths else 0.0
+        logger.finish_unit("compute per-subject sequence lengths", f"subjects={len(self.lengths):,} mean_length={mean_length:.1f}")
 
     def __len__(self) -> int:
         return len(self.start)
@@ -135,22 +159,35 @@ def _events_fingerprint(path: Path) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _cached_event_atoms(data_dir: Path, events_path: Path, codes: list[str], code_atoms: CodeAtomMap) -> np.ndarray:
+def _cached_event_atoms(
+    data_dir: Path,
+    events_path: Path,
+    codes: list[str],
+    code_atoms: CodeAtomMap,
+    logger: ProgressLogger,
+) -> np.ndarray:
     cache_dir = data_dir / ".genterp_cache"
     cache_name = f"event_atoms-{_events_fingerprint(events_path)}-{_code_atoms_fingerprint(code_atoms)}.npy"
     cache_path = cache_dir / cache_name
     if cache_path.exists():
+        logger.log("event atom cache hit", f"path={cache_path}")
         cached = np.load(cache_path, mmap_mode="r")
         if cached.shape == (len(codes),):
+            logger.log("event atom cache validated", f"shape={cached.shape} expected_codes={len(codes):,}")
             return cached
+        logger.log("event atom cache stale", f"shape={cached.shape} expected_codes={len(codes):,}; rebuilding")
         cache_path.unlink()
 
+    logger.log("event atom cache miss", f"encoding codes={len(codes):,} cache_path={cache_path}")
     encoded = np.fromiter((code_atoms.atom(code) for code in codes), dtype=np.uint32, count=len(codes))
+    non_pad = int(np.count_nonzero(encoded))
+    logger.log("event atom encoding complete", f"encoded={len(encoded):,} non_pad={non_pad:,} pad={len(encoded) - non_pad:,}")
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
     with tmp.open("wb") as f:
         np.save(f, encoded)
     tmp.replace(cache_path)
+    logger.log("event atom cache written", f"path={cache_path}")
     return np.load(cache_path, mmap_mode="r")
 
 

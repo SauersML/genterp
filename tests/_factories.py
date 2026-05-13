@@ -19,6 +19,5 @@ def tiny_config(n_atoms: int = 128, dim: int = 64, n_heads: int = 4, n_layers: i
         n_static_blocks=1,
         k_static_summary=4,
         n_time_mix=4,
-        mark_rank=32,
         time_phi_dim=16,
     )

@@ -22,25 +22,59 @@ from pathlib import Path
 import polars as pl
 from google.cloud import bigquery
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from genterp.progress import ProgressLogger
+from genterp.vocab import collapse_vocabulary
 
-_T0 = time.monotonic()
+
+_WORK = ProgressLogger("aou_etl", total_units=14)
 
 
 def _log(msg: str) -> None:
-    elapsed = time.monotonic() - _T0
-    print(f"[aou_etl t+{elapsed:6.1f}s] {msg}", flush=True)
+    _WORK.log(msg)
+
+
+_BQ_JOB_CACHE_DIR: Path | None = None
+
+
+def _set_bq_job_cache_dir(p: Path) -> None:
+    global _BQ_JOB_CACHE_DIR
+    p.mkdir(parents=True, exist_ok=True)
+    _BQ_JOB_CACHE_DIR = p
+
+
+def _bq_job_id_file(sql: str) -> Path | None:
+    if _BQ_JOB_CACHE_DIR is None:
+        return None
+    key = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
+    return _BQ_JOB_CACHE_DIR / f"{key}.txt"
 
 
 def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
+    job_id_file = _bq_job_id_file(sql)
+    if job_id_file is not None and job_id_file.exists():
+        prev_id = job_id_file.read_text().strip()
+        try:
+            job = client.get_job(prev_id)
+            if job.state == "DONE" and job.error_result is None:
+                _log(f"  bq reuse:  {label} job_id={prev_id} (server-cached result)")
+                t0 = time.monotonic()
+                table = job.to_arrow(progress_bar_type="tqdm")
+                _log(f"  bq done:   {label} rows={table.num_rows:,} reused in {time.monotonic() - t0:.1f}s")
+                return table
+            _log(f"  bq prior job state={job.state}; resubmitting")
+        except Exception as exc:
+            _log(f"  bq prior job lookup failed ({exc.__class__.__name__}); resubmitting")
     _log(f"  bq query: {label}")
     t0 = time.monotonic()
     job = client.query(sql)
+    if job_id_file is not None:
+        job_id_file.write_text(job.job_id or "")
+        _log(f"  bq job_id={job.job_id} (recorded for resume)")
     table = job.to_arrow(progress_bar_type="tqdm")
-    _log(f"  bq done:  {label} rows={table.num_rows:,} in {time.monotonic() - t0:.1f}s")
+    _log(f"  bq done:   {label} rows={table.num_rows:,} in {time.monotonic() - t0:.1f}s")
     return table
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from genterp.vocab import collapse_vocabulary
 
 THRESHOLD = 500
 TEST_SPLIT_PERCENT = 20
@@ -67,9 +101,19 @@ def _cache_key(cdr: str) -> str:
 
 
 def _write_json(path: Path, data: object) -> None:
+    _log(f"writing json atomically: {path} ({_payload_units(data)})")
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
+    _log(f"json write complete: {path} ({tmp.name} replaced target)")
+
+
+def _payload_units(data: object) -> str:
+    if isinstance(data, dict):
+        return f"items={len(data):,}"
+    if isinstance(data, (list, tuple, set)):
+        return f"items={len(data):,}"
+    return f"type={type(data).__name__}"
 
 
 def _stable_json_fingerprint(data: object) -> str:
@@ -85,12 +129,15 @@ def _path_fingerprint(path: Path) -> str:
 
 def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFrame:
     if path.exists():
-        _log(f"cache hit:  {path.name}")
-        return pl.read_parquet(path)
-    _log(f"cache miss: {path.name} — building")
+        _log(f"cache hit:  {path.name}; reading parquet from disk")
+        data = pl.read_parquet(path)
+        _log(f"cache read complete: {path.name} rows={data.height:,} columns={len(data.columns):,}")
+        return data
+    _log(f"cache miss: {path.name}; building dataframe")
     t0 = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = build()
+    _log(f"cache build complete: {path.name} rows={data.height:,} columns={len(data.columns):,}; writing parquet")
     tmp = path.with_suffix(path.suffix + ".tmp")
     data.write_parquet(tmp)
     tmp.replace(path)
@@ -100,9 +147,11 @@ def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFram
 
 def _cache_json(path: Path, build: Callable[[], object]) -> object:
     if path.exists():
-        _log(f"cache hit:  {path.name}")
-        return json.loads(path.read_text())
-    _log(f"cache miss: {path.name} — building")
+        _log(f"cache hit:  {path.name}; reading json from disk")
+        payload = json.loads(path.read_text())
+        _log(f"cache read complete: {path.name} ({_payload_units(payload)})")
+        return payload
+    _log(f"cache miss: {path.name}; building json payload")
     t0 = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = build()
@@ -255,8 +304,10 @@ def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: 
     cached = {int(cid): str(code) for cid, code in json.loads(path.read_text())} if path.exists() else {}
     missing = ids - set(cached)
     if not missing:
+        _log(f"concept code cache satisfied: cached={len(cached):,} requested={len(ids):,} missing=0")
         return cached
 
+    _log(f"concept code cache incomplete: cached={len(cached):,} requested={len(ids):,} missing={len(missing):,}")
     cached.update(_concept_codes(client(), cdr, missing))
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, [[cid, code] for cid, code in sorted(cached.items())])
@@ -303,6 +354,7 @@ def _cached_value_stats(
 
 
 def main() -> None:
+    _WORK.start_unit("validate AoU CDR configuration", "reading WORKSPACE_CDR and preparing output paths")
     cdr = os.environ.get("WORKSPACE_CDR")
     if not cdr:
         raise SystemExit(
@@ -312,8 +364,10 @@ def main() -> None:
     out_dir = Path.home() / "genterp" / "etl"
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = out_dir / "cache" / _cache_key(cdr)
+    _set_bq_job_cache_dir(cache_dir / "bq_jobs")
     _log(f"CDR={cdr}")
     _log(f"cache_dir={cache_dir}")
+    _WORK.finish_unit("validate AoU CDR configuration", f"out_dir={out_dir} cache_dir={cache_dir}")
     client_instance: bigquery.Client | None = None
 
     def client() -> bigquery.Client:
@@ -323,14 +377,19 @@ def main() -> None:
             client_instance = bigquery.Client()
         return client_instance
 
-    _log("step 1/8: pull non-drug events (condition, procedure, observation, visit, device)")
+    _WORK.start_unit("pull non-drug events", "condition, procedure, observation, visit, and device domains")
     non_drug = _cache_parquet(cache_dir / "non_drug_events.parquet", lambda: pl.from_arrow(_non_drug_events_arrow(client(), cdr)))
-    _log("step 2/8: pull drug events (drug_exposure JOIN drug_strength → ingredient)")
-    drug = _cache_parquet(cache_dir / "drug_events.parquet", lambda: pl.from_arrow(_drug_events_arrow(client(), cdr)))
-    _log("step 3/8: pull measurement events (with value_as_number)")
-    meas = _cache_parquet(cache_dir / "measurement_events.parquet", lambda: pl.from_arrow(_measurement_events_arrow(client(), cdr)))
+    _WORK.finish_unit("pull non-drug events", f"rows={non_drug.height:,}")
 
-    _log("step 4/8: concatenate event streams")
+    _WORK.start_unit("pull drug events", "drug_exposure joined through drug_strength to ingredient concepts")
+    drug = _cache_parquet(cache_dir / "drug_events.parquet", lambda: pl.from_arrow(_drug_events_arrow(client(), cdr)))
+    _WORK.finish_unit("pull drug events", f"rows={drug.height:,}")
+
+    _WORK.start_unit("pull measurement events", "measurement rows with value_as_number preserved")
+    meas = _cache_parquet(cache_dir / "measurement_events.parquet", lambda: pl.from_arrow(_measurement_events_arrow(client(), cdr)))
+    _WORK.finish_unit("pull measurement events", f"rows={meas.height:,}")
+
+    _WORK.start_unit("concatenate event streams", "normalizing source columns before combining domains")
     source_events_path = cache_dir / "all_source_events.parquet"
     events_all = _cache_parquet(
         source_events_path,
@@ -341,20 +400,25 @@ def main() -> None:
         ]),
     )
     source_key = _path_fingerprint(source_events_path)
-    _log(f"  total events: {events_all.height:,}")
-    own_by_cid = _cached_own_counts(events_all, cache_dir, source_key)
-    _log(f"  unique concept_ids: {len(own_by_cid):,}")
+    _log(f"source event fingerprint={source_key}; total rows={events_all.height:,}")
+    _WORK.finish_unit("concatenate event streams", f"rows={events_all.height:,} source_key={source_key}")
 
-    _log("step 5/8: vocab collapse")
+    _WORK.start_unit("count distinct subjects per source concept", "grouping all source events by concept_id")
+    own_by_cid = _cached_own_counts(events_all, cache_dir, source_key)
+    _WORK.finish_unit("count distinct subjects per source concept", f"unique concept_ids={len(own_by_cid):,}")
+
+    _WORK.start_unit("collapse vocabulary", f"threshold={THRESHOLD:,}; resolving ancestors and concept codes if cache is cold")
     vocab_cache = cache_dir / f"collapsed_vocab-{source_key}.json"
     if vocab_cache.exists():
-        _log(f"  cache hit: {vocab_cache.name}")
+        _log(f"vocab cache hit: {vocab_cache.name}; loading collapsed code-to-atom map")
         atom_idx = {str(code): int(atom) for code, atom in json.loads(vocab_cache.read_text()).items()}
     else:
-        _log("  cache miss — running coverage+ancestors queries and threshold-500 collapse")
+        _log("vocab cache miss; running coverage+ancestors queries and threshold collapse")
         cov, anc = _cached_coverage_and_ancestors(client, cdr, list(own_by_cid), cache_dir)
+        _log(f"coverage+ancestor payload ready: coverage_concepts={len(cov):,} descendant_maps={len(anc):,}")
 
         all_ids = set(own_by_cid) | set(cov) | {a for d in anc.values() for a in d}
+        _log(f"resolving OMOP concept codes: own={len(own_by_cid):,} coverage={len(cov):,} ancestor_ids={len(all_ids):,}")
         code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
         own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
         cov_by_code = {code_of[c]: n for c, n in cov.items() if c in code_of}
@@ -364,26 +428,29 @@ def main() -> None:
         }
 
         atom_idx = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
-        _log(f"  collapsed vocab: {len(set(atom_idx.values())):,} atoms covering {len(atom_idx):,} codes")
+        _log(f"collapsed vocab: atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
         _write_json(vocab_cache, atom_idx)
     _write_json(out_dir / "vocab.json", atom_idx)
+    _WORK.finish_unit("collapse vocabulary", f"atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
 
-    _log("step 6/8: per-atom value stats (μ, σ over numeric measurements)")
+    _WORK.start_unit("compute per-atom value stats", "mean and stddev over finite numeric measurements")
     vocab_key = _stable_json_fingerprint(atom_idx)
     stats = _cached_value_stats(events_all, atom_idx, cache_dir, source_key, vocab_key)
     _write_json(out_dir / "value_stats.json", stats)
-    _log(f"  magnitude-bearing atoms: {len(stats):,}")
+    _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
-    _log("step 7/8: filter+sort final events.parquet")
+    _WORK.start_unit("filter and sort final events", "keeping collapsed-vocab codes and sorting by subject/time")
     final_events = _cache_parquet(
         cache_dir / f"events-{source_key}-{vocab_key}.parquet",
         lambda: events_all.select(["subject_id", "time_seconds", "code", "value"])
         .filter(pl.col("code").is_in(set(atom_idx.keys())))
         .sort(["subject_id", "time_seconds"]),
     )
+    _log(f"writing final events parquet: {out_dir / 'events.parquet'} rows={final_events.height:,}")
     final_events.write_parquet(out_dir / "events.parquet")
+    _WORK.finish_unit("filter and sort final events", f"rows={final_events.height:,}")
 
-    _log("step 8/8: pull person + observation_period (sex, birth, censoring)")
+    _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
     persons = _cache_parquet(
         cache_dir / "persons.parquet",
         lambda: pl.from_arrow(
@@ -397,6 +464,9 @@ def main() -> None:
                 FROM `{cdr}.person`""", "person")
         ),
     )
+    _WORK.finish_unit("pull person demographics", f"rows={persons.height:,}")
+
+    _WORK.start_unit("pull observation-period censoring", "latest observation_period_end_date per subject")
     censor = _cache_parquet(
         cache_dir / "censor.parquet",
         lambda: pl.from_arrow(
@@ -405,11 +475,14 @@ def main() -> None:
                     FROM `{cdr}.observation_period` GROUP BY person_id""", "observation_period")
         ),
     )
+    _WORK.finish_unit("pull observation-period censoring", f"rows={censor.height:,}")
 
+    _WORK.start_unit("build subject metadata", "row offsets, demographics, censoring, and deterministic split labels")
     offsets = final_events.with_row_index("row").group_by("subject_id", maintain_order=True).agg(
         pl.col("row").min().alias("start"),
         pl.col("row").max().alias("end"),
     )
+    _log(f"subject offsets computed: subjects_with_events={offsets.height:,}")
     subjects = (
         offsets.join(persons, on="subject_id", how="inner")
         .join(censor, on="subject_id", how="inner")
@@ -421,17 +494,21 @@ def main() -> None:
         .sort("subject_id")
     )
     subjects = _cache_parquet(cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet", lambda: subjects)
+    _log(f"writing final subjects parquet: {out_dir / 'subjects.parquet'} rows={subjects.height:,}")
     subjects.write_parquet(out_dir / "subjects.parquet")
+    _WORK.finish_unit("build subject metadata", f"subjects={subjects.height:,}")
 
+    _WORK.start_unit("summarize ETL artifacts", "counting split rows and final artifact dimensions")
     split_counts = subjects.group_by("split").agg(pl.len().alias("n")).sort("split")
     split_summary = "  ".join(f"{row['split']}={row['n']:,}" for row in split_counts.iter_rows(named=True))
-    print(
+    _WORK.finish_unit(
+        "summarize ETL artifacts",
         f"vocab={len(set(atom_idx.values())):,}  "
         f"events={final_events.height:,}  "
         f"subjects={subjects.height:,}  "
         f"magnitude_atoms={len(stats):,}  "
         f"split[{split_summary}]  "
-        f"-> {out_dir}"
+        f"out_dir={out_dir}",
     )
 
 

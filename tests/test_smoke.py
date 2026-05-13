@@ -40,6 +40,12 @@ def test_forward_backward():
     assert grad_norm > 0
 
 
+def test_mark_output_uses_atom_embedding_weight():
+    model = Genterp(tiny_config())
+
+    assert model.tpp.mark_out.weight is model.embed.embedding.weight
+
+
 def test_transcoder_acts():
     cfg = tiny_config()
     model = Genterp(cfg)

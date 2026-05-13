@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from genterp.progress import ProgressLogger
+
 GIB = 1024**3
 
 
@@ -196,15 +198,32 @@ def get_torch_runtime() -> TorchRuntime:
 
 
 def configure_torch_runtime(runtime: TorchRuntime | None = None) -> TorchRuntime:
+    logger = ProgressLogger("torch_runtime", total_units=5)
+    logger.start_unit("select torch runtime", "using provided runtime or probing local accelerator")
     runtime = runtime or get_torch_runtime()
+    logger.finish_unit("select torch runtime", f"device={runtime.device} cuda_gpus={runtime.cuda_device_count}")
+
+    logger.start_unit("set float32 matmul precision", "precision=high")
     torch.set_float32_matmul_precision("high")
+    logger.finish_unit("set float32 matmul precision", "precision=high")
+
+    logger.start_unit("configure TF32 flags", f"enabled={runtime.tf32}")
     torch.backends.cuda.matmul.allow_tf32 = runtime.tf32
     torch.backends.cudnn.allow_tf32 = runtime.tf32
+    logger.finish_unit("configure TF32 flags", f"enabled={runtime.tf32}")
+
+    logger.start_unit("configure cuDNN benchmark", f"enabled={runtime.device.type == 'cuda'}")
     torch.backends.cudnn.benchmark = runtime.device.type == "cuda"
+    logger.finish_unit("configure cuDNN benchmark", f"enabled={runtime.device.type == 'cuda'}")
+
+    logger.start_unit("configure CUDA scaled-dot-product attention kernels", f"device_type={runtime.device.type}")
     if runtime.device.type == "cuda":
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
+        logger.finish_unit("configure CUDA scaled-dot-product attention kernels", "flash=True mem_efficient=True math=True")
+    else:
+        logger.finish_unit("configure CUDA scaled-dot-product attention kernels", "skipped for non-CUDA runtime")
     return runtime
 
 
@@ -220,5 +239,16 @@ def accelerator_label(runtime: TorchRuntime) -> str:
 
 
 def move_batch_to_device(batch: dict[str, object], device: torch.device) -> dict[str, object]:
+    logger = ProgressLogger("device_transfer", total_units=len(batch))
     non_blocking = device.type == "cuda"
-    return {k: (v.to(device, non_blocking=non_blocking) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+    moved: dict[str, object] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            logger.start_unit("move tensor to device", f"key={key} shape={tuple(value.shape)} device={device}")
+            moved[key] = value.to(device, non_blocking=non_blocking)
+            logger.finish_unit("move tensor to device", f"key={key} device={device}")
+        else:
+            logger.start_unit("leave non-tensor batch field on host", f"key={key} type={type(value).__name__}")
+            moved[key] = value
+            logger.finish_unit("leave non-tensor batch field on host", f"key={key}")
+    return moved

@@ -253,23 +253,25 @@ class MarkedTPPHead(nn.Module):
     """Marked temporal point process: log-normal mixture for Δt, conditional softmax mark|Δt.
 
     p(Δt | h) = Σ_k w_k(h) · LogNormal(Δt; μ_k(h), σ_k(h))
-    p(m  | h, Δt) = softmax(W_out @ (W_h h + W_φ φ(Δt)))
+    p(m  | h, Δt) = softmax(E @ (W_h h + W_φ φ(Δt)))
 
     φ(Δt) is a fixed log-spaced sinusoidal embedding of Δt.
     """
 
-    def __init__(self, dim: int, n_marks: int, n_mix: int = 8, mark_rank: int = 64, time_dim: int = 32):
+    def __init__(self, dim: int, n_marks: int, mark_weight: nn.Parameter, n_mix: int = 8, time_dim: int = 32):
         super().__init__()
         assert time_dim % 2 == 0
+        if mark_weight.shape != (n_marks, dim):
+            raise ValueError("mark_weight must have shape (n_marks, dim)")
         self.n_marks = n_marks
         self.n_mix = n_mix
         self.time_proj = nn.Linear(dim, 3 * n_mix)
-        self.mark_h_proj = nn.Linear(dim, mark_rank, bias=False)
-        self.mark_time_proj = nn.Linear(time_dim, mark_rank, bias=False)
-        self.mark_out = nn.Linear(mark_rank, n_marks, bias=False)
+        self.mark_h_proj = nn.Linear(dim, dim, bias=False)
+        self.mark_time_proj = nn.Linear(time_dim, dim, bias=False)
+        self.mark_out = nn.Linear(dim, n_marks, bias=False)
+        self.mark_out.weight = mark_weight
         nn.init.normal_(self.mark_h_proj.weight, std=0.02)
         nn.init.normal_(self.mark_time_proj.weight, std=0.02)
-        nn.init.normal_(self.mark_out.weight, std=0.02)
         freqs = torch.exp(torch.linspace(math.log(0.01), math.log(100.0), time_dim // 2))
         self.register_buffer("time_freqs", freqs, persistent=False)
 
@@ -310,7 +312,6 @@ class GenterpConfig:
     dropout: float = 0.0
     pad_atom_idx: int = 0
     n_time_mix: int = 8
-    mark_rank: int = 64
     time_phi_dim: int = 32
     value_mlp_hidden: int = 64
     value_head_hidden: int = 64
@@ -330,7 +331,7 @@ class Genterp(nn.Module):
             Block(cfg.dim, cfg.n_heads, self.rope, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
         )
         self.norm = RMSNorm(cfg.dim)
-        self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, cfg.n_time_mix, cfg.mark_rank, cfg.time_phi_dim)
+        self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, self.embed.embedding.weight, cfg.n_time_mix, cfg.time_phi_dim)
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
         self._attn_base_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
         self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
