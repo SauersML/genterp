@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -23,7 +24,6 @@ from google.cloud import bigquery
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.vocab import collapse_vocabulary
 
-CDR = "fc-aou-cdr-prod-curation.R2024Q3R5"  # AoU curated CDR project.dataset — edit per release
 THRESHOLD = 500
 
 NON_DRUG_TABLES = [
@@ -260,7 +260,12 @@ def _cached_value_stats(
 
 
 def main() -> None:
-    cdr = CDR
+    cdr = os.environ.get("WORKSPACE_CDR")
+    if not cdr:
+        raise SystemExit(
+            "WORKSPACE_CDR is not set. On the AoU Researcher Workbench it's set automatically; "
+            "outside AoU, export WORKSPACE_CDR=<project>.<dataset> before running."
+        )
     out_dir = Path.home() / "genterp" / "etl"
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = out_dir / "cache" / _cache_key(cdr)

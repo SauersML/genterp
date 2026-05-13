@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import uuid
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -11,13 +15,14 @@ from typing import Any
 import torch
 import transformers
 from transformers.trainer_pt_utils import LengthGroupedSampler
-from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
 
 RUNTIME_STATE_FILE = "genterp_runtime.json"
+FINAL_POINTER_FILE = "final_checkpoint.json"
+CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -110,12 +115,28 @@ def latest_checkpoint(output_dir: str | Path) -> str | None:
     output_dir = Path(output_dir)
     if not output_dir.is_dir():
         return None
-    return get_last_checkpoint(str(output_dir))
+    checkpoints = []
+    for path in output_dir.iterdir():
+        match = CHECKPOINT_RE.match(path.name)
+        if path.is_dir() and match and checkpoint_is_complete(path):
+            checkpoints.append((int(match.group(1)), path))
+    if not checkpoints:
+        return None
+    return str(max(checkpoints)[1])
 
 
 def final_model_path(output_dir: str | Path) -> str | None:
-    final_dir = Path(output_dir) / "final"
-    if (final_dir / "config.json").is_file():
+    output_dir = Path(output_dir)
+    pointer = output_dir / FINAL_POINTER_FILE
+    if pointer.is_file():
+        try:
+            final_dir = output_dir / str(json.loads(pointer.read_text())["path"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            final_dir = output_dir / "final"
+        if model_dir_is_complete(final_dir):
+            return str(final_dir)
+    final_dir = output_dir / "final"
+    if model_dir_is_complete(final_dir):
         return str(final_dir)
     return None
 
@@ -137,18 +158,64 @@ def runtime_state(runtime: TorchRuntime) -> dict[str, object]:
 def write_runtime_state(path: str | Path, runtime: TorchRuntime) -> None:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    (path / RUNTIME_STATE_FILE).write_text(json.dumps(runtime_state(runtime), indent=2, sort_keys=True))
+    atomic_write_json(path / RUNTIME_STATE_FILE, runtime_state(runtime))
 
 
 def checkpoint_runtime_state(path: str | Path) -> dict[str, object] | None:
     state_path = Path(path) / RUNTIME_STATE_FILE
     if not state_path.is_file():
         return None
-    return dict(json.loads(state_path.read_text()))
+    try:
+        return dict(json.loads(state_path.read_text()))
+    except json.JSONDecodeError:
+        return None
 
 
 def checkpoint_matches_runtime(path: str | Path, runtime: TorchRuntime) -> bool:
     return checkpoint_runtime_state(path) == runtime_state(runtime)
+
+
+def atomic_write_json(path: str | Path, data: dict[str, object]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with tmp.open("w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def model_dir_is_complete(path: str | Path) -> bool:
+    path = Path(path)
+    return path.is_dir() and (path / "config.json").is_file() and (
+        (path / "model.safetensors").is_file() or (path / "pytorch_model.bin").is_file()
+    )
+
+
+def checkpoint_is_complete(path: str | Path) -> bool:
+    path = Path(path)
+    return (
+        model_dir_is_complete(path)
+        and (path / "trainer_state.json").is_file()
+        and ((path / "optimizer.pt").is_file() or (path / "optimizer.bin").is_file())
+        and (path / "scheduler.pt").is_file()
+        and checkpoint_runtime_state(path) is not None
+    )
+
+
+def save_final_model(trainer: transformers.Trainer, output_dir: str | Path, runtime: TorchRuntime) -> None:
+    output_dir = Path(output_dir)
+    final_name = f"final-{trainer.state.global_step}-{uuid.uuid4().hex[:12]}"
+    tmp_dir = output_dir / f".{final_name}.tmp"
+    final_dir = output_dir / final_name
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    trainer.save_model(str(tmp_dir))
+    write_runtime_state(tmp_dir, runtime)
+    tmp_dir.replace(final_dir)
+    atomic_write_json(output_dir / FINAL_POINTER_FILE, {"path": final_dir.name})
 
 
 def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
