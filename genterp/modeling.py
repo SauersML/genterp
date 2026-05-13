@@ -219,12 +219,9 @@ class ValueModulator(nn.Module):
 
     def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         has_mag = self.event_has_magnitude(leaf_atom, value)
-        out = e_concept.clone()
-        selected = has_mag.nonzero(as_tuple=True)
-        selected_z = self.z_score(leaf_atom[selected], value[selected]).unsqueeze(-1)
-        modulation = torch.tanh(self.value_mlp(selected_z)).to(e_concept.dtype)
-        out[selected] = e_concept[selected] * modulation
-        return out
+        x = self.z_score(leaf_atom, value).unsqueeze(-1)
+        modulation = torch.tanh(self.value_mlp(x)).to(e_concept.dtype)
+        return torch.where(has_mag.unsqueeze(-1), e_concept * modulation, e_concept)
 
 
 class ValueHead(nn.Module):

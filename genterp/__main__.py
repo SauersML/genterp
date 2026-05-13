@@ -8,7 +8,7 @@ import torch
 
 from genterp import Genterp, GenterpConfig
 from genterp._synthetic import make_batch
-from genterp.runtime import configure_torch_runtime, move_batch_to_device
+from genterp.runtime import accelerator_label, configure_torch_runtime, move_batch_to_device
 
 
 def main() -> None:
@@ -31,7 +31,7 @@ def main() -> None:
     use_amp = runtime.device.type == "cuda" and (runtime.bf16 or runtime.fp16)
     scaler = torch.amp.GradScaler("cuda", enabled=runtime.fp16)
     params = sum(p.numel() for p in model.parameters())
-    print(f"genterp demo  device={runtime.device.type}  params={params:,}")
+    print(f"genterp demo  device={accelerator_label(runtime)}  params={params:,}")
 
     batch_size = max(4, runtime.per_device_train_batch_size)
     batch = move_batch_to_device(make_batch(B=batch_size, M=4, T=24, n_atoms=n_atoms, seed=0), runtime.device)

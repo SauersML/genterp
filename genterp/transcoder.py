@@ -1,24 +1,29 @@
-"""Cross-Layer Transcoder (CLT) with per-layer BatchTopK activations.
+"""Cross-Layer Transcoder (CLT) with JumpReLU activations + tanh sparsity penalty.
 
 For each layer ℓ ∈ [0, L):
-    features[n, ℓ] = BatchTopK_ℓ(ReLU(W_enc[ℓ] @ pre_mlp[n, ℓ] + b_enc[ℓ]))
+    preact[n, ℓ]   = W_enc[ℓ] @ pre_mlp[n, ℓ] + b_enc[ℓ]
+    features[n, ℓ] = preact * (preact > θ[ℓ])             # JumpReLU, per-feature θ
 For each output layer t ∈ [0, L):
-    mlp_out_recon[n, t] = Σ_{ℓ ≤ t} W_dec[ℓ → t] @ features[n, ℓ] + b_dec[t]
+    recon[n, t]    = Σ_{ℓ ≤ t} W_dec[ℓ → t] @ features[n, ℓ] + b_dec[t]
 
-Loss = Σ_t MSE((recon[n, t] - mlp_out[n, t]) / σ_t)
+Loss = Σ_t MSE((recon - mlp_out) / σ_t)  +  sparsity_coef · Σ tanh(features / scale)
 
-BatchTopK selects the top (k_per_token × n_tokens) preactivations per layer
-across the whole batch. Average sparsity is exact at k_per_token features per
-token per layer, with cross-token flexibility. After training,
-fit_inference_threshold() records a per-layer threshold so encode() works on a
-single sample at eval time. References: Bussmann et al. "BatchTopK SAEs"
-(2024); Lindsey, Pearce et al. "Circuit Tracing" (Anthropic, 2025).
+Per-feature thresholds θ live in log space (always positive) and are trained
+via STE backward through the JumpReLU forward. The tanh penalty is smooth
+everywhere. θ is a model parameter, not derived from batch statistics, so the
+gate is identical at training and inference — no calibration step.
+
+References: Ameisen et al. "Circuit Tracing" (Anthropic, 2025); Rajamanoharan
+et al. "JumpReLU SAEs" (GDM, 2024). BatchTopK (Bussmann et al. 2024) was
+considered and rejected for clinical activation heterogeneity: top-K methods
+select on raw magnitude across a pool, which suppresses subtle features
+regardless of frequency. Per-feature θ decouples sparsity from magnitude so
+rare-subtle features can survive on their own scale.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -33,9 +38,33 @@ class CLTConfig:
     n_layers: int
     dim: int
     n_features: int
-    k_per_token: int = 32
+    init_log_threshold: float = -4.6   # ≈ log(0.01)
+    jumprelu_bandwidth: float = 1e-3
+    sparsity_coef: float = 1e-3
+    sparsity_tanh_scale: float = 1.0
     activation_std_momentum: float = 0.99
     activation_std_eps: float = 1e-6
+
+
+class _JumpReLU(torch.autograd.Function):
+    """Forward: x · 𝟙[x > θ]. Backward: pass-through where active, rectangular STE on θ."""
+
+    @staticmethod
+    def forward(ctx, x, theta, bandwidth):
+        ctx.save_for_backward(x, theta)
+        ctx.bandwidth = bandwidth
+        return x * (x > theta).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, theta = ctx.saved_tensors
+        bw = ctx.bandwidth
+        grad_x = grad_output * (x > theta).to(grad_output.dtype)
+        in_band = ((x - theta).abs() < bw / 2).to(grad_output.dtype)
+        grad_theta = -grad_output * x * in_band / bw
+        while grad_theta.dim() > theta.dim():
+            grad_theta = grad_theta.sum(0)
+        return grad_x, grad_theta, None
 
 
 class CrossLayerTranscoder(nn.Module):
@@ -59,34 +88,18 @@ class CrossLayerTranscoder(nn.Module):
         self.register_buffer("dec_mask", torch.triu(torch.ones(L, L))[..., None, None], persistent=False)
         self.register_buffer("per_layer_std", torch.ones(L))
         self.register_buffer("per_layer_std_initialized", torch.tensor(False))
-        self.register_buffer("inference_threshold", torch.zeros(L))
-        self.register_buffer("inference_threshold_initialized", torch.tensor(False))
+
+        self.log_threshold = nn.Parameter(torch.full((L, Fdim), cfg.init_log_threshold))
 
     def _preact(self, pre_mlp: torch.Tensor) -> torch.Tensor:
         return torch.einsum("nld,lfd->nlf", pre_mlp, self.enc_weight) + self.enc_bias
 
-    def _batch_topk(self, relu: torch.Tensor) -> torch.Tensor:
-        N, L, Fdim = relu.shape
-        K = self.cfg.k_per_token
-        if K <= 0 or N == 0:
-            return torch.zeros_like(relu)
-        k_total = min(K * N, N * Fdim)
-        if k_total >= N * Fdim:
-            return relu
-        flat = relu.transpose(0, 1).reshape(L, N * Fdim)
-        _, idx = flat.topk(k_total, dim=-1)
-        mask = torch.zeros_like(flat).scatter_(-1, idx, 1.0)
-        return (flat * mask).reshape(L, N, Fdim).transpose(0, 1).contiguous()
-
-    def _threshold_gate(self, relu: torch.Tensor) -> torch.Tensor:
-        theta = self.inference_threshold.view(1, -1, 1).to(relu.dtype)
-        return relu * (relu > theta).to(relu.dtype)
+    def _theta_like(self, ref: torch.Tensor) -> torch.Tensor:
+        return self.log_threshold.exp().to(ref.dtype)
 
     def encode(self, pre_mlp: torch.Tensor) -> torch.Tensor:
-        relu = self._preact(pre_mlp).clamp_min(0)
-        if self.training or not bool(self.inference_threshold_initialized.item()):
-            return self._batch_topk(relu)
-        return self._threshold_gate(relu)
+        preact = self._preact(pre_mlp)
+        return _JumpReLU.apply(preact, self._theta_like(preact), self.cfg.jumprelu_bandwidth)
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
         masked = self.dec_weight * self.dec_mask
@@ -113,34 +126,12 @@ class CrossLayerTranscoder(nn.Module):
 
         per_layer_std = self.per_layer_std.view(1, self.cfg.n_layers, 1)
         recon_err = ((recon.float() - mlp_out.float()) / per_layer_std).pow(2).sum(dim=-1).mean()
+        sparsity = torch.tanh(features / self.cfg.sparsity_tanh_scale).sum(dim=(-2, -1)).mean()
+        total = recon_err + self.cfg.sparsity_coef * sparsity
 
         with torch.no_grad():
             n_active = (features > 0).float().sum(dim=-1).mean()
-        return {"loss": recon_err, "recon": recon_err, "n_active": n_active}
-
-    @torch.no_grad()
-    def fit_inference_threshold(self, pre_mlp_batches: Iterable[torch.Tensor]) -> None:
-        """Estimate per-layer threshold for batch-free inference. Records the mean
-        (across supplied batches) of the k_total-th largest preactivation per layer."""
-        K = self.cfg.k_per_token
-        per_layer_kth: list[torch.Tensor] = []
-        for pre_mlp in pre_mlp_batches:
-            relu = self._preact(pre_mlp).clamp_min(0)
-            N, L, Fdim = relu.shape
-            if K <= 0 or N == 0:
-                continue
-            k_total = min(K * N, N * Fdim)
-            if k_total >= N * Fdim:
-                per_layer_kth.append(torch.zeros(L, dtype=torch.float32, device=relu.device))
-                continue
-            flat = relu.transpose(0, 1).reshape(L, N * Fdim)
-            topk_vals, _ = flat.topk(k_total, dim=-1)
-            per_layer_kth.append(topk_vals[:, -1].detach().float())
-        if not per_layer_kth:
-            return
-        threshold = torch.stack(per_layer_kth).mean(dim=0)
-        self.inference_threshold.copy_(threshold.to(self.inference_threshold.dtype))
-        self.inference_threshold_initialized.fill_(True)
+        return {"loss": total, "recon": recon_err, "sparsity": sparsity, "n_active": n_active}
 
 
 @torch.no_grad()

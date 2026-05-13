@@ -10,12 +10,12 @@ from typing import Any
 
 import torch
 import transformers
-from transformers.trainer_pt_utils import LengthGroupedSampler
+from transformers.trainer_pt_utils import DistributedLengthGroupedSampler, LengthGroupedSampler
 from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
-from genterp.runtime import configure_torch_runtime
+from genterp.runtime import accelerator_label, configure_torch_runtime
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -47,8 +47,18 @@ class GenterpTrainer(transformers.Trainer):
             and self.args.train_sampling_strategy == "group_by_length"
             and hasattr(train_dataset, "lengths")
         ):
+            batch_size = self.args.train_batch_size * self.args.gradient_accumulation_steps
+            if self.args.world_size > 1:
+                return DistributedLengthGroupedSampler(
+                    batch_size,
+                    num_replicas=self.args.world_size,
+                    rank=self.args.process_index,
+                    seed=self.args.seed,
+                    drop_last=self.args.dataloader_drop_last,
+                    lengths=train_dataset.lengths,
+                )
             return LengthGroupedSampler(
-                self.args.train_batch_size * self.args.gradient_accumulation_steps,
+                batch_size,
                 lengths=train_dataset.lengths,
             )
         return super()._get_train_sampler(train_dataset)
@@ -96,6 +106,8 @@ def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch
 
 def main() -> None:
     runtime = configure_torch_runtime()
+    if runtime.device.type != "cuda" or runtime.device.index in (None, 0):
+        print(f"genterp train accelerator={accelerator_label(runtime)} batch_per_device={runtime.per_device_train_batch_size}")
     etl = Path.home() / "genterp" / "etl"
     output_dir = Path.home() / "genterp" / "runs"
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
@@ -125,10 +137,10 @@ def main() -> None:
         save_steps=2_000,
         logging_steps=50,
         optim=runtime.optim,
-        dataloader_num_workers=4,
+        dataloader_num_workers=runtime.dataloader_num_workers,
         dataloader_persistent_workers=True,
         dataloader_pin_memory=runtime.dataloader_pin_memory,
-        dataloader_prefetch_factor=4,
+        dataloader_prefetch_factor=runtime.dataloader_prefetch_factor,
         dataloader_drop_last=True,
         train_sampling_strategy="group_by_length",
         length_column_name="length",
@@ -138,10 +150,12 @@ def main() -> None:
         restore_callback_states_from_checkpoint=True,
         save_safetensors=True,
         auto_find_batch_size=runtime.auto_find_batch_size,
+        ddp_find_unused_parameters=runtime.ddp_find_unused_parameters,
+        ddp_bucket_cap_mb=runtime.ddp_bucket_cap_mb,
     )
     if runtime.torch_compile:
-        training_args["torch_compile_backend"] = "inductor"
-        training_args["torch_compile_mode"] = "max-autotune"
+        training_args["torch_compile_backend"] = runtime.torch_compile_backend
+        training_args["torch_compile_mode"] = runtime.torch_compile_mode
 
     trainer = GenterpTrainer(
         model=model,
