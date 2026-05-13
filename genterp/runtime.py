@@ -87,30 +87,11 @@ def _best_cuda_device(props: list[Any]) -> int:
     return max(range(len(props)), key=lambda index: _cuda_score(index, props[index]))
 
 
-def _cuda_dataloader_workers(device_count: int) -> int:
+def _cuda_dataloader_workers(active_device_count: int) -> int:
     cpu_count = os.cpu_count() or 8
-    workers_per_rank = max(2, cpu_count // max(device_count, 1))
-    return min(8, workers_per_rank)
-
-
-def _local_rank() -> int | None:
-    value = os.environ.get("LOCAL_RANK")
-    return int(value) if value is not None else None
-
-
-def should_launch_distributed() -> bool:
-    """True iff we're the parent of a not-yet-launched multi-GPU job.
-
-    LOCAL_RANK is set by the launcher (torchrun / accelerate / HF Trainer)
-    inside each worker — checking for its absence is the standard way to tell
-    'I'm the outermost process and need to spawn workers' from 'I'm already a
-    worker and should just configure my own device.'
-    """
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.device_count() > 1
-        and _local_rank() is None
-    )
+    if active_device_count > 1:
+        return min(16, max(4, cpu_count // 2))
+    return min(8, max(2, cpu_count // 4))
 
 
 def get_torch_runtime() -> TorchRuntime:
@@ -118,13 +99,7 @@ def get_torch_runtime() -> TorchRuntime:
         device_count = torch.cuda.device_count()
         all_props = [torch.cuda.get_device_properties(index) for index in range(device_count)]
         use_data_parallel = _cuda_devices_are_homogeneous(all_props)
-        rank = _local_rank()
-        if rank is not None:
-            device_index = rank % max(device_count, 1)
-        elif use_data_parallel:
-            device_index = 0
-        else:
-            device_index = _best_cuda_device(all_props)
+        device_index = 0 if use_data_parallel else _best_cuda_device(all_props)
         torch.cuda.set_device(device_index)
         props: Any = all_props[device_index]
         capability = _cuda_capability(device_index, props)
@@ -133,6 +108,7 @@ def get_torch_runtime() -> TorchRuntime:
         tf32 = capability[0] >= 8
         compile_model = capability[0] >= 8
         large_hopper = capability[0] >= 9
+        active_device_count = device_count if use_data_parallel else 1
         return TorchRuntime(
             device=torch.device("cuda", device_index),
             cuda_device_count=device_count,
@@ -147,7 +123,7 @@ def get_torch_runtime() -> TorchRuntime:
             torch_compile_mode="max-autotune" if large_hopper else "reduce-overhead" if compile_model else None,
             optim="adamw_torch_fused",
             use_data_parallel=use_data_parallel,
-            dataloader_num_workers=_cuda_dataloader_workers(device_count),
+            dataloader_num_workers=_cuda_dataloader_workers(active_device_count),
             dataloader_pin_memory=True,
             dataloader_prefetch_factor=4,
             auto_find_batch_size=True,

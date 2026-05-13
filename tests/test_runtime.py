@@ -16,7 +16,7 @@ def test_cuda_batch_size_scales_with_visible_memory():
     assert batch_size_for_cuda_memory(180 * GIB) == 32
 
 
-def test_cuda_runtime_uses_bf16_when_supported(monkeypatch):
+def test_cuda_runtime_uses_all_homogeneous_bf16_devices(monkeypatch):
     set_devices = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
@@ -24,7 +24,7 @@ def test_cuda_runtime_uses_bf16_when_supported(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda index: SimpleNamespace(total_memory=180 * GIB, name=f"NVIDIA H200 {index}", major=9, minor=0),
+        lambda index: SimpleNamespace(total_memory=180 * GIB, name=f"accelerator-{index}", major=9, minor=0),
     )
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
 
@@ -33,7 +33,6 @@ def test_cuda_runtime_uses_bf16_when_supported(monkeypatch):
     assert runtime.device.type == "cuda"
     assert runtime.device.index == 0
     assert runtime.cuda_device_count == 8
-    assert runtime.cuda_name == "NVIDIA H200 0"
     assert runtime.cuda_capability == (9, 0)
     assert runtime.per_device_train_batch_size == 32
     assert runtime.bf16
@@ -48,21 +47,20 @@ def test_cuda_runtime_uses_bf16_when_supported(monkeypatch):
     assert "strategy=data_parallel" in accelerator_label(runtime)
 
 
-def test_cuda_runtime_uses_fp16_when_bf16_is_not_supported(monkeypatch):
+def test_cuda_runtime_uses_fp16_without_unsupported_newer_cuda_features(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _: SimpleNamespace(total_memory=16 * GIB, name="NVIDIA T4", major=7, minor=5),
+        lambda _: SimpleNamespace(total_memory=16 * GIB, name="accelerator", major=7, minor=5),
     )
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
 
     runtime = get_torch_runtime()
 
     assert runtime.device.type == "cuda"
-    assert runtime.cuda_name == "NVIDIA T4"
     assert runtime.cuda_capability == (7, 5)
     assert runtime.per_device_train_batch_size == 2
     assert not runtime.bf16
@@ -79,10 +77,10 @@ def test_cuda_runtime_picks_best_visible_mixed_gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
     props = [
-        SimpleNamespace(total_memory=16 * GIB, name="NVIDIA T4", major=7, minor=5),
-        SimpleNamespace(total_memory=180 * GIB, name="NVIDIA H200", major=9, minor=0),
-        SimpleNamespace(total_memory=80 * GIB, name="NVIDIA A100", major=8, minor=0),
-        SimpleNamespace(total_memory=24 * GIB, name="NVIDIA L4", major=8, minor=9),
+        SimpleNamespace(total_memory=16 * GIB, name="small", major=7, minor=5),
+        SimpleNamespace(total_memory=180 * GIB, name="largest-newest", major=9, minor=0),
+        SimpleNamespace(total_memory=80 * GIB, name="large", major=8, minor=0),
+        SimpleNamespace(total_memory=24 * GIB, name="newer-small", major=8, minor=9),
     ]
     monkeypatch.setattr(
         torch.cuda,
@@ -94,7 +92,6 @@ def test_cuda_runtime_picks_best_visible_mixed_gpu(monkeypatch):
     runtime = get_torch_runtime()
 
     assert runtime.device == torch.device("cuda", 1)
-    assert runtime.cuda_name == "NVIDIA H200"
     assert not runtime.use_data_parallel
     assert set_devices == [1]
     assert "strategy=single_gpu" in accelerator_label(runtime)
