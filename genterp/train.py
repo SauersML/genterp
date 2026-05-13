@@ -86,20 +86,15 @@ class VerboseTrainerProgressCallback(transformers.TrainerCallback):
         )
         return control
 
-    def on_step_begin(self, args, state, control, **kwargs):
-        total = int(state.max_steps or args.max_steps or 0)
-        self.logger.set_progress(int(state.global_step), total)
-        self.logger.log(
-            "training step starts",
-            f"next_step={state.global_step + 1:,}; Trainer will load a batch, run forward loss, "
-            "backpropagate, clip/update gradients, and advance scheduler",
-        )
-        return control
-
     def on_step_end(self, args, state, control, **kwargs):
+        """Lightweight per-step pulse: only update the progress counter.
+
+        We deliberately do NOT log on every step — at 8 it/s × 50K steps that's
+        50K lines of noise. The on_log callback fires at logging_steps cadence
+        and emits the per-step metrics; that's the user-visible signal.
+        """
         total = int(state.max_steps or args.max_steps or 0)
         self.logger.set_progress(int(state.global_step), total)
-        self.logger.log("training step complete", f"global_step={state.global_step:,}")
         return control
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -445,11 +440,12 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
         "tf32": runtime.tf32,
         "torch_compile": runtime.torch_compile,
         "save_strategy": "steps",
-        "save_steps": 1,
+        "save_steps": 500,
+        "save_total_limit": 5,
         "eval_strategy": "steps",
         "eval_steps": 500,
         "prediction_loss_only": True,
-        "logging_steps": 1,
+        "logging_steps": 25,
         "logging_first_step": True,
         "optim": runtime.optim,
         "dataloader_num_workers": runtime.dataloader_num_workers,
@@ -563,7 +559,8 @@ def main(argv: list[str] | None = None) -> None:
     setup.finish_unit(
         "build training arguments",
         f"max_steps={training_args['max_steps']:,} logging_steps={training_args['logging_steps']} "
-        f"save_steps={training_args['save_steps']} eval_steps={training_args['eval_steps']} "
+        f"save_steps={training_args['save_steps']} save_total_limit={training_args['save_total_limit']} "
+        f"eval_steps={training_args['eval_steps']} "
         f"lr_scheduler={training_args['lr_scheduler_type']} gradient_checkpointing={training_args['gradient_checkpointing']}",
     )
 

@@ -378,23 +378,12 @@ def _default_activation_batch_tokens(runtime: TorchRuntime) -> int:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a CLT on a frozen Genterp checkpoint.")
-    parser.add_argument("--tiny", action="store_true", help="Use smaller default CLT feature count for tiny runs.")
-    parser.add_argument("--model-dir", type=Path, default=None, help="Genterp checkpoint directory to explain.")
-    parser.add_argument("--data-dir", type=Path, default=Path.home() / "genterp" / "etl")
-    parser.add_argument("--output-dir", type=Path, default=Path.home() / "genterp" / "clt-runs")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
-    parser.add_argument("--n-features", type=int, default=None)
-    parser.add_argument("--off-diagonal-rank", type=int, default=32)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--activation-batch-tokens", type=int, default=None)
-    parser.add_argument("--subject-batch-size", type=int, default=None)
-    parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
-    parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
-    parser.add_argument("--eval-batches", type=int, default=8)
-    parser.add_argument("--max-events", type=int, default=4096)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--tiny",
+        action="store_true",
+        help="Load from ~/genterp/runs-tiny/ and use the tiny CLT preset. Pair with "
+        "`scripts.aou_etl --tiny` + `genterp.train --tiny`.",
+    )
     return parser.parse_args(argv)
 
 
@@ -407,13 +396,18 @@ def main(argv: list[str] | None = None) -> None:
     runtime = configure_torch_runtime()
     setup.finish_unit("configure torch runtime", f"accelerator={accelerator_label(runtime)}")
 
-    setup.start_unit("resolve Genterp checkpoint", "using --model-dir or final model pointer")
-    model_dir = args.model_dir
-    if model_dir is None:
-        resolved = final_model_path(Path.home() / "genterp" / "runs")
-        if resolved is None:
-            raise FileNotFoundError("no Genterp final checkpoint found; pass --model-dir")
-        model_dir = Path(resolved)
+    data_dir = Path.home() / "genterp" / "etl"
+    runs_dir = Path.home() / "genterp" / ("runs-tiny" if args.tiny else "runs")
+    output_dir = runs_dir / "clt"
+
+    setup.start_unit("resolve Genterp checkpoint", f"runs_dir={runs_dir}")
+    resolved = final_model_path(runs_dir)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"no Genterp final checkpoint under {runs_dir}; run `python -m genterp.train"
+            f"{' --tiny' if args.tiny else ''}` first"
+        )
+    model_dir = Path(resolved)
     setup.finish_unit("resolve Genterp checkpoint", f"model_dir={model_dir}")
 
     setup.start_unit("load frozen Genterp model", f"path={model_dir}")
@@ -427,25 +421,17 @@ def main(argv: list[str] | None = None) -> None:
         f"layers={base.cfg.n_layers} dim={base.cfg.dim} params={count_parameters(model):,}",
     )
 
-    setup.start_unit("build CLT datasets", f"data_dir={args.data_dir} max_events={args.max_events:,}")
-    train_dataset = CohortDataset(args.data_dir, max_events=args.max_events, split="train")
-    eval_dataset = CohortDataset(args.data_dir, max_events=args.max_events, split="test")
+    setup.start_unit("build CLT datasets", f"data_dir={data_dir}")
+    train_dataset = CohortDataset(data_dir, split="train")
+    eval_dataset = CohortDataset(data_dir, split="test")
     setup.finish_unit("build CLT datasets", f"train={len(train_dataset):,} eval={len(eval_dataset):,}")
 
-    subject_batch_size = args.subject_batch_size or runtime.per_device_train_batch_size
-    activation_batch_tokens = args.activation_batch_tokens or _default_activation_batch_tokens(runtime)
+    subject_batch_size = runtime.per_device_train_batch_size
+    activation_batch_tokens = _default_activation_batch_tokens(runtime)
     training_cfg = CLTTrainingConfig(
-        steps=args.steps,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        grad_clip_norm=args.grad_clip_norm,
+        steps=500 if args.tiny else DEFAULT_STEPS,
         activation_batch_tokens=activation_batch_tokens,
         subject_batch_size=subject_batch_size,
-        eval_every=args.eval_every,
-        save_every=args.save_every,
-        eval_batches=args.eval_batches,
-        max_events=args.max_events,
-        seed=args.seed,
     )
 
     setup.start_unit("build CLT dataloaders", f"subject_batch_size={subject_batch_size}")
@@ -453,20 +439,21 @@ def main(argv: list[str] | None = None) -> None:
     eval_loader = build_clt_dataloader(eval_dataset, batch_size=subject_batch_size, runtime=runtime, training=False)
     setup.finish_unit("build CLT dataloaders", f"workers={runtime.dataloader_num_workers}")
 
-    n_features = args.n_features or (256 if args.tiny else 8192)
+    n_features = 256 if args.tiny else 8192
+    off_diagonal_rank = 4 if args.tiny else 32
     clt_cfg = CLTConfig(
         n_layers=base.cfg.n_layers,
         dim=base.cfg.dim,
         n_features=n_features,
-        off_diagonal_rank=args.off_diagonal_rank,
+        off_diagonal_rank=off_diagonal_rank,
     )
-    setup.start_unit("initialize CLT", f"features={n_features:,} off_diagonal_rank={args.off_diagonal_rank}")
+    setup.start_unit("initialize CLT", f"features={n_features:,} off_diagonal_rank={off_diagonal_rank}")
     clt = CrossLayerTranscoder(clt_cfg).to(runtime.device)
     setup.finish_unit("initialize CLT", f"params={count_parameters(clt):,}")
 
-    setup.start_unit("prepare CLT output directory", f"path={args.output_dir}")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    setup.finish_unit("prepare CLT output directory", f"path={args.output_dir}")
+    setup.start_unit("prepare CLT output directory", f"path={output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    setup.finish_unit("prepare CLT output directory", f"path={output_dir}")
 
     setup.start_unit(
         "train CLT",
@@ -479,7 +466,7 @@ def main(argv: list[str] | None = None) -> None:
         eval_loader,
         runtime=runtime,
         training_cfg=training_cfg,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
     )
     setup.finish_unit(
         "train CLT",
