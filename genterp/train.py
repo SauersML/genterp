@@ -481,9 +481,9 @@ def main(argv: list[str] | None = None) -> None:
     if runtime.device.type != "cuda" or runtime.device.index in (None, 0):
         print(f"genterp train accelerator={accelerator_label(runtime)} batch_per_device={runtime.per_device_train_batch_size}")
 
-    setup.start_unit("resolve ETL and output directories", "using ~/genterp/etl and ~/genterp/runs")
+    setup.start_unit("resolve ETL and output directories", "tiny runs land under runs-tiny so they don't warm-start the full pipeline")
     etl = Path.home() / "genterp" / "etl"
-    output_dir = Path.home() / "genterp" / "runs"
+    output_dir = Path.home() / "genterp" / ("runs-tiny" if tiny else "runs")
     setup.finish_unit("resolve ETL and output directories", f"etl={etl} output_dir={output_dir}")
 
     setup.start_unit("load vocabulary", f"path={etl / 'vocab.json'}")

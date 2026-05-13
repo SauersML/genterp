@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_TOTAL_UNITS=7
+RUN_TOTAL_UNITS=8
 RUN_COMPLETED_UNITS=0
 RUN_STARTED_AT="$(date +%s)"
 
@@ -67,3 +67,7 @@ finish_run_unit "run AoU ETL workflow"
 log_run "START run Genterp training workflow"
 uv run python -m genterp.train "$@"
 finish_run_unit "run Genterp training workflow"
+
+log_run "START run CLT training workflow"
+uv run python -m genterp.clt_train "$@"
+finish_run_unit "run CLT training workflow"

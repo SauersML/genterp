@@ -56,31 +56,56 @@ def _set_bq_job_cache_dir(p: Path) -> None:
     _BQ_JOB_CACHE_DIR = p
 
 
-def _bq_job_id_file(sql: str) -> Path | None:
+def _bq_param_fingerprint(parameters: Sequence[bigquery.ArrayQueryParameter] | None) -> str:
+    if not parameters:
+        return ""
+    parts: list[str] = []
+    for p in parameters:
+        name = getattr(p, "name", "") or ""
+        ptype = getattr(p, "array_type", None) or getattr(p, "type_", None) or ""
+        values = getattr(p, "values", None)
+        if values is None:
+            values = getattr(p, "value", None)
+        try:
+            values_repr = json.dumps(values, default=str, sort_keys=True)
+        except (TypeError, ValueError):
+            values_repr = repr(values)
+        parts.append(f"{name}:{ptype}:{values_repr}")
+    return "\n".join(parts)
+
+
+def _bq_job_id_file(sql: str, parameters: Sequence[bigquery.ArrayQueryParameter] | None = None) -> Path | None:
     if _BQ_JOB_CACHE_DIR is None:
         return None
-    key = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
+    blob = sql + "\n--params--\n" + _bq_param_fingerprint(parameters)
+    key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
     return _BQ_JOB_CACHE_DIR / f"{key}.txt"
 
 
-def _submit_or_reuse_job(client: bigquery.Client, sql: str, label: str) -> bigquery.QueryJob:
-    """Resume a prior server-side BQ job for this exact SQL if still available, else submit a fresh one."""
-    job_id_file = _bq_job_id_file(sql)
+def _submit_or_reuse_job(
+    client: bigquery.Client,
+    sql: str,
+    label: str,
+    parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
+) -> bigquery.QueryJob:
+    """Resume a prior server-side BQ job for this exact SQL+params if still available."""
+    job_id_file = _bq_job_id_file(sql, parameters)
     if job_id_file is not None and job_id_file.exists():
         prev_id = job_id_file.read_text().strip()
         try:
             job = client.get_job(prev_id)
             if job.state == "DONE" and job.error_result is None:
-                _log(f"  bq reuse:  {label} job_id={prev_id} (server-cached result)")
+                _log(f"  bq reuse:   {label} job_id={prev_id} (server-cached result)")
                 return job
-            _log(f"  bq prior job state={job.state}; resubmitting")
+            _log(f"  bq prior:   {label} state={job.state}; resubmitting")
         except Exception as exc:
-            _log(f"  bq prior job lookup failed ({exc.__class__.__name__}); resubmitting")
-    _log(f"  bq submit: {label}")
-    job = client.query(sql)
+            _log(f"  bq prior:   {label} lookup failed ({exc.__class__.__name__}); resubmitting")
+    _log(f"  bq submit:  {label}")
+    job_config = bigquery.QueryJobConfig(query_parameters=list(parameters or [])) if parameters else None
+    job = client.query(sql, job_config=job_config) if job_config is not None else client.query(sql)
     if job_id_file is not None:
         job_id_file.write_text(job.job_id or "")
-        _log(f"  bq job_id={job.job_id} (recorded for resume)")
+        _log(f"  bq job_id:  {label} {job.job_id} (recorded for resume)")
     return job
 
 
@@ -158,19 +183,15 @@ def _run_aggregation(
     label: str,
     parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
 ) -> pa.Table:
-    """Submit a BQ aggregation query, log live progress, download via Storage API.
+    """Submit (or reuse) a BQ aggregation, log live progress, download via Storage API.
 
-    For analytic queries (coverage, ancestors, concept codes) where we need to *see*
-    the query making progress. Job-id caching is skipped because parameters change the
-    result, and these queries are anyway one-shot per CDR (the outer JSON cache handles
-    persistence across runs).
+    Hits the SQL+params job-id cache, so a Python crash *after* the BQ job completed
+    but *before* the result was consumed costs nothing on retry — BQ keeps job
+    results server-side for 24h. The outer JSON cache (``_cache_json``) handles
+    persistence across longer windows.
     """
     t0 = time.monotonic()
-    job_config = bigquery.QueryJobConfig(query_parameters=list(parameters or []))
-    _log(f"  bq submit:  {label}")
-    job = client.query(sql, job_config=job_config)
-    _log(f"  bq job_id:  {label} {job.job_id}")
-
+    job = _submit_or_reuse_job(client, sql, label, parameters)
     _wait_with_progress(job, label)
     t_done = time.monotonic()
     _log(f"  bq query:   {label} completed in {t_done-t0:.1f}s; downloading via Storage API")
@@ -199,7 +220,7 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
     Arrow table in process memory.
     """
     if out_path.exists():
-        _log(f"cache hit:  {out_path.name}")
+        _log(f"cache hit:  {out_path.name} ({out_path.stat().st_size/1e9:.2f}GB)")
         return
     _log(f"streaming:  {out_path.name} (BQ Storage API, parallel streams)")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,24 +336,24 @@ def _path_fingerprint(path: Path) -> str:
 
 def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFrame:
     if path.exists():
-        _log(f"cache hit:  {path.name}; reading parquet from disk")
+        size_gb = path.stat().st_size / 1e9
+        _log(f"cache hit:  {path.name} ({size_gb:.2f}GB); reading parquet from disk")
         t0 = time.monotonic()
         data = pl.read_parquet(path)
-        _log(f"cache read complete: {path.name} rows={data.height:,} columns={len(data.columns):,} in {time.monotonic() - t0:.1f}s")
+        _log(f"cache read: {path.name} rows={data.height:,} columns={len(data.columns):,} in {time.monotonic() - t0:.1f}s")
         return data
     _log(f"cache miss: {path.name}; building dataframe")
     t_build = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = build()
-    _log(f"cache build complete: {path.name} rows={data.height:,} columns={len(data.columns):,} in {time.monotonic() - t_build:.1f}s")
     tmp = path.with_suffix(path.suffix + ".tmp")
-    _log(f"parquet write starting: {tmp} rows={data.height:,}")
     t_write = time.monotonic()
     data.write_parquet(tmp)
-    bytes_written = tmp.stat().st_size
-    _log(f"parquet write complete: {tmp.name} bytes={bytes_written:,} in {time.monotonic() - t_write:.1f}s; renaming to final path")
     tmp.replace(path)
-    _log(f"cached:     {path.name} rows={data.height:,} total={time.monotonic() - t_build:.1f}s")
+    _log(
+        f"cached:     {path.name} ({path.stat().st_size/1e9:.2f}GB) "
+        f"rows={data.height:,} build={t_write - t_build:.1f}s write={time.monotonic() - t_write:.1f}s"
+    )
     return data
 
 
@@ -348,7 +369,7 @@ def _arrow_to_polars(arrow_table, label: str) -> pl.DataFrame:
 def _sink_parquet(lf: pl.LazyFrame, path: Path, label: str) -> None:
     """Streaming sink: never materialize the full frame in memory."""
     if path.exists():
-        _log(f"cache hit:  {path.name}")
+        _log(f"cache hit:  {path.name} ({path.stat().st_size/1e9:.2f}GB)")
         return
     _log(f"sink:       {path.name} (streaming)")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -358,21 +379,104 @@ def _sink_parquet(lf: pl.LazyFrame, path: Path, label: str) -> None:
     t0 = time.monotonic()
     lf.sink_parquet(tmp, compression="zstd")
     tmp.replace(path)
-    _log(f"sunk:       {path.name} bytes={path.stat().st_size:,} in {time.monotonic() - t0:.1f}s")
+    _log(f"sunk:       {path.name} ({path.stat().st_size/1e9:.2f}GB) in {time.monotonic() - t0:.1f}s")
+
+
+def _summarize_cache_state(out_dir: Path, cache_dir: Path) -> None:
+    """Print a single block of HIT/MISS status for every artifact this run will produce.
+
+    Anything tagged HIT below will short-circuit its build step at the cache layer.
+    Anything MISS will be computed fresh; if a build step crashes, its BQ job-id
+    (under ``cache_dir/bq_jobs/``) is still recorded so the next run reuses BQ's
+    server-cached result rather than re-billing the same query.
+    """
+    candidates: list[tuple[str, Path]] = [
+        ("publish", out_dir / "events.parquet"),
+        ("publish", out_dir / "subjects.parquet"),
+        ("publish", out_dir / "vocab.json"),
+        ("publish", out_dir / "value_stats.json"),
+        ("cache", cache_dir / "all_events.parquet"),
+        ("cache", cache_dir / "persons.parquet"),
+        ("cache", cache_dir / "censor.parquet"),
+        ("cache", cache_dir / "concept_codes.json"),
+    ]
+    # Match keyed paths by stable prefix — keys aren't known until later steps run.
+    keyed_prefixes = [
+        "own_counts-",
+        "coverage_and_ancestors-",
+        "collapsed_vocab-",
+        "value_stats-",
+        "events-",
+        "subjects-",
+    ]
+    matched_by_prefix: dict[str, list[Path]] = {p: [] for p in keyed_prefixes}
+    if cache_dir.exists():
+        for entry in cache_dir.iterdir():
+            for prefix in keyed_prefixes:
+                if entry.name.startswith(prefix):
+                    matched_by_prefix[prefix].append(entry)
+                    break
+
+    _log("cache state at run start:")
+    n_hit = n_miss = 0
+    for kind, path in candidates:
+        if path.exists():
+            n_hit += 1
+            unit = "GB" if path.stat().st_size >= 1e9 else "MB"
+            size = path.stat().st_size / (1e9 if unit == "GB" else 1e6)
+            _log(f"  [{kind:7s}] HIT  {path.name} ({size:.2f}{unit})")
+        else:
+            n_miss += 1
+            _log(f"  [{kind:7s}] MISS {path.name}")
+    for prefix, entries in matched_by_prefix.items():
+        if entries:
+            for entry in sorted(entries):
+                unit = "GB" if entry.stat().st_size >= 1e9 else "MB"
+                size = entry.stat().st_size / (1e9 if unit == "GB" else 1e6)
+                _log(f"  [keyed  ] HIT  {entry.name} ({size:.2f}{unit})")
+                n_hit += 1
+        else:
+            _log(f"  [keyed  ] MISS {prefix}*")
+            n_miss += 1
+
+    job_cache = cache_dir / "bq_jobs"
+    n_jobs = sum(1 for _ in job_cache.iterdir()) if job_cache.exists() else 0
+    _log(f"cache state summary: {n_hit} hits, {n_miss} misses, {n_jobs} BQ job-ids on file for resume")
+
+
+def _publish(source: Path, dest: Path) -> None:
+    """Make ``dest`` an instant alias for ``source`` (hardlink if same filesystem, else copy).
+
+    The final ETL outputs (events.parquet, subjects.parquet) live in ``out_dir`` but
+    their authoritative copies are under ``cache_dir``. Hardlinking is O(1) and
+    zero-disk; only falls back to a streaming copy if the two live on different
+    filesystems (cross-device EXDEV).
+    """
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, dest)
+        _log(f"publish:    {dest.name} ← {source.name} (hardlink, 0B)")
+    except OSError as exc:
+        if getattr(exc, "errno", None) != 18:  # EXDEV
+            raise
+        _log(f"publish:    {dest.name} ← {source.name} (cross-device, streaming copy)")
+        pl.scan_parquet(str(source)).sink_parquet(dest, compression="zstd")
 
 
 def _cache_json(path: Path, build: Callable[[], object]) -> object:
     if path.exists():
-        _log(f"cache hit:  {path.name}; reading json from disk")
+        _log(f"cache hit:  {path.name} ({path.stat().st_size/1e6:.2f}MB); reading json from disk")
         payload = json.loads(path.read_text())
-        _log(f"cache read complete: {path.name} ({_payload_units(payload)})")
+        _log(f"cache read: {path.name} ({_payload_units(payload)})")
         return payload
     _log(f"cache miss: {path.name}; building json payload")
     t0 = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = build()
     _write_json(path, data)
-    _log(f"cached:     {path.name} in {time.monotonic() - t0:.1f}s")
+    _log(f"cached:     {path.name} ({path.stat().st_size/1e6:.2f}MB) in {time.monotonic() - t0:.1f}s")
     return data
 
 
@@ -673,6 +777,7 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"cache_dir={cache_dir}")
     if TINY:
         _log(f"--tiny active: sampling 1/{TINY_PERSON_MOD} of person_ids end-to-end")
+    _summarize_cache_state(out_dir, cache_dir)
     _WORK.finish_unit("validate AoU CDR configuration", f"out_dir={out_dir} cache_dir={cache_dir}")
     client_instance: bigquery.Client | None = None
 
@@ -750,8 +855,7 @@ def main(argv: list[str] | None = None) -> None:
         .sort(["subject_id", "time_seconds"])
     )
     _sink_parquet(final_lf, final_events_path, "final_events")
-    _log(f"copying final events to: {out_dir / 'events.parquet'}")
-    pl.scan_parquet(str(final_events_path)).sink_parquet(out_dir / "events.parquet", compression="zstd")
+    _publish(final_events_path, out_dir / "events.parquet")
     final_events_lf = pl.scan_parquet(str(final_events_path))
     final_rows = final_events_lf.select(pl.len()).collect(engine="streaming").item()
     _WORK.finish_unit("filter and sort final events", f"rows={final_rows:,}")
@@ -806,12 +910,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         .sort("subject_id")
     )
-    subjects = _cache_parquet(
-        cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet",
-        lambda: subjects,
-    )
-    _log(f"writing final subjects parquet: {out_dir / 'subjects.parquet'} rows={subjects.height:,}")
-    subjects.write_parquet(out_dir / "subjects.parquet")
+    subjects_path = cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet"
+    subjects = _cache_parquet(subjects_path, lambda: subjects)
+    _publish(subjects_path, out_dir / "subjects.parquet")
     _WORK.finish_unit("build subject metadata", f"subjects={subjects.height:,}")
 
     _WORK.start_unit("summarize ETL artifacts", "counting split rows and final artifact dimensions")
