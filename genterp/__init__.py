@@ -1,4 +1,3 @@
-from genterp.clt_train import CLTTrainingConfig, load_clt_artifact, train_clt
 from genterp.modeling import (
     AtomEmbedding,
     ContinuousTimeRoPE,
@@ -25,7 +24,6 @@ from genterp.transcoder import (
 __all__ = [
     "AtomEmbedding",
     "CLTConfig",
-    "CLTTrainingConfig",
     "CrossLayerTranscoder",
     "FeatureActivationWindow",
     "FeatureGraphEdge",
@@ -40,8 +38,6 @@ __all__ = [
     "feature_to_output_attribution",
     "harvest_transcoder_acts",
     "top_activating_examples",
-    "train_clt",
-    "load_clt_artifact",
     "unwrap_genterp_model",
     "marked_tpp_value_loss",
 ]

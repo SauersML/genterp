@@ -44,6 +44,11 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
     config_class = GenterpHFConfig
     main_input_name = "event_atoms"
     supports_gradient_checkpointing = True
+    # tpp.mark_out shares storage with the atom embedding (input/output weight tie).
+    # transformers 5.x expects a dict mapping tied → source so save_pretrained can
+    # dedup on disk and re-tie on load.
+    _tied_weights_keys = {"model.tpp.mark_out.weight": "model.embed.embedding.weight"}
+    all_tied_weights_keys = _tied_weights_keys
 
     def __init__(self, config: GenterpHFConfig):
         super().__init__(config)

@@ -1,96 +1,104 @@
-"""Smoke test for end-to-end CLT training against a fake-saved tiny Genterp.
-
-Asserts: clt_train.main(["--tiny", "--max-steps=2"]) runs without error,
-the recon loss is recorded, and a CLT checkpoint lands at runs-tiny/clt/final/clt.pt.
-"""
-
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import polars as pl
 import pytest
 import torch
 
-from genterp import clt_train
-from genterp.modeling import Genterp, GenterpConfig
-from genterp.train import GenterpForCausalLM, GenterpHFConfig
+from genterp.clt_train import CLTTrainingConfig, iter_activation_chunks, load_clt_artifact, train_clt
+from genterp.modeling import Genterp
+from genterp.runtime import TorchRuntime
+from genterp.transcoder import CLTConfig, CrossLayerTranscoder
+from tests._factories import make_batch, tiny_config
 
 
-def _write_minimal_etl(etl: Path, n_atoms: int) -> None:
-    etl.mkdir(parents=True, exist_ok=True)
-    vocab = {f"V/{i}": i for i in range(1, n_atoms)}  # atom 0 reserved for PAD
-    (etl / "vocab.json").write_text(json.dumps(vocab))
-    (etl / "value_stats.json").write_text("{}")
-    # Two tiny subjects, a handful of events each.
-    pl.DataFrame(
-        {
-            "subject_id": [1, 1, 1, 1, 2, 2, 2, 2],
-            "time_seconds": [0, 86400, 172800, 259200, 0, 86400, 172800, 259200],
-            "atom": pl.Series([1, 2, 3, 1, 2, 3, 1, 2], dtype=pl.UInt32),
-            "value": [None] * 8,
-        }
-    ).write_parquet(etl / "events.parquet")
-    pl.DataFrame(
-        {
-            "subject_id": [1, 2],
-            "start": [0, 4],
-            "end": [3, 7],
-            "sex": [0, 1],
-            "birth_seconds": [0, 0],
-            "censor_seconds": [86400 * 10, 86400 * 10],
-            "split": ["train", "train"],
-        }
-    ).write_parquet(etl / "subjects.parquet")
+def _cpu_runtime() -> TorchRuntime:
+    return TorchRuntime(
+        device=torch.device("cpu"),
+        cuda_device_count=0,
+        cuda_name=None,
+        cuda_capability=None,
+        per_device_train_batch_size=1,
+        bf16=False,
+        fp16=False,
+        tf32=False,
+        torch_compile=False,
+        torch_compile_backend=None,
+        torch_compile_mode=None,
+        optim="adamw_torch",
+        use_data_parallel=False,
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+        dataloader_prefetch_factor=None,
+        auto_find_batch_size=False,
+    )
 
 
-def _seed_fake_genterp(runs_dir: Path, n_atoms: int) -> None:
-    cfg = GenterpConfig(n_atoms=n_atoms, dim=16, n_heads=2, n_layers=2)
-    hf_cfg = GenterpHFConfig(genterp_cfg={
-        "n_atoms": cfg.n_atoms, "dim": cfg.dim, "n_heads": cfg.n_heads, "n_layers": cfg.n_layers,
-    })
-    model = GenterpForCausalLM(hf_cfg)
-    final = runs_dir / "final"
-    final.mkdir(parents=True, exist_ok=True)
-    # Write the bare minimum that `final_model_path` recognizes. `save_pretrained`
-    # trips on the tied embed↔mark_out weight pair under both safetensors and bin
-    # paths in some transformers versions; this bypass is acceptable for a test fixture.
-    hf_cfg.save_pretrained(str(final))
-    torch.save(model.state_dict(), final / "pytorch_model.bin")
-    (runs_dir / "final_checkpoint.json").write_text(json.dumps({"path": "final"}))
+def test_iter_activation_chunks_bounds_tokens_and_preserves_pairs():
+    pre_mlp = torch.arange(10 * 2 * 3, dtype=torch.float32).reshape(10, 2, 3)
+    mlp_out = pre_mlp + 1000
+
+    chunks = list(iter_activation_chunks(pre_mlp, mlp_out, chunk_tokens=4, shuffle=False))
+
+    assert [chunk[0].shape[0] for chunk in chunks] == [4, 4, 2]
+    assert torch.equal(chunks[0][0], pre_mlp[:4])
+    assert torch.equal(chunks[2][1], mlp_out[8:])
 
 
-def test_clt_train_smoke_end_to_end(tmp_path, monkeypatch):
-    n_atoms = 8
-    home = tmp_path
-    monkeypatch.setenv("HOME", str(home))
-    # Path.home() reads $HOME on POSIX/macOS; force a refresh by patching the function too.
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-
-    etl = home / "genterp" / "etl"
-    runs = home / "genterp" / "runs-tiny"
-    _write_minimal_etl(etl, n_atoms)
-    _seed_fake_genterp(runs, n_atoms)
-
-    # Keep the run cheap and CPU-friendly.
+def test_train_clt_end_to_end_saves_loadable_artifact(tmp_path: Path):
     torch.manual_seed(0)
-    clt_train.main(["--tiny", "--max-steps", "2", "--log-every", "1", "--save-every", "100"])
+    cfg = tiny_config(dim=16, n_heads=4, n_layers=2)
+    base = Genterp(cfg).eval()
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=cfg.n_layers, dim=cfg.dim, n_features=16, off_diagonal_rank=2))
+    batch = make_batch(B=2, T=10, n_atoms=cfg.n_atoms)
+    training_cfg = CLTTrainingConfig(
+        steps=4,
+        learning_rate=1e-2,
+        activation_batch_tokens=8,
+        subject_batch_size=2,
+        eval_every=2,
+        save_every=3,
+        eval_batches=1,
+        max_events=10,
+    )
 
-    saved = runs / "clt" / "final" / "clt.pt"
-    config_json = runs / "clt" / "final" / "config.json"
-    assert saved.is_file(), "expected CLT weights file at runs-tiny/clt/final/clt.pt"
-    assert config_json.is_file(), "expected CLT config sidecar"
+    metrics = train_clt(
+        base,
+        clt,
+        [batch],
+        [batch],
+        runtime=_cpu_runtime(),
+        training_cfg=training_cfg,
+        output_dir=tmp_path,
+    )
 
-    payload = torch.load(saved, map_location="cpu", weights_only=False)
-    assert "state_dict" in payload and "config" in payload
-    assert payload["config"]["n_layers"] == 2
-    assert payload["config"]["dim"] == 16
+    artifact_dir = Path(str(metrics["artifact_dir"]))
+    loaded = load_clt_artifact(artifact_dir)
+    assert artifact_dir.is_dir()
+    assert (tmp_path / "final_clt.json").is_file()
+    assert loaded.cfg == clt.cfg
+    assert metrics["loss"] > 0
+    assert "eval_loss" in metrics
 
 
-def test_clt_train_errors_when_no_genterp_checkpoint(tmp_path, monkeypatch):
+def test_clt_train_cli_rejects_unknown_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The CLI surface is intentionally minimal: only --tiny is accepted.
+
+    Every other knob (steps, lr, features, ranks, batch sizing) lives in
+    CLTTrainingConfig defaults so library callers stay flexible while operators
+    have one switch. This test pins that contract.
+    """
+    from genterp import clt_train
+
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    _write_minimal_etl(tmp_path / "genterp" / "etl", n_atoms=4)
-    # Note: no runs-tiny/ directory created → no final model exists.
-    with pytest.raises(SystemExit, match="no final Genterp model"):
-        clt_train.main(["--tiny", "--max-steps", "1"])
+    for flag in ("--steps", "--model-dir", "--n-features", "--off-diagonal-rank"):
+        with pytest.raises(SystemExit):
+            clt_train.main([flag, "1"])
+
+
+def test_clt_train_errors_when_no_genterp_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from genterp import clt_train
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with pytest.raises(FileNotFoundError, match="no Genterp final checkpoint"):
+        clt_train.main([])
