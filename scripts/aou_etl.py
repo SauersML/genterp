@@ -151,12 +151,12 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 
 THRESHOLD = 500
 TEST_SPLIT_PERCENT = 20
-TINY = os.environ.get("GENTERP_TINY") == "1"
-TINY_PERSON_MOD = 10  # GENTERP_TINY samples 1 in N person_ids end-to-end
+TINY_PERSON_MOD = 10  # --tiny samples 1 in N person_ids end-to-end
+TINY = False  # set by main() from --tiny; module-level so SQL builders read it
 
 
 def _tiny_predicate(person_col: str) -> str:
-    """SQL fragment restricting to 1/TINY_PERSON_MOD of person_ids when GENTERP_TINY is set.
+    """SQL fragment restricting to 1/TINY_PERSON_MOD of person_ids when --tiny is set.
 
     Pushed inside each per-domain WHERE so BigQuery prunes on the source tables and
     scans ~10% of rows — keeps the same code path as full runs but ~10× cheaper /
@@ -491,7 +491,21 @@ def _cached_value_stats(
     return {str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])} for code, stats in payload.items()}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build genterp ETL artifacts from AoU OMOP.")
+    parser.add_argument(
+        "--tiny",
+        action="store_true",
+        help=f"Sample 1/{TINY_PERSON_MOD} of person_ids end-to-end for quick iteration. "
+        f"Cache lands under a separate _tiny{TINY_PERSON_MOD}x namespace so it doesn't "
+        "collide with full-CDR artifacts.",
+    )
+    args = parser.parse_args(argv)
+    global TINY
+    TINY = args.tiny
+
     _WORK.start_unit("validate AoU CDR configuration", "reading WORKSPACE_CDR and preparing output paths")
     cdr = os.environ.get("WORKSPACE_CDR")
     if not cdr:
@@ -506,7 +520,7 @@ def main() -> None:
     _log(f"CDR={cdr}")
     _log(f"cache_dir={cache_dir}")
     if TINY:
-        _log(f"GENTERP_TINY=1 active: sampling 1/{TINY_PERSON_MOD} of person_ids end-to-end")
+        _log(f"--tiny active: sampling 1/{TINY_PERSON_MOD} of person_ids end-to-end")
     _WORK.finish_unit("validate AoU CDR configuration", f"out_dir={out_dir} cache_dir={cache_dir}")
     client_instance: bigquery.Client | None = None
 

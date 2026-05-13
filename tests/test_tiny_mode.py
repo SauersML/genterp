@@ -1,13 +1,13 @@
-"""GENTERP_TINY=1 toggles a 10× data subsample + smaller cache namespace.
+"""--tiny toggles a 10× data subsample + smaller cache namespace.
 
 Tiny mode is wired in two layers:
-  - scripts/aou_etl.py: each per-domain SQL gets a MOD(person_id, N)=0 filter, and
-    _cache_key gains a _tiny{N}x suffix so tiny artifacts don't collide with full.
-  - genterp/train.py: the GenterpConfig in main() shrinks from dim=512/8/8 to
-    dim=32/2/2 when GENTERP_TINY=1.
+  - scripts/aou_etl.py: main() parses --tiny, sets module-level TINY, each
+    per-domain SQL injects MOD(person_id, N)=0 inside its WHERE, and
+    _cache_key gains a _tiny{N}x suffix so tiny artifacts don't collide.
+  - genterp/train.py: main() parses --tiny and builds a smaller GenterpConfig.
 
 Tests here only cover (a). The training-side switch is a tiny if/else and the model
-shape is already exercised by tests/test_smoke.py with custom configs.
+shape is exercised by tests/test_smoke.py with custom configs.
 """
 
 from __future__ import annotations
@@ -51,3 +51,19 @@ def test_tiny_filter_lands_in_per_domain_sql(monkeypatch):
     assert f"MOD(de.person_id, {n}) = 0" in aou_etl._drug_events_sql(cdr)
     assert f"MOD(m.person_id, {n}) = 0" in aou_etl._measurement_events_sql(cdr)
     assert f"MOD(person_id, {n}) = 0" in aou_etl._non_drug_events_cte(cdr, with_time=True)
+
+
+def test_main_parses_tiny_flag_and_rejects_unknown(monkeypatch):
+    """main() exposes --tiny through argparse so `run.sh --tiny` propagates."""
+    import argparse
+    import pytest
+
+    # Quick-exit main() before it tries to talk to BigQuery: swap WORKSPACE_CDR check.
+    monkeypatch.delenv("WORKSPACE_CDR", raising=False)
+
+    with pytest.raises(SystemExit):
+        aou_etl.main(["--tiny"])  # exits on missing WORKSPACE_CDR — but argparse accepted --tiny
+    assert aou_etl.TINY is True
+
+    with pytest.raises((SystemExit, argparse.ArgumentError)):
+        aou_etl.main(["--no-such-flag"])

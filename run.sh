@@ -57,11 +57,13 @@ log_run "START sync Python dependencies with uv"
 uv sync
 finish_run_unit "sync Python dependencies with uv"
 
+# Forward run.sh args (e.g. --tiny) to both ETL and training entrypoints so
+# `~/genterp/run.sh --tiny` exercises the downsampled cohort end-to-end.
 # ETL is internally cached per-CDR; rerun is cheap if outputs are warm.
 log_run "START run AoU ETL workflow"
-uv run python -m scripts.aou_etl
+uv run python -m scripts.aou_etl "$@"
 finish_run_unit "run AoU ETL workflow"
 
 log_run "START run Genterp training workflow"
-uv run python -m genterp.train
+uv run python -m genterp.train "$@"
 finish_run_unit "run Genterp training workflow"

@@ -458,7 +458,19 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
     return training_args
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Genterp on AoU OMOP.")
+    parser.add_argument(
+        "--tiny",
+        action="store_true",
+        help="Build a ~1000× smaller model (dim=32, heads=2, layers=2) for quick iteration. "
+        "Pair with `scripts.aou_etl --tiny` to also use the 10× downsampled cohort.",
+    )
+    args = parser.parse_args(argv)
+    tiny = args.tiny
+
     setup = ProgressLogger("train_setup", total_units=15)
     setup.start_unit("configure torch runtime", "selecting accelerator, precision, optimizer, and dataloader settings")
     runtime = configure_torch_runtime()
@@ -486,11 +498,10 @@ def main() -> None:
     eval_dataset = CohortDataset(etl, split="test")
     setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
 
-    tiny = os.environ.get("GENTERP_TINY") == "1"
     if tiny:
         # ~1000× fewer transformer params: dim 32 vs 512 (16×), 2 vs 8 layers (4×).
         # Per-layer dense weights scale as L·dim² → 4·256 = 1024×.
-        setup.start_unit("construct model config", "GENTERP_TINY=1 → dim=32 heads=2 layers=2")
+        setup.start_unit("construct model config", "--tiny → dim=32 heads=2 layers=2")
         cfg = GenterpConfig(n_atoms=len(vocab), dim=32, n_heads=2, n_layers=2)
     else:
         setup.start_unit("construct model config", "dim=512 heads=8 layers=8")
