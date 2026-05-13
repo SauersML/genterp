@@ -13,9 +13,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import transformers
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 from transformers import trainer as hf_trainer
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
@@ -38,6 +39,16 @@ class GenterpHFConfig(transformers.PretrainedConfig):
     def __init__(self, **kwargs):
         self.genterp_cfg: dict = kwargs.pop("genterp_cfg", {})
         super().__init__(**kwargs)
+
+
+class _LengthAwareSubset(Subset):
+    """Subset that exposes ``.lengths`` so ``LengthGroupedSampler`` keeps working."""
+
+    def __init__(self, dataset: Dataset, indices: list[int]):
+        super().__init__(dataset, indices)
+        parent_lengths = getattr(dataset, "lengths", None)
+        if parent_lengths is not None:
+            self.lengths = np.asarray(parent_lengths, dtype=np.int64)[indices]
 
 
 class GenterpForCausalLM(transformers.PreTrainedModel):
@@ -150,9 +161,61 @@ class GenterpTrainer(transformers.Trainer):
     ):
         self.runtime = runtime
         self.reset_training_state_on_resume = reset_training_state_on_resume
+        # Per-component loss accumulator drained by `log()`. Keys are the metric
+        # names emitted by `marked_tpp_value_loss` (time_nll, mark_nll, value_nll,
+        # censor_nll, n_real, n_censor, n_mag). One list of per-step floats per key
+        # for {train, eval}; we average on emit so each logging_steps interval (or
+        # full eval pass) reports the mean component NLL over its tokens.
+        self._loss_accum_train: dict[str, list[float]] = {}
+        self._loss_accum_eval: dict[str, list[float]] = {}
         super().__init__(*args, **kwargs)
         if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
             self.args._n_gpu = 1
+
+    def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False, **kwargs):
+        """Compute the rich Genterp loss dict; stash component NLLs for `log()` to surface.
+
+        HF Trainer normally only sees `loss`. Here we also capture time/mark/value/censor
+        NLLs and token counts every forward — train side accumulates into
+        `_loss_accum_train`, eval side into `_loss_accum_eval`, and `log()` averages
+        whichever bucket matches the call.
+        """
+        inner = model.model if hasattr(model, "model") else model
+        ld = inner.loss(**inputs)
+        bucket = self._loss_accum_train if model.training else self._loss_accum_eval
+        for key in ("time_nll", "mark_nll", "value_nll", "censor_nll", "n_real", "n_censor", "n_mag"):
+            tensor = ld.get(key)
+            if tensor is None:
+                continue
+            bucket.setdefault(key, []).append(float(tensor.detach().item()))
+        loss = ld["loss"]
+        if return_outputs:
+            outputs = transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=loss.detach().reshape(1))
+            return loss, outputs
+        return loss
+
+    def _drain_loss_bucket(self, bucket: dict[str, list[float]], prefix: str = "") -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, values in bucket.items():
+            if not values:
+                continue
+            out[f"{prefix}{key}"] = sum(values) / len(values)
+        bucket.clear()
+        return out
+
+    def log(self, logs, *args, **kwargs):
+        """Merge accumulated component metrics into the next emitted log payload.
+
+        The presence of an "eval_loss" key marks an eval log emission; otherwise
+        it's a train-side metrics flush. Component aggregates come along for the
+        ride so on-disk train history and trainer_pt's TensorBoard both see them.
+        """
+        is_eval = any(k.startswith("eval_") for k in logs)
+        if is_eval:
+            logs.update(self._drain_loss_bucket(self._loss_accum_eval, prefix="eval_"))
+        else:
+            logs.update(self._drain_loss_bucket(self._loss_accum_train))
+        return super().log(logs, *args, **kwargs)
 
     def _get_train_sampler(self, train_dataset=None) -> torch.utils.data.Sampler | None:
         train_dataset = self.train_dataset if train_dataset is None else train_dataset
@@ -208,12 +271,19 @@ class GenterpTrainer(transformers.Trainer):
                 else _limit_eval_worker
             )
 
+        # Eval gets fewer workers and never keeps them resident: each worker copies
+        # the events parquet into its own numpy arrays (~1.7GB for the tiny CDR; way
+        # more for full). Keeping 4 of those alive between every 500-step eval cycle
+        # is what was OOMing the box.
+        num_workers = self.args.dataloader_num_workers if is_training else min(2, self.args.dataloader_num_workers)
+        persistent_workers = self.args.dataloader_persistent_workers if is_training else False
+
         dataloader_params = {
             "batch_size": batch_size,
             "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
+            "num_workers": num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
-            "persistent_workers": self.args.dataloader_persistent_workers,
+            "persistent_workers": persistent_workers,
             "multiprocessing_context": "fork" if should_fork else None,
             "worker_init_fn": worker_init_fn,
         }
@@ -508,8 +578,24 @@ def main(argv: list[str] | None = None) -> None:
     setup.finish_unit("build training dataset", f"subjects={len(train_dataset):,}")
 
     setup.start_unit("build evaluation dataset", "split=test")
-    eval_dataset = CohortDataset(etl, split="test")
-    setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
+    eval_full = CohortDataset(etl, split="test")
+    # Cap each in-loop eval pass to a fixed subsample. The full ~12K test cohort at
+    # batch_size=1 takes ~30min and OOM-risks the eval-worker fleet for no per-cycle
+    # signal benefit. The subsample is deterministic (longest-first by length) so
+    # eval loss is comparable across steps. Set GENTERP_EVAL_SUBJECTS=0 to disable
+    # the cap and evaluate on the full test set.
+    eval_cap = int(os.environ.get("GENTERP_EVAL_SUBJECTS", "1024"))
+    if eval_cap > 0 and len(eval_full) > eval_cap:
+        order = np.argsort(-eval_full.lengths)[:eval_cap]
+        eval_dataset: Dataset = _LengthAwareSubset(eval_full, order.tolist())
+        setup.finish_unit(
+            "build evaluation dataset",
+            f"subjects={len(eval_dataset):,} (subsampled from {len(eval_full):,}; "
+            f"set GENTERP_EVAL_SUBJECTS=0 to use full test set)",
+        )
+    else:
+        eval_dataset = eval_full
+        setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
 
     if tiny:
         # ~1000× fewer transformer params: dim 32 vs 512 (16×), 2 vs 8 layers (4×).
