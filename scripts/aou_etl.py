@@ -1,12 +1,15 @@
 """Build genterp's vocab, ancestors, value stats, event timelines, and subject metadata from AoU OMOP.
 
   - Drug events expanded to RxNorm ingredient atoms via drug_strength.
-  - Measurement raw values flow through to events.parquet; per-atom (μ, σ) for
-    magnitude-bearing codes are written to value_stats.json for the model's
-    ValueModulator at training start.
+  - Measurement raw values flow through to events.parquet; collapsed atom ids
+    are materialized as uint32 so training never string-encodes events.
+  - Per-atom (μ, σ) for magnitude-bearing codes are written to
+    value_stats.json for the model's ValueModulator at training start.
   - Hierarchical collapse at threshold=500 patients across all domains.
   - observation_period_end_date drives per-subject right-censoring.
 """
+
+# ruff: noqa: E402, I001
 
 from __future__ import annotations
 
@@ -35,7 +38,8 @@ _PROC = psutil.Process()
 def _mem_str() -> str:
     return f"RSS={_PROC.memory_info().rss / 1e9:.2f}GB"
 
-_WORK = ProgressLogger("aou_etl", total_units=14)
+_WORK = ProgressLogger("aou_etl", total_units=11)
+REST_PAGE_SIZE = 100_000
 
 
 def _log(msg: str) -> None:
@@ -83,7 +87,7 @@ def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
     """One-shot Arrow Table fetch — only safe for small results (concept lookup, censor, person)."""
     t0 = time.monotonic()
     job = _submit_or_reuse_job(client, sql, label)
-    table = job.to_arrow(progress_bar_type="tqdm")
+    table = job.to_arrow(progress_bar_type="tqdm", create_bqstorage_client=False)
     _log(f"  bq done:   {label} rows={table.num_rows:,} in {time.monotonic() - t0:.1f}s")
     return table
 
@@ -106,7 +110,11 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 
     t0 = time.monotonic()
     job = _submit_or_reuse_job(client, sql, label)
-    iterable = job.result().to_arrow_iterable()
+    # Do not use the BigQuery Storage API here. Its parallel Arrow downloader
+    # can allocate multiprocessing semaphores and leak them on shutdown under
+    # very large result sets. REST pages are slower but keep memory and OS
+    # resources bounded and predictable.
+    iterable = job.result(page_size=REST_PAGE_SIZE).to_arrow_iterable(bqstorage_client=None)
 
     writer: pq.ParquetWriter | None = None
     rows = 0
@@ -295,6 +303,25 @@ def _measurement_events_sql(cdr: str) -> str:
     """
 
 
+def _all_events_sorted_sql(cdr: str) -> str:
+    """One combined event stream sorted by (subject_id, time_seconds) — sort happens in BigQuery.
+
+    Polars `.sort()` is not streaming-compatible, so a global Python sort of 400M+ rows would
+    materialize and OOM. Pushing the sort to BQ lets it use the warehouse's distributed sort
+    and stream already-sorted Arrow batches back to disk.
+    """
+    return f"""
+    WITH events AS (
+      ({_non_drug_events_sql(cdr)})
+      UNION ALL ({_drug_events_sql(cdr)})
+      UNION ALL ({_measurement_events_sql(cdr)})
+    )
+    SELECT subject_id, time_seconds, code, cid, value
+    FROM events
+    ORDER BY subject_id, time_seconds
+    """
+
+
 def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[int]):
     _log(f"  bq query: coverage (concept_ancestor JOIN cohort events, {len(cohort_ids):,} cohort ids)")
     t0 = time.monotonic()
@@ -458,28 +485,18 @@ def main() -> None:
             client_instance = bigquery.Client()
         return client_instance
 
-    non_drug_path = cache_dir / "non_drug_events.parquet"
-    drug_path = cache_dir / "drug_events.parquet"
-    meas_path = cache_dir / "measurement_events.parquet"
+    all_sorted_path = cache_dir / "all_events_sorted.parquet"
 
-    _WORK.start_unit("pull non-drug events", "streaming condition/procedure/observation/visit/device to parquet")
-    _stream_query_to_parquet(client(), _non_drug_events_sql(cdr), "non_drug_events", non_drug_path)
-    _WORK.finish_unit("pull non-drug events", f"path={non_drug_path.name}")
+    _WORK.start_unit(
+        "pull all events (combined + sorted in BQ)",
+        "single query: UNION ALL non-drug/drug/measurement with ORDER BY (subject_id, time_seconds) on BQ side",
+    )
+    _stream_query_to_parquet(client(), _all_events_sorted_sql(cdr), "all_events_sorted", all_sorted_path)
+    _WORK.finish_unit("pull all events (combined + sorted in BQ)", f"path={all_sorted_path.name}")
 
-    _WORK.start_unit("pull drug events", "streaming drug_exposure ⨝ drug_strength → ingredients to parquet")
-    _stream_query_to_parquet(client(), _drug_events_sql(cdr), "drug_events", drug_path)
-    _WORK.finish_unit("pull drug events", f"path={drug_path.name}")
-
-    _WORK.start_unit("pull measurement events", "streaming measurement rows (value_as_number preserved) to parquet")
-    _stream_query_to_parquet(client(), _measurement_events_sql(cdr), "measurement_events", meas_path)
-    _WORK.finish_unit("pull measurement events", f"path={meas_path.name}")
-
-    _WORK.start_unit("build lazy event scan", "scanning three domain parquets as a single lazy frame")
-    source_paths = [non_drug_path, drug_path, meas_path]
-    source_key = hashlib.sha256(
-        "|".join(f"{p.name}:{_path_fingerprint(p)}" for p in source_paths).encode()
-    ).hexdigest()[:16]
-    events_lf = pl.scan_parquet([str(p) for p in source_paths]).select(
+    _WORK.start_unit("build lazy event scan", "scanning the sorted all-events parquet as a lazy frame")
+    source_key = _path_fingerprint(all_sorted_path)
+    events_lf = pl.scan_parquet(str(all_sorted_path)).select(
         ["subject_id", "time_seconds", "code", "cid", "value"]
     )
     _log(f"source event fingerprint={source_key}")
@@ -521,20 +538,24 @@ def main() -> None:
     _write_json(out_dir / "value_stats.json", stats)
     _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
-    _WORK.start_unit("filter and sort final events", "streaming filter+sort to final parquet")
-    final_events_path = cache_dir / f"events-{source_key}-{vocab_key}.parquet"
-    keep_codes = set(atom_idx.keys())
+    _WORK.start_unit(
+        "filter final events",
+        "streaming filter+atom encode to final parquet; source already sorted by BQ, no Python sort or join",
+    )
+    final_events_path = cache_dir / f"events-{source_key}-{vocab_key}-atom-v1.parquet"
+    keep_codes = pl.Series("code", list(atom_idx.keys()))
+    atom_expr = pl.col("code").replace_strict(atom_idx, return_dtype=pl.UInt32).alias("atom")
     final_lf = (
         events_lf.select(["subject_id", "time_seconds", "code", "value"])
         .filter(pl.col("code").is_in(keep_codes))
-        .sort(["subject_id", "time_seconds"])
+        .select(["subject_id", "time_seconds", atom_expr, "value"])
     )
     _sink_parquet(final_lf, final_events_path, "final_events")
     _log(f"copying final events to: {out_dir / 'events.parquet'}")
     pl.scan_parquet(str(final_events_path)).sink_parquet(out_dir / "events.parquet", compression="zstd")
     final_events_lf = pl.scan_parquet(str(final_events_path))
     final_rows = final_events_lf.select(pl.len()).collect(streaming=True).item()
-    _WORK.finish_unit("filter and sort final events", f"rows={final_rows:,}")
+    _WORK.finish_unit("filter final events", f"rows={final_rows:,}")
 
     _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
     persons = _cache_parquet(

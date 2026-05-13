@@ -3,7 +3,7 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from genterp.data import CodeAtomMap, CohortDataset
+from genterp.data import CohortDataset
 from scripts.aou_etl import TEST_SPLIT_PERCENT, split_for_subject
 
 
@@ -30,7 +30,7 @@ def _write_split_fixture(tmp_path):
         {
             "subject_id": [1, 1, 2, 2, 3, 3, 4, 4],
             "time_seconds": [0, 86400, 0, 86400, 0, 86400, 0, 86400],
-            "code": ["A", "B"] * 4,
+            "atom": [5, 6] * 4,
             "value": [None, 1.0, None, 2.0, None, 3.0, None, 4.0],
         }
     ).write_parquet(tmp_path / "events.parquet")
@@ -49,10 +49,9 @@ def _write_split_fixture(tmp_path):
 
 def test_cohort_dataset_filters_to_requested_split(tmp_path):
     _write_split_fixture(tmp_path)
-    atoms = CodeAtomMap({"A": 5, "B": 6})
 
-    train = CohortDataset(tmp_path, atoms, split="train")
-    test = CohortDataset(tmp_path, atoms, split="test")
+    train = CohortDataset(tmp_path, split="train")
+    test = CohortDataset(tmp_path, split="test")
 
     assert len(train) == 3
     assert len(test) == 1
@@ -62,11 +61,10 @@ def test_cohort_dataset_filters_to_requested_split(tmp_path):
 
 def test_cohort_dataset_split_partition_is_disjoint_and_exhaustive(tmp_path):
     _write_split_fixture(tmp_path)
-    atoms = CodeAtomMap({"A": 5, "B": 6})
 
-    train = CohortDataset(tmp_path, atoms, split="train")
-    test = CohortDataset(tmp_path, atoms, split="test")
-    full = CohortDataset(tmp_path, atoms)
+    train = CohortDataset(tmp_path, split="train")
+    test = CohortDataset(tmp_path, split="test")
+    full = CohortDataset(tmp_path)
 
     train_starts = set(train.start.tolist())
     test_starts = set(test.start.tolist())
@@ -78,7 +76,7 @@ def test_cohort_dataset_split_partition_is_disjoint_and_exhaustive(tmp_path):
 
 def test_cohort_dataset_raises_when_subjects_lack_split_column(tmp_path):
     pl.DataFrame(
-        {"subject_id": [1], "time_seconds": [0], "code": ["A"], "value": [None]}
+        {"subject_id": [1], "time_seconds": [0], "atom": [5], "value": [None]}
     ).write_parquet(tmp_path / "events.parquet")
     pl.DataFrame(
         {
@@ -92,4 +90,4 @@ def test_cohort_dataset_raises_when_subjects_lack_split_column(tmp_path):
     ).write_parquet(tmp_path / "subjects.parquet")
 
     with pytest.raises(ValueError, match="no 'split' column"):
-        CohortDataset(tmp_path, CodeAtomMap({"A": 5}), split="train")
+        CohortDataset(tmp_path, split="train")

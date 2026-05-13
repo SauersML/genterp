@@ -7,16 +7,19 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import torch
 import transformers
+from torch.utils.data import DataLoader, Dataset, IterableDataset
+from transformers import trainer as hf_trainer
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
-from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
+from genterp.data import AtomVocab, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
 from genterp.progress import ProgressLogger, count_parameters
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
@@ -117,6 +120,22 @@ class VerboseTrainerProgressCallback(transformers.TrainerCallback):
         return control
 
 
+def _limit_dataloader_worker_threads() -> None:
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[name] = "1"
+    torch.set_num_threads(1)
+
+
+def _seed_and_limit_train_worker(worker_id: int, *, num_workers: int, rank: int) -> None:
+    _limit_dataloader_worker_threads()
+    hf_trainer.seed_worker(worker_id, num_workers=num_workers, rank=rank)
+
+
+def _limit_eval_worker(worker_id: int) -> None:
+    del worker_id
+    _limit_dataloader_worker_threads()
+
+
 class GenterpTrainer(transformers.Trainer):
     def __init__(
         self,
@@ -144,6 +163,60 @@ class GenterpTrainer(transformers.Trainer):
                 lengths=train_dataset.lengths,
             )
         return super()._get_train_sampler(train_dataset)
+
+    def _get_dataloader(
+        self,
+        dataset: Dataset,
+        description: str,
+        batch_size: int,
+        sampler_fn: Callable[[Dataset], torch.utils.data.Sampler] | None = None,
+        is_training: bool = False,
+        dataloader_key: str | None = None,
+    ) -> DataLoader:
+        data_collator = self.data_collator
+        if hf_trainer.is_datasets_available() and isinstance(dataset, hf_trainer.datasets.Dataset):
+            dataset = self._remove_unused_columns(dataset, description=description)
+        else:
+            data_collator = self._get_collator_with_removed_columns(self.data_collator, description=description)
+
+        should_fork = torch.backends.mps.is_available() and self.args.dataloader_num_workers > 1
+        worker_init_fn = None
+        if self.args.dataloader_num_workers > 0:
+            worker_init_fn = (
+                partial(
+                    _seed_and_limit_train_worker,
+                    num_workers=self.args.dataloader_num_workers,
+                    rank=self.args.process_index,
+                )
+                if is_training
+                else _limit_eval_worker
+            )
+
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "multiprocessing_context": "fork" if should_fork else None,
+            "worker_init_fn": worker_init_fn,
+        }
+
+        if not isinstance(dataset, IterableDataset):
+            if sampler_fn is not None:
+                dataloader_params["sampler"] = sampler_fn(dataset)
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+
+        if dataloader_key is not None and self.args.dataloader_persistent_workers:
+            if hasattr(self, "_eval_dataloaders"):
+                self._eval_dataloaders[dataloader_key] = dataloader
+            else:
+                self._eval_dataloaders = {dataloader_key: dataloader}
+
+        return dataloader
 
     def _prepare_input(self, data: Any) -> Any:
         if isinstance(data, torch.Tensor):
@@ -345,15 +418,14 @@ def main() -> None:
 
     setup.start_unit("load vocabulary", f"path={etl / 'vocab.json'}")
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
-    code_atoms = CodeAtomMap.from_vocab(vocab)
-    setup.finish_unit("load vocabulary", f"atoms={len(vocab):,} mapped_codes={len(code_atoms.code_to_atom):,}")
+    setup.finish_unit("load vocabulary", f"atoms={len(vocab):,} mapped_codes={len(vocab.code_to_atom):,}")
 
     setup.start_unit("build training dataset", "split=train")
-    train_dataset = CohortDataset(etl, code_atoms, split="train")
+    train_dataset = CohortDataset(etl, split="train")
     setup.finish_unit("build training dataset", f"subjects={len(train_dataset):,}")
 
     setup.start_unit("build evaluation dataset", "split=test")
-    eval_dataset = CohortDataset(etl, code_atoms, split="test")
+    eval_dataset = CohortDataset(etl, split="test")
     setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
 
     setup.start_unit("construct model config", "dim=512 heads=8 layers=8")

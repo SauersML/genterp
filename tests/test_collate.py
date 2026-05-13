@@ -6,17 +6,16 @@ import numpy as np
 import polars as pl
 import torch
 
-from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, _pad_atoms, collate
+from genterp.data import AtomVocab, CohortDataset, _pad_atoms, collate
 
 
-def test_code_atom_map_uses_single_collapsed_atom():
+def test_atom_vocab_encodes_known_codes_and_pad_for_missing():
     vocab = AtomVocab({"A": 5, "B": 5, "P": 9})
-    code_atoms = CodeAtomMap.from_vocab(vocab)
 
-    assert code_atoms.atom("A") == 5
-    assert code_atoms.atom("B") == 5
-    assert code_atoms.atom("P") == 9
-    assert code_atoms.atom("missing") == 0
+    assert vocab.encode("A") == 5
+    assert vocab.encode("B") == 5
+    assert vocab.encode("P") == 9
+    assert vocab.encode("missing") == 0
 
 
 def test_pad_atoms_always_emits_at_least_one_slot():
@@ -86,7 +85,7 @@ def test_cohort_dataset_keeps_most_recent_events_when_history_exceeds_max(tmp_pa
         {
             "subject_id": [1] * len(times),
             "time_seconds": times,
-            "code": ["S"] * n_static + [f"E{i}" for i in range(n_events)],
+            "atom": [1] * n_static + [i + 2 for i in range(n_events)],
             "value": [None] * len(times),
         }
     ).write_parquet(tmp_path / "events.parquet")
@@ -101,21 +100,20 @@ def test_cohort_dataset_keeps_most_recent_events_when_history_exceeds_max(tmp_pa
         }
     ).write_parquet(tmp_path / "subjects.parquet")
 
-    code_atoms = CodeAtomMap({"S": 1, **{f"E{i}": i + 2 for i in range(n_events)}})
     max_events = 10
-    item = CohortDataset(tmp_path, code_atoms, max_events=max_events)[0]
+    item = CohortDataset(tmp_path, max_events=max_events)[0]
 
     # Should be the *last* 10 events (E90..E99 → atoms 92..101), not the first 10.
     assert item["event_atoms"] == [i + 2 for i in range(n_events - max_events, n_events)]
     assert item["length"] == max_events
 
 
-def test_cohort_dataset_persists_encoded_atom_cache(tmp_path):
+def test_cohort_dataset_reads_materialized_atoms(tmp_path):
     pl.DataFrame(
         {
             "subject_id": [1, 1, 1],
             "time_seconds": [0, 86400, 172800],
-            "code": ["A", "B", "missing"],
+            "atom": [5, 6, 0],
             "value": [None, 1.5, None],
         }
     ).write_parquet(tmp_path / "events.parquet")
@@ -130,15 +128,7 @@ def test_cohort_dataset_persists_encoded_atom_cache(tmp_path):
         }
     ).write_parquet(tmp_path / "subjects.parquet")
 
-    first = CohortDataset(tmp_path, CodeAtomMap({"A": 5, "B": 6}))[0]
+    item = CohortDataset(tmp_path)[0]
 
-    cache_files = sorted((tmp_path / ".genterp_cache").glob("event_atoms-*.npy"))
-    assert len(cache_files) == 1
-    assert first["static_atoms"] == [5]
-    assert first["event_atoms"] == [6]
-
-    second = CohortDataset(tmp_path, CodeAtomMap({"A": 7, "B": 8}))[0]
-
-    assert len(sorted((tmp_path / ".genterp_cache").glob("event_atoms-*.npy"))) == 2
-    assert second["static_atoms"] == [7]
-    assert second["event_atoms"] == [8]
+    assert item["static_atoms"] == [5]
+    assert item["event_atoms"] == [6]

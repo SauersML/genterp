@@ -158,16 +158,45 @@ class CrossLayerTranscoder(nn.Module):
         return {"loss": total, "recon": recon_err, "sparsity": sparsity, "n_active": n_active}
 
 
+def unwrap_genterp_model(model: nn.Module) -> Genterp:
+    """Return the inner :class:`Genterp` from a base model or training wrapper.
+
+    Training checkpoints are saved as ``GenterpForCausalLM`` instances whose
+    ``.model`` attribute is the actual ``Genterp``. CLT harvesting operates on
+    that inner model because it needs ``return_transcoder_acts=True``, which is
+    implemented by ``Genterp.forward`` rather than the Hugging Face wrapper.
+    """
+    if isinstance(model, Genterp):
+        return model
+    inner = getattr(model, "model", None)
+    if isinstance(inner, Genterp):
+        return inner
+    raise TypeError(f"expected Genterp or wrapper with .model: Genterp, got {type(model).__name__}")
+
+
 @torch.no_grad()
-def harvest_transcoder_acts(model: Genterp, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run base model frozen, return (pre_mlp, mlp_out), each (n_real_tokens, L, D)."""
-    was_training = model.training
-    model.eval()
+def harvest_transcoder_acts(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a frozen Genterp and return CLT training activations.
+
+    Returns ``(pre_mlp, mlp_out)``, each shaped ``(n_real_tokens, L, D)``.
+
+    ``pre_mlp`` is the residual stream after the attention sublayer has been
+    added back into the block residual, immediately before ``norm2`` and the
+    SwiGLU MLP. This is the stream the CLT encoder reads, so a CLT "feature" is
+    a direction in the pre-MLP residual stream, not in the normalized MLP input.
+
+    ``mlp_out`` is the additive MLP output for the same block and token. The CLT
+    decoder learns to reconstruct these per-layer MLP writes from the harvested
+    pre-MLP residual features.
+    """
+    base_model = unwrap_genterp_model(model)
+    was_training = base_model.training
+    base_model.eval()
     try:
-        out = model(**batch, return_transcoder_acts=True)
+        out = base_model(**batch, return_transcoder_acts=True)
         keep = ~batch["event_pad"].reshape(-1)
         pre_mlp_flat = rearrange(out["pre_mlp"], "b l t d -> (b t) l d")[keep]
         mlp_out_flat = rearrange(out["mlp_out"], "b l t d -> (b t) l d")[keep]
         return pre_mlp_flat, mlp_out_flat
     finally:
-        model.train(was_training)
+        base_model.train(was_training)

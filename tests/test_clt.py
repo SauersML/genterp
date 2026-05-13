@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import torch
 
-from genterp import CLTConfig, CrossLayerTranscoder, Genterp, harvest_transcoder_acts
+from genterp import CLTConfig, CrossLayerTranscoder, Genterp, harvest_transcoder_acts, unwrap_genterp_model
 from genterp.transcoder import _JumpReLU
 from tests._factories import make_batch, tiny_config
+
+
+class _SavedModelWrapper(torch.nn.Module):
+    def __init__(self, model: Genterp):
+        super().__init__()
+        self.model = model
 
 
 def test_clt_training():
@@ -35,6 +41,21 @@ def test_clt_training():
     final = clt.loss(pre_mlp, mlp_out)
     assert final["recon"].item() < init_recon
     assert 0 <= final["n_active"].item() < clt.cfg.n_features
+
+
+def test_harvest_transcoder_acts_accepts_saved_training_wrapper():
+    cfg = tiny_config(n_layers=2)
+    wrapped = _SavedModelWrapper(Genterp(cfg))
+    wrapped.train()
+    batch = make_batch(B=2, T=8, n_atoms=cfg.n_atoms)
+
+    assert unwrap_genterp_model(wrapped) is wrapped.model
+    pre_mlp, mlp_out = harvest_transcoder_acts(wrapped, batch)
+
+    assert wrapped.model.training
+    assert pre_mlp.shape == mlp_out.shape
+    assert pre_mlp.shape[1:] == (cfg.n_layers, cfg.dim)
+    assert pre_mlp.shape[0] > 0
 
 
 def test_clt_cross_layer_decoder_mask():

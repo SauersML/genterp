@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,20 +29,6 @@ class AtomVocab:
         return self.code_to_atom.get(code, PAD_ATOM)
 
 
-@dataclass
-class CodeAtomMap:
-    """Code -> collapsed atom index."""
-
-    code_to_atom: dict[str, int]
-
-    def atom(self, code: str) -> int:
-        return self.code_to_atom.get(code, PAD_ATOM)
-
-    @classmethod
-    def from_vocab(cls, vocab: AtomVocab) -> CodeAtomMap:
-        return cls({code: atom for code, atom in vocab.code_to_atom.items() if atom != PAD_ATOM})
-
-
 class CohortDataset(Dataset):
     """events.parquet sorted by (subject_id, time_seconds); subjects.parquet holds per-subject row offsets, sex, birth.
 
@@ -55,26 +39,21 @@ class CohortDataset(Dataset):
     def __init__(
         self,
         data_dir: str | Path,
-        code_atoms: CodeAtomMap,
         max_events: int = 4096,
         split: str | None = None,
     ):
         data_dir = Path(data_dir)
-        logger = ProgressLogger(f"cohort_dataset:{split or 'all'}", total_units=7)
+        logger = ProgressLogger(f"cohort_dataset:{split or 'all'}", total_units=6)
         events_path = data_dir / "events.parquet"
-        logger.start_unit("read events parquet", f"path={events_path} columns=time_seconds,code,value")
-        events = pq.read_table(events_path, columns=["time_seconds", "code", "value"], memory_map=True)
+        logger.start_unit("read events parquet", f"path={events_path} columns=time_seconds,atom,value")
+        events = pq.read_table(events_path, columns=["time_seconds", "atom", "value"], memory_map=True)
         logger.finish_unit("read events parquet", f"rows={events.num_rows:,}")
 
-        logger.start_unit("materialize event columns", "combining Arrow chunks into numpy/list columns")
+        logger.start_unit("materialize event columns", "combining Arrow chunks into numpy columns")
         self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
-        event_codes = events.column("code").to_pylist()
+        self.event_atoms = events.column("atom").combine_chunks().to_numpy(zero_copy_only=True)
         self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
-        logger.finish_unit("materialize event columns", f"codes={len(event_codes):,} values={len(self.event_values):,}")
-
-        logger.start_unit("encode event atom cache", "mapping OMOP code strings to collapsed atom ids")
-        self.event_atoms = _cached_event_atoms(data_dir, events_path, event_codes, code_atoms, logger)
-        logger.finish_unit("encode event atom cache", f"atoms={len(self.event_atoms):,}")
+        logger.finish_unit("materialize event columns", f"atoms={len(self.event_atoms):,} values={len(self.event_values):,}")
 
         logger.start_unit("read subjects parquet", f"path={data_dir / 'subjects.parquet'}")
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
@@ -109,31 +88,31 @@ class CohortDataset(Dataset):
     def __len__(self) -> int:
         return len(self.start)
 
+    def atom_counts(self, n_atoms: int) -> np.ndarray:
+        counts = np.bincount(np.asarray(self.event_atoms), minlength=n_atoms)[:n_atoms].astype(np.float32, copy=False)
+        counts[PAD_ATOM] = 0.0
+        if counts.sum() <= 0:
+            raise ValueError("event atom cache has no non-PAD atoms")
+        return counts
+
     def __getitem__(self, idx: int) -> dict:
         s, e = int(self.start[idx]), int(self.end[idx])
         stop = e + 1
         birth = float(self.birth_seconds[idx])
         max_events = self.max_events
 
-        sub_atoms = np.asarray(self.event_atoms[s:stop])
-        sub_values = np.asarray(self.event_values[s:stop])
-        sub_times = np.asarray(self.event_times[s:stop])
-        ages = (sub_times - birth) / 86400.0
+        atoms = np.asarray(self.event_atoms[s:stop])
+        times = np.asarray(self.event_times[s:stop])
+        delta_days = (times - birth) / 86400.0
+        real_atom = atoms != PAD_ATOM
 
-        static_slot = ages <= 0.5
-        static_atoms_arr = sub_atoms[static_slot & (sub_atoms != PAD_ATOM)]
+        static_idx = np.where((delta_days <= 0.5) & real_atom)[0]
+        event_idx = np.where((delta_days > 0.5) & real_atom)[0][-max_events:]
 
-        event_slot = ~static_slot & (sub_atoms != PAD_ATOM)
-        event_atoms_arr = sub_atoms[event_slot]
-        event_ages_arr = ages[event_slot]
-        event_values_arr = sub_values[event_slot]
-
-        # Keep the *most recent* max_events. Tail slicing matters for older subjects with
-        # long histories — head-slicing trains on childhood events and discards adulthood.
-        if event_atoms_arr.shape[0] > max_events:
-            event_atoms_arr = event_atoms_arr[-max_events:]
-            event_ages_arr = event_ages_arr[-max_events:]
-            event_values_arr = event_values_arr[-max_events:]
+        static_atoms_arr = atoms[static_idx]
+        event_atoms_arr = atoms[event_idx]
+        event_ages_arr = delta_days[event_idx]
+        event_values_arr = np.asarray(self.event_values[s:stop])[event_idx]
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
@@ -145,49 +124,6 @@ class CohortDataset(Dataset):
             "censor_age_days": float(censor_age_days),
             "length": int(event_atoms_arr.shape[0]),
         }
-
-
-def _code_atoms_fingerprint(code_atoms: CodeAtomMap) -> str:
-    payload = json.dumps(sorted(code_atoms.code_to_atom.items()), separators=(",", ":")).encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def _events_fingerprint(path: Path) -> str:
-    stat = path.stat()
-    payload = f"{stat.st_size}:{stat.st_mtime_ns}".encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def _cached_event_atoms(
-    data_dir: Path,
-    events_path: Path,
-    codes: list[str],
-    code_atoms: CodeAtomMap,
-    logger: ProgressLogger,
-) -> np.ndarray:
-    cache_dir = data_dir / ".genterp_cache"
-    cache_name = f"event_atoms-{_events_fingerprint(events_path)}-{_code_atoms_fingerprint(code_atoms)}.npy"
-    cache_path = cache_dir / cache_name
-    if cache_path.exists():
-        logger.log("event atom cache hit", f"path={cache_path}")
-        cached = np.load(cache_path, mmap_mode="r")
-        if cached.shape == (len(codes),):
-            logger.log("event atom cache validated", f"shape={cached.shape} expected_codes={len(codes):,}")
-            return cached
-        logger.log("event atom cache stale", f"shape={cached.shape} expected_codes={len(codes):,}; rebuilding")
-        cache_path.unlink()
-
-    logger.log("event atom cache miss", f"encoding codes={len(codes):,} cache_path={cache_path}")
-    encoded = np.fromiter((code_atoms.atom(code) for code in codes), dtype=np.uint32, count=len(codes))
-    non_pad = int(np.count_nonzero(encoded))
-    logger.log("event atom encoding complete", f"encoded={len(encoded):,} non_pad={non_pad:,} pad={len(encoded) - non_pad:,}")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with tmp.open("wb") as f:
-        np.save(f, encoded)
-    tmp.replace(cache_path)
-    logger.log("event atom cache written", f"path={cache_path}")
-    return np.load(cache_path, mmap_mode="r")
 
 
 def _pad_atoms(seqs: list[list[int]]) -> torch.Tensor:

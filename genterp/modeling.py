@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
 
 ROPE_BASE = 10000.0
 
@@ -259,13 +260,22 @@ class MarkedTPPHead(nn.Module):
     φ(Δt) is a fixed log-spaced sinusoidal embedding of Δt.
     """
 
-    def __init__(self, dim: int, n_marks: int, mark_weight: nn.Parameter, n_mix: int = 8, time_dim: int = 32):
+    def __init__(
+        self,
+        dim: int,
+        n_marks: int,
+        mark_weight: nn.Parameter,
+        n_mix: int = 8,
+        time_dim: int = 32,
+        sampled_mark_negatives: int = 4096,
+    ):
         super().__init__()
         assert time_dim % 2 == 0
         if mark_weight.shape != (n_marks, dim):
             raise ValueError("mark_weight must have shape (n_marks, dim)")
         self.n_marks = n_marks
         self.n_mix = n_mix
+        self.sampled_mark_negatives = sampled_mark_negatives
         self.time_proj = nn.Linear(dim, 3 * n_mix)
         self.mark_h_proj = nn.Linear(dim, dim, bias=False)
         self.mark_time_proj = nn.Linear(time_dim, dim, bias=False)
@@ -275,6 +285,20 @@ class MarkedTPPHead(nn.Module):
         nn.init.normal_(self.mark_time_proj.weight, std=0.02)
         freqs = torch.exp(torch.linspace(math.log(0.01), math.log(100.0), time_dim // 2))
         self.register_buffer("time_freqs", freqs, persistent=False)
+        mark_noise_probs = torch.ones(n_marks, dtype=torch.float32)
+        mark_noise_probs[0] = 0.0
+        self.register_buffer("mark_noise_probs", mark_noise_probs / mark_noise_probs.sum().clamp(min=1.0))
+
+    @torch.no_grad()
+    def set_mark_noise_distribution(self, counts: torch.Tensor) -> None:
+        if counts.shape != (self.n_marks,):
+            raise ValueError(f"counts must have shape ({self.n_marks},)")
+        probs = counts.to(device=self.mark_noise_probs.device, dtype=self.mark_noise_probs.dtype).clamp(min=0)
+        probs[0] = 0.0
+        total = probs.sum()
+        if total <= 0:
+            raise ValueError("mark noise distribution has no non-PAD mass")
+        self.mark_noise_probs.copy_(probs / total)
 
     def _phi(self, delta_t: torch.Tensor) -> torch.Tensor:
         log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
@@ -285,9 +309,29 @@ class MarkedTPPHead(nn.Module):
         log_w_raw, mu, log_sigma = self.time_proj(hidden).chunk(3, dim=-1)
         return log_w_raw.log_softmax(dim=-1), mu, log_sigma.clamp(-5.0, 5.0)
 
-    def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+    def mark_features(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
         phi = self._phi(delta_t)
-        return self.mark_out(self.mark_h_proj(hidden) + self.mark_time_proj(phi)).log_softmax(dim=-1)
+        return self.mark_h_proj(hidden) + self.mark_time_proj(phi)
+
+    def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        return self.mark_out(self.mark_features(hidden, delta_t)).log_softmax(dim=-1)
+
+    def sampled_mark_nll(self, hidden: torch.Tensor, delta_t: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        features = self.mark_features(hidden, delta_t)
+        k = min(self.sampled_mark_negatives, max(self.n_marks - 1, 1))
+        negatives = torch.multinomial(self.mark_noise_probs, k, replacement=False)
+        weight = self.mark_out.weight
+
+        target = target.long()
+        target_logits = (features * weight[target]).sum(dim=-1, keepdim=True)
+        negative_logits = features @ weight[negatives].T
+        negative_logits = negative_logits.masked_fill(negatives.unsqueeze(0) == target.unsqueeze(1), float("-inf"))
+
+        q_neg = self.mark_noise_probs[negatives].clamp_min(torch.finfo(self.mark_noise_probs.dtype).tiny)
+        negative_logits = negative_logits - (k * q_neg).log().to(negative_logits.dtype)
+        logits = torch.cat([target_logits, negative_logits], dim=-1).float()
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+        return F.cross_entropy(logits, labels, reduction="sum")
 
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor, generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -316,6 +360,7 @@ class GenterpConfig:
     time_phi_dim: int = 32
     value_mlp_hidden: int = 64
     value_head_hidden: int = 64
+    sampled_mark_negatives: int = 4096
 
 
 class Genterp(nn.Module):
@@ -332,10 +377,19 @@ class Genterp(nn.Module):
             Block(cfg.dim, cfg.n_heads, self.rope, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
         )
         self.norm = RMSNorm(cfg.dim)
-        self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, self.embed.embedding.weight, cfg.n_time_mix, cfg.time_phi_dim)
+        self.tpp = MarkedTPPHead(
+            cfg.dim,
+            cfg.n_atoms,
+            self.embed.embedding.weight,
+            cfg.n_time_mix,
+            cfg.time_phi_dim,
+            cfg.sampled_mark_negatives,
+        )
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
         self._attn_base_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
         self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_func = checkpoint
 
     def _embed(self, atoms: torch.Tensor) -> torch.Tensor:
         return self.embed(atoms)
@@ -405,7 +459,10 @@ class Genterp(nn.Module):
         pre_mlps: list[torch.Tensor] = []
         mlp_outs: list[torch.Tensor] = []
         for blk in self.blocks:
-            x, pre_mlp, mlp_out = blk(x, angles, mask)
+            if self.gradient_checkpointing and self.training:
+                x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, mask)
+            else:
+                x, pre_mlp, mlp_out = blk(x, angles, mask)
             if return_transcoder_acts:
                 pre_mlps.append(pre_mlp[:, K:])
                 mlp_outs.append(mlp_out[:, K:])
@@ -493,9 +550,12 @@ def marked_tpp_value_loss(
     n_mag = mag_mask.sum()
 
     delta_mark = delta_real.clamp(min=1e-6)[real_mask]
-    mark_log_probs = tpp.mark_log_probs(h_pred[real_mask], delta_mark)
-    mark_lp = torch.gather(mark_log_probs, -1, target_real[real_mask].unsqueeze(-1)).squeeze(-1)
-    mark_loss = -mark_lp.sum()
+    if tpp.training:
+        mark_loss = tpp.sampled_mark_nll(h_pred[real_mask], delta_mark, target_real[real_mask])
+    else:
+        mark_log_probs = tpp.mark_log_probs(h_pred[real_mask], delta_mark)
+        mark_lp = torch.gather(mark_log_probs, -1, target_real[real_mask].unsqueeze(-1)).squeeze(-1)
+        mark_loss = -mark_lp.sum()
 
     leaf_mag = target_real[mag_mask]
     z_target = value_mod.z_score(leaf_mag, value_real[mag_mask])

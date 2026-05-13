@@ -9,7 +9,7 @@ from genterp.modeling import (
     ValueModulator,
     marked_tpp_value_loss,
 )
-from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts
+from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts, unwrap_genterp_model
 
 __all__ = [
     "AtomEmbedding",
@@ -23,5 +23,6 @@ __all__ = [
     "ValueHead",
     "ValueModulator",
     "harvest_transcoder_acts",
+    "unwrap_genterp_model",
     "marked_tpp_value_loss",
 ]
