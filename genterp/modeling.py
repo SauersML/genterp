@@ -289,19 +289,6 @@ class MarkedTPPHead(nn.Module):
         log_w_raw, mu, log_sigma = self.time_proj(hidden).chunk(3, dim=-1)
         return log_w_raw.log_softmax(dim=-1), mu, log_sigma.clamp(-5.0, 5.0)
 
-    def time_log_prob(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-        log_w, mu, log_sigma = self.time_params(hidden)
-        log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
-        log_pdf = -log_dt - log_sigma - 0.5 * math.log(2 * math.pi) - 0.5 * ((log_dt - mu) * (-log_sigma).exp()).pow(2)
-        return torch.logsumexp(log_w + log_pdf, dim=-1)
-
-    def time_log_survival(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-        log_w, mu, log_sigma = self.time_params(hidden)
-        log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
-        z = (log_dt - mu) * (-log_sigma).exp()
-        log_surv_per_k = torch.special.log_ndtr(-z)
-        return torch.logsumexp(log_w + log_surv_per_k, dim=-1)
-
     def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
         phi = self._phi(delta_t)
         return self.mark_out(self.mark_h_proj(hidden) + self.mark_time_proj(phi)).log_softmax(dim=-1)

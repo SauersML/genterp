@@ -17,12 +17,11 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import polars as pl
+from google.cloud import bigquery
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import polars as pl  # noqa: E402
-from google.cloud import bigquery  # noqa: E402
-
-from genterp.vocab import collapse_vocabulary  # noqa: E402
+from genterp.vocab import collapse_vocabulary
 
 THRESHOLD = 500
 

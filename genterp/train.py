@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 import torch
 import transformers
 from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AncestorMap, AtomVocab, CohortDataset, collate
-from genterp.modeling import Genterp, GenterpConfig, marked_tpp_value_loss
+from genterp.modeling import Genterp, GenterpConfig
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -31,26 +30,9 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         super().__init__(config)
         self.model = Genterp(GenterpConfig(**config.genterp_cfg))
 
-    def forward(self, target_atoms: torch.Tensor | None = None, censor_age: torch.Tensor | None = None, **batch: Any):
-        if target_atoms is None:
-            raise ValueError("target_atoms is required for value-modulated Genterp forward")
-        out = self.model(target_atoms=target_atoms, **batch)
-        loss = None
-        if censor_age is not None:
-            ld = marked_tpp_value_loss(
-                self.model.tpp,
-                self.model.value_mod,
-                self.model.value_head,
-                self.model.embed.bag.weight,
-                out["hidden"],
-                batch["event_ages"],
-                target_atoms,
-                batch["event_values"],
-                batch["event_pad"],
-                censor_age,
-            )
-            loss = ld["loss"]
-        return transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=out["hidden"])
+    def forward(self, **batch: torch.Tensor) -> transformers.modeling_outputs.CausalLMOutput:
+        ld = self.model.loss(**batch)
+        return transformers.modeling_outputs.CausalLMOutput(loss=ld["loss"], logits=ld["loss"].detach().reshape(1))
 
 
 def latest_checkpoint(output_dir: str | Path) -> str | None:
