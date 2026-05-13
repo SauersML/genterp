@@ -1,13 +1,11 @@
-"""Build genterp's vocab, ancestors, event timelines, and subject metadata from AoU OMOP.
+"""Build genterp's vocab, ancestors, value stats, event timelines, and subject metadata from AoU OMOP.
 
-Stages:
-  1. Standard event coverage via concept_ancestor (Conditions/Procedures/Observations).
-  2. Drug events expanded to RxNorm ingredient atoms via drug_strength
-     (skipping noisy intermediate RxNorm levels — clinicians think at ingredient level).
-  3. Measurement values quantile-binned per concept (Q=10) into VOCAB/CODE@Q{n} tokens,
-     ancestors pointing back to the bare concept.
-  4. Hierarchical collapse at threshold=500 patients.
-  5. observation_period_end_date drives per-subject right-censoring.
+  - Drug events expanded to RxNorm ingredient atoms via drug_strength.
+  - Measurement raw values flow through to events.parquet; per-atom (μ, σ) for
+    magnitude-bearing codes are written to value_stats.json for the model's
+    ValueModulator at training start.
+  - Hierarchical collapse at threshold=500 patients across all domains.
+  - observation_period_end_date drives per-subject right-censoring.
 """
 
 from __future__ import annotations

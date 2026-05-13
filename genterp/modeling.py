@@ -226,14 +226,9 @@ class ValueModulator(nn.Module):
 
     def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         has_mag = self.event_has_magnitude(leaf_atom, value)
-        if not has_mag.any():
-            return e_concept
-
-        out = e_concept.clone()
-        x = self.z_score(leaf_atom[has_mag], value[has_mag]).unsqueeze(-1)
+        x = self.z_score(leaf_atom, value).unsqueeze(-1)
         modulation = torch.tanh(self.value_mlp(x)).to(e_concept.dtype)
-        out[has_mag] = e_concept[has_mag] * modulation
-        return out
+        return torch.where(has_mag.unsqueeze(-1), e_concept * modulation, e_concept)
 
 
 class ValueHead(nn.Module):
@@ -389,8 +384,9 @@ class Genterp(nn.Module):
         target_atoms: torch.Tensor,
         event_values: torch.Tensor,
         return_transcoder_acts: bool = False,
-        **_unused,
+        **loss_only_kwargs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        del loss_only_kwargs  # censor_age and other loss-side fields ride the same batch dict
         B, M = static_shape
         T = event_ages.shape[1]
         K = self.cfg.k_static_summary
@@ -480,12 +476,6 @@ def marked_tpp_value_loss(
     n_real = real_mask.sum()
     n_censor = censor_mask.sum()
     n_any = n_real + n_censor
-    if n_any == 0:
-        zero = hidden.sum() * 0
-        return {
-            "loss": zero, "time_nll": zero, "mark_nll": zero, "value_nll": zero, "censor_nll": zero,
-            "n_real": torch.tensor(0), "n_censor": torch.tensor(0), "n_mag": torch.tensor(0),
-        }
 
     delta_any = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)[any_mask]
     log_w, mu, log_sigma = tpp.time_params(h_pred[any_mask])
@@ -503,35 +493,23 @@ def marked_tpp_value_loss(
     mag_mask = real_mask & value_mod.event_has_magnitude(target_real, value_real)
     n_mag = mag_mask.sum()
 
-    if n_real > 0:
-        delta_mark = delta_real.clamp(min=1e-6)[real_mask]
-        mark_lp = (
-            tpp.mark_log_probs(h_pred[real_mask], delta_mark)
-            .gather(-1, target_real[real_mask].unsqueeze(-1))
-            .squeeze(-1)
-        )
-        mark_nll = -mark_lp.sum() / n_real
-        mark_loss = -mark_lp.sum()
-    else:
-        mark_nll = hidden.sum() * 0
-        mark_loss = mark_nll
+    delta_mark = delta_real.clamp(min=1e-6)[real_mask]
+    mark_log_probs = tpp.mark_log_probs(h_pred[real_mask], delta_mark)
+    mark_lp = torch.gather(mark_log_probs, -1, target_real[real_mask].unsqueeze(-1)).squeeze(-1)
+    mark_loss = -mark_lp.sum()
 
-    if n_mag > 0:
-        h_mag = h_pred[mag_mask]
-        leaf_mag = target_real[mag_mask]
-        val_mag = value_real[mag_mask]
-        z_target = value_mod.z_score(leaf_mag, val_mag)
-        concept_emb = atom_embedding[leaf_mag]
-        value_nll_tokens = value_head.nll(h_mag, concept_emb, z_target)
-        value_nll = value_nll_tokens.sum() / n_mag
-        value_loss = value_nll_tokens.sum()
-    else:
-        value_nll = hidden.sum() * 0
-        value_loss = value_nll
+    leaf_mag = target_real[mag_mask]
+    z_target = value_mod.z_score(leaf_mag, value_real[mag_mask])
+    value_nll_tokens = value_head.nll(h_pred[mag_mask], atom_embedding[leaf_mag], z_target)
+    value_loss = value_nll_tokens.sum()
 
-    time_nll = -real_time_lp.sum() / n_real.clamp(min=1)
-    censor_nll = -censor_time_ls.sum() / n_censor.clamp(min=1)
-    total = (-real_time_lp.sum() + mark_loss + value_loss - censor_time_ls.sum()) / n_any
+    time_loss = -real_time_lp.sum()
+    censor_loss = -censor_time_ls.sum()
+    time_nll = time_loss / n_real.clamp(min=1)
+    mark_nll = mark_loss / n_real.clamp(min=1)
+    value_nll = value_loss / n_mag.clamp(min=1)
+    censor_nll = censor_loss / n_censor.clamp(min=1)
+    total = (time_loss + mark_loss + value_loss + censor_loss) / n_any.clamp(min=1)
 
     return {
         "loss": total,

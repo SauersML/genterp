@@ -65,18 +65,24 @@ def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch
     mu = torch.zeros(n)
     sigma = torch.ones(n)
     has_mag = torch.zeros(n, dtype=torch.bool)
-    if path.exists():
-        for code, s in json.loads(path.read_text()).items():
-            a = vocab.encode(code)
-            if a == 0:
-                continue
-            mu[a] = float(s["mu"])
-            sigma[a] = max(float(s["sigma"]), 1e-6)
-            has_mag[a] = True
+    for code, s in json.loads(path.read_text()).items():
+        a = vocab.encode(code)
+        if a == 0:
+            continue
+        mu[a] = float(s["mu"])
+        sigma[a] = max(float(s["sigma"]), 1e-6)
+        has_mag[a] = True
     return mu, sigma, has_mag
 
 
+def configure_torch_runtime() -> None:
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
 def main() -> None:
+    configure_torch_runtime()
     etl = Path.home() / "genterp" / "etl"
     output_dir = Path.home() / "genterp" / "runs"
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
@@ -98,13 +104,21 @@ def main() -> None:
             max_steps=50_000,
             lr_scheduler_type="cosine",
             bf16=True,
+            tf32=True,
             torch_compile=True,
+            torch_compile_backend="inductor",
+            torch_compile_mode="max-autotune",
             save_steps=2_000,
             logging_steps=50,
+            optim="adamw_torch_fused",
             dataloader_num_workers=4,
             dataloader_persistent_workers=True,
+            dataloader_pin_memory=True,
+            dataloader_prefetch_factor=4,
+            dataloader_drop_last=True,
             remove_unused_columns=False,
             report_to="none",
+            skip_memory_metrics=True,
             restore_callback_states_from_checkpoint=True,
             save_safetensors=True,
         ),
