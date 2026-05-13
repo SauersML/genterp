@@ -454,7 +454,7 @@ def _cached_own_counts(events_lf: pl.LazyFrame, cache_dir: Path, source_key: str
         df = (
             events_lf.group_by("cid")
             .agg(pl.col("subject_id").n_unique().alias("n"))
-            .collect(streaming=True)
+            .collect(engine="streaming")
         )
         return [[int(r["cid"]), int(r["n"])] for r in df.iter_rows(named=True)]
 
@@ -479,7 +479,7 @@ def _cached_value_stats(
                 pl.len().alias("n"),
             )
             .filter(pl.col("n") >= THRESHOLD)
-            .collect(streaming=True)
+            .collect(engine="streaming")
         )
         return {
             r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
@@ -601,7 +601,7 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"copying final events to: {out_dir / 'events.parquet'}")
     pl.scan_parquet(str(final_events_path)).sink_parquet(out_dir / "events.parquet", compression="zstd")
     final_events_lf = pl.scan_parquet(str(final_events_path))
-    final_rows = final_events_lf.select(pl.len()).collect(streaming=True).item()
+    final_rows = final_events_lf.select(pl.len()).collect(engine="streaming").item()
     _WORK.finish_unit("filter and sort final events", f"rows={final_rows:,}")
 
     _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
@@ -641,7 +641,7 @@ def main(argv: list[str] | None = None) -> None:
         final_events_lf.with_row_index("row")
         .group_by("subject_id", maintain_order=True)
         .agg(pl.col("row").min().alias("start"), pl.col("row").max().alias("end"))
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
     _log(f"subject offsets computed: subjects_with_events={offsets.height:,}")
     subjects = (
