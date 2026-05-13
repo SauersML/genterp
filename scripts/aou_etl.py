@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.progress import ProgressLogger
 from genterp.vocab import collapse_vocabulary
 
-
 _WORK = ProgressLogger("aou_etl", total_units=14)
 
 
@@ -130,19 +129,32 @@ def _path_fingerprint(path: Path) -> str:
 def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFrame:
     if path.exists():
         _log(f"cache hit:  {path.name}; reading parquet from disk")
+        t0 = time.monotonic()
         data = pl.read_parquet(path)
-        _log(f"cache read complete: {path.name} rows={data.height:,} columns={len(data.columns):,}")
+        _log(f"cache read complete: {path.name} rows={data.height:,} columns={len(data.columns):,} in {time.monotonic() - t0:.1f}s")
         return data
     _log(f"cache miss: {path.name}; building dataframe")
-    t0 = time.monotonic()
+    t_build = time.monotonic()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = build()
-    _log(f"cache build complete: {path.name} rows={data.height:,} columns={len(data.columns):,}; writing parquet")
+    _log(f"cache build complete: {path.name} rows={data.height:,} columns={len(data.columns):,} in {time.monotonic() - t_build:.1f}s")
     tmp = path.with_suffix(path.suffix + ".tmp")
+    _log(f"parquet write starting: {tmp} rows={data.height:,}")
+    t_write = time.monotonic()
     data.write_parquet(tmp)
+    bytes_written = tmp.stat().st_size
+    _log(f"parquet write complete: {tmp.name} bytes={bytes_written:,} in {time.monotonic() - t_write:.1f}s; renaming to final path")
     tmp.replace(path)
-    _log(f"cached:     {path.name} rows={data.height:,} in {time.monotonic() - t0:.1f}s")
+    _log(f"cached:     {path.name} rows={data.height:,} total={time.monotonic() - t_build:.1f}s")
     return data
+
+
+def _arrow_to_polars(arrow_table, label: str) -> pl.DataFrame:
+    _log(f"  arrow→polars: {label} (rows={arrow_table.num_rows:,}); converting Arrow table to polars DataFrame")
+    t0 = time.monotonic()
+    df = pl.from_arrow(arrow_table)
+    _log(f"  arrow→polars done: {label} rows={df.height:,} columns={len(df.columns):,} in {time.monotonic() - t0:.1f}s")
+    return df
 
 
 def _cache_json(path: Path, build: Callable[[], object]) -> object:
@@ -378,15 +390,24 @@ def main() -> None:
         return client_instance
 
     _WORK.start_unit("pull non-drug events", "condition, procedure, observation, visit, and device domains")
-    non_drug = _cache_parquet(cache_dir / "non_drug_events.parquet", lambda: pl.from_arrow(_non_drug_events_arrow(client(), cdr)))
+    non_drug = _cache_parquet(
+        cache_dir / "non_drug_events.parquet",
+        lambda: _arrow_to_polars(_non_drug_events_arrow(client(), cdr), "non_drug_events"),
+    )
     _WORK.finish_unit("pull non-drug events", f"rows={non_drug.height:,}")
 
     _WORK.start_unit("pull drug events", "drug_exposure joined through drug_strength to ingredient concepts")
-    drug = _cache_parquet(cache_dir / "drug_events.parquet", lambda: pl.from_arrow(_drug_events_arrow(client(), cdr)))
+    drug = _cache_parquet(
+        cache_dir / "drug_events.parquet",
+        lambda: _arrow_to_polars(_drug_events_arrow(client(), cdr), "drug_events"),
+    )
     _WORK.finish_unit("pull drug events", f"rows={drug.height:,}")
 
     _WORK.start_unit("pull measurement events", "measurement rows with value_as_number preserved")
-    meas = _cache_parquet(cache_dir / "measurement_events.parquet", lambda: pl.from_arrow(_measurement_events_arrow(client(), cdr)))
+    meas = _cache_parquet(
+        cache_dir / "measurement_events.parquet",
+        lambda: _arrow_to_polars(_measurement_events_arrow(client(), cdr), "measurement_events"),
+    )
     _WORK.finish_unit("pull measurement events", f"rows={meas.height:,}")
 
     _WORK.start_unit("concatenate event streams", "normalizing source columns before combining domains")
@@ -453,7 +474,7 @@ def main() -> None:
     _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
     persons = _cache_parquet(
         cache_dir / "persons.parquet",
-        lambda: pl.from_arrow(
+        lambda: _arrow_to_polars(
             _query_to_arrow(client(), f"""SELECT
                   CAST(person_id AS INT64) AS subject_id,
                   IF(gender_concept_id = 8507, 1, 0) AS sex,
@@ -461,7 +482,8 @@ def main() -> None:
                     birth_datetime,
                     TIMESTAMP(DATE(year_of_birth, COALESCE(month_of_birth, 1), COALESCE(day_of_birth, 1)))
                   )) AS birth_seconds
-                FROM `{cdr}.person`""", "person")
+                FROM `{cdr}.person`""", "person"),
+            "person",
         ),
     )
     _WORK.finish_unit("pull person demographics", f"rows={persons.height:,}")
@@ -469,10 +491,11 @@ def main() -> None:
     _WORK.start_unit("pull observation-period censoring", "latest observation_period_end_date per subject")
     censor = _cache_parquet(
         cache_dir / "censor.parquet",
-        lambda: pl.from_arrow(
+        lambda: _arrow_to_polars(
             _query_to_arrow(client(), f"""SELECT CAST(person_id AS INT64) AS subject_id,
                            UNIX_SECONDS(TIMESTAMP(MAX(observation_period_end_date))) AS censor_seconds
-                    FROM `{cdr}.observation_period` GROUP BY person_id""", "observation_period")
+                    FROM `{cdr}.observation_period` GROUP BY person_id""", "observation_period"),
+            "observation_period",
         ),
     )
     _WORK.finish_unit("pull observation-period censoring", f"rows={censor.height:,}")

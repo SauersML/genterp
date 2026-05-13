@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import TextIO
-
-import sys
 
 
 @dataclass
@@ -16,7 +15,7 @@ class ProgressLogger:
     name: str
     total_units: int | None = None
     completed_units: int = 0
-    stream: TextIO = sys.stdout
+    stream: TextIO = field(default_factory=lambda: sys.stdout)
     started_at: float = field(default_factory=time.monotonic)
 
     def log(self, action: str, detail: str | None = None) -> None:
