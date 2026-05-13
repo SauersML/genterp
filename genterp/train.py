@@ -17,6 +17,8 @@ from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
 
+RUNTIME_STATE_FILE = "genterp_runtime.json"
+
 
 class GenterpHFConfig(transformers.PretrainedConfig):
     model_type = "genterp"
@@ -39,9 +41,25 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         return transformers.modeling_outputs.CausalLMOutput(loss=ld["loss"], logits=ld["loss"].detach().reshape(1))
 
 
-class GenterpTrainer(transformers.Trainer):
-    def __init__(self, *args, runtime: TorchRuntime | None = None, **kwargs):
+class RuntimeStateCallback(transformers.TrainerCallback):
+    def __init__(self, runtime: TorchRuntime):
         self.runtime = runtime
+
+    def on_save(self, args, state, control, **kwargs):
+        write_runtime_state(Path(args.output_dir) / f"checkpoint-{state.global_step}", self.runtime)
+        return control
+
+
+class GenterpTrainer(transformers.Trainer):
+    def __init__(
+        self,
+        *args,
+        runtime: TorchRuntime | None = None,
+        reset_training_state_on_resume: bool = False,
+        **kwargs,
+    ):
+        self.runtime = runtime
+        self.reset_training_state_on_resume = reset_training_state_on_resume
         super().__init__(*args, **kwargs)
         if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
             self.args._n_gpu = 1
@@ -77,6 +95,16 @@ class GenterpTrainer(transformers.Trainer):
             device = self.runtime.device
         super()._move_model_to_device(model, device)
 
+    def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
+        if checkpoint is not None and self.reset_training_state_on_resume:
+            return
+        super()._load_optimizer_and_scheduler(checkpoint)
+
+    def _load_scaler(self, checkpoint: str | None) -> None:
+        if checkpoint is not None and self.reset_training_state_on_resume:
+            return
+        super()._load_scaler(checkpoint)
+
 
 def latest_checkpoint(output_dir: str | Path) -> str | None:
     output_dir = Path(output_dir)
@@ -90,6 +118,37 @@ def final_model_path(output_dir: str | Path) -> str | None:
     if (final_dir / "config.json").is_file():
         return str(final_dir)
     return None
+
+
+def runtime_state(runtime: TorchRuntime) -> dict[str, object]:
+    return {
+        "device_type": runtime.device.type,
+        "cuda_capability": list(runtime.cuda_capability) if runtime.cuda_capability is not None else None,
+        "precision": "bf16" if runtime.bf16 else "fp16" if runtime.fp16 else "fp32",
+        "tf32": runtime.tf32,
+        "torch_compile": runtime.torch_compile,
+        "torch_compile_backend": runtime.torch_compile_backend,
+        "torch_compile_mode": runtime.torch_compile_mode,
+        "optim": runtime.optim,
+        "use_data_parallel": runtime.use_data_parallel,
+    }
+
+
+def write_runtime_state(path: str | Path, runtime: TorchRuntime) -> None:
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / RUNTIME_STATE_FILE).write_text(json.dumps(runtime_state(runtime), indent=2, sort_keys=True))
+
+
+def checkpoint_runtime_state(path: str | Path) -> dict[str, object] | None:
+    state_path = Path(path) / RUNTIME_STATE_FILE
+    if not state_path.is_file():
+        return None
+    return dict(json.loads(state_path.read_text()))
+
+
+def checkpoint_matches_runtime(path: str | Path, runtime: TorchRuntime) -> bool:
+    return checkpoint_runtime_state(path) == runtime_state(runtime)
 
 
 def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -118,11 +177,14 @@ def main() -> None:
 
     cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
     resume_checkpoint = latest_checkpoint(output_dir)
-    warm_start_path = resume_checkpoint or final_model_path(output_dir)
-    if warm_start_path is not None and resume_checkpoint is None:
+    reset_training_state = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
+    warm_start_path = final_model_path(output_dir) if resume_checkpoint is None else None
+    if warm_start_path is not None:
         model = GenterpForCausalLM.from_pretrained(warm_start_path)
     else:
         model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))
+    if reset_training_state:
+        print("genterp train hardware profile changed; resuming model weights and rebuilding optimizer state")
     mu, sigma, has_mag = _load_value_stats(etl / "value_stats.json", vocab)
     model.model.value_mod.set_stats(mu, sigma, has_mag)
 
@@ -164,9 +226,12 @@ def main() -> None:
         train_dataset=dataset,
         data_collator=collate,
         runtime=runtime,
+        reset_training_state_on_resume=reset_training_state,
+        callbacks=[RuntimeStateCallback(runtime)],
     )
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(str(output_dir / "final"))
+    write_runtime_state(output_dir / "final", runtime)
 
 
 if __name__ == "__main__":
