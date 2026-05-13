@@ -13,13 +13,17 @@
 
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
+import faulthandler
 import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import time
+import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -45,6 +49,71 @@ _WORK = ProgressLogger("aou_etl", total_units=11)
 
 def _log(msg: str) -> None:
     _WORK.log(f"{msg} [{_mem_str()}]")
+
+
+def _install_crash_diagnostics() -> None:
+    """Make non-OOM crashes loud and OOM crashes diagnosable after the fact.
+
+    What this covers:
+      * faulthandler.enable: prints a C-level traceback to stderr on SIGSEGV,
+        SIGFPE, SIGABRT, SIGBUS, SIGILL — the polars/pyarrow Rust panic surface.
+      * faulthandler.register on SIGTERM/SIGHUP: dumps a Python traceback when
+        we get terminated cleanly (e.g. parent shell hangup, job manager kill).
+      * sys.excepthook: catches the last unhandled Python exception so it lands
+        in the same _log channel as every other line. Otherwise Trainer-style
+        async output ordering can hide the traceback above the prompt return.
+      * atexit: logs the final RSS so a graceful exit leaves a footprint.
+
+    What this does NOT cover: SIGKILL from the kernel OOM-killer. Nothing
+    in-process can catch SIGKILL — the only mitigation is to not run
+    memory-hungry steps locally. That's why ``own_counts`` was moved off
+    polars and onto BigQuery in the same change as installing this.
+    """
+    faulthandler.enable()
+    for sig_name in ("SIGTERM", "SIGHUP", "SIGUSR1"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            faulthandler.register(sig, all_threads=True, chain=True)
+        except (ValueError, OSError):
+            pass
+
+    def _on_signal(signum: int, frame) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        _log(f"FATAL: received {name} ({signum}); flushing logs and exiting")
+        traceback.print_stack(frame)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(128 + signum)
+
+    for sig_name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass
+
+    def _on_unhandled(exc_type, exc, tb) -> None:
+        _log(f"FATAL: unhandled {exc_type.__name__}: {exc}")
+        traceback.print_exception(exc_type, exc, tb)
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    sys.excepthook = _on_unhandled
+
+    def _on_exit() -> None:
+        try:
+            _log(f"process exiting; final {_mem_str()}")
+        except Exception:
+            pass
+
+    atexit.register(_on_exit)
 
 
 _BQ_JOB_CACHE_DIR: Path | None = None
@@ -717,14 +786,37 @@ def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: 
     return cached
 
 
-def _cached_own_counts(events_lf: pl.LazyFrame, cache_dir: Path, source_key: str) -> dict[int, int]:
+def _own_counts_sql(cdr: str) -> str:
+    """Distinct subjects per source concept_id, computed at BigQuery.
+
+    Computing this locally on 1B rows tried to keep a hash set of subject_ids per
+    cid (n_unique aggregation, 104K groups) and got SIGKILL'd by the OOM killer
+    even with the polars streaming engine. BQ has unlimited memory for this kind
+    of distinct count — and the result is tiny (one row per cid, ~100K rows).
+    """
+    return f"""
+    WITH events AS (
+      {_non_drug_events_cte(cdr, with_time=False)}
+      UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
+      UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
+    )
+    SELECT cid, COUNT(DISTINCT person_id) AS n
+    FROM events
+    GROUP BY cid
+    """
+
+
+def _cached_own_counts(
+    client: bigquery.Client,
+    cdr: str,
+    cache_dir: Path,
+    source_key: str,
+) -> dict[int, int]:
     def build() -> list[list[int]]:
-        df = (
-            events_lf.group_by("cid")
-            .agg(pl.col("subject_id").n_unique().alias("n"))
-            .collect(engine="streaming")
-        )
-        return [[int(r["cid"]), int(r["n"])] for r in df.iter_rows(named=True)]
+        table = _run_aggregation(client, _own_counts_sql(cdr), "own_counts")
+        cids = table.column("cid").to_pylist()
+        ns = table.column("n").to_pylist()
+        return [[int(c), int(n)] for c, n in zip(cids, ns, strict=True)]
 
     payload = _cache_json(cache_dir / f"own_counts-{source_key}.json", build)
     return {int(cid): int(n) for cid, n in payload}
@@ -774,6 +866,7 @@ def main(argv: list[str] | None = None) -> None:
     global TINY
     TINY = args.tiny
 
+    _install_crash_diagnostics()
     _WORK.start_unit("validate AoU CDR configuration", "reading WORKSPACE_CDR and preparing output paths")
     cdr = os.environ.get("WORKSPACE_CDR")
     if not cdr:
@@ -817,8 +910,11 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"source event fingerprint={source_key}")
     _WORK.finish_unit("build lazy event scan", f"source_key={source_key}")
 
-    _WORK.start_unit("count distinct subjects per source concept", "lazy group_by over scanned event parquets")
-    own_by_cid = _cached_own_counts(events_lf, cache_dir, source_key)
+    _WORK.start_unit(
+        "count distinct subjects per source concept",
+        "COUNT(DISTINCT person_id) GROUP BY cid at BigQuery — local polars n_unique on 1B rows OOM'd",
+    )
+    own_by_cid = _cached_own_counts(client(), cdr, cache_dir, source_key)
     _WORK.finish_unit("count distinct subjects per source concept", f"unique concept_ids={len(own_by_cid):,}")
 
     _WORK.start_unit("collapse vocabulary", f"threshold={THRESHOLD:,}; resolving ancestors and concept codes if cache is cold")
