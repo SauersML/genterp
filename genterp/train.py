@@ -451,7 +451,7 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
         "report_to": "none",
         "skip_memory_metrics": True,
         "restore_callback_states_from_checkpoint": True,
-        "save_safetensors": True,
+        # save_safetensors removed in transformers 5.x — safetensors is the only format now.
         "auto_find_batch_size": runtime.auto_find_batch_size,
         "gradient_checkpointing": use_gradient_checkpointing,
     }
