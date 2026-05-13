@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,32 +29,23 @@ class AtomVocab:
 
 
 @dataclass
-class AncestorMap:
-    """Code -> [leaf_atom, *strict_ancestor_atoms]. bag[0] is the next-event target."""
+class CodeAtomMap:
+    """Code -> collapsed atom index."""
 
-    closure: dict[str, list[int]]
+    code_to_atom: dict[str, int]
 
-    def bag(self, code: str) -> list[int]:
-        return self.closure.get(code, [])
+    def atom(self, code: str) -> int:
+        return self.code_to_atom.get(code, PAD_ATOM)
 
     @classmethod
-    def from_omop_concept_ancestor(
-        cls, vocab: AtomVocab, code_to_ancestor_codes: dict[str, Iterable[str]]
-    ) -> "AncestorMap":
-        out: dict[str, list[int]] = {}
-        for code, ancestors in code_to_ancestor_codes.items():
-            leaf = vocab.encode(code)
-            if leaf == PAD_ATOM:
-                continue
-            anc = [vocab.encode(a) for a in ancestors if a in vocab.code_to_atom and a != code]
-            out[code] = [leaf, *anc]
-        return cls(out)
+    def from_vocab(cls, vocab: AtomVocab) -> "CodeAtomMap":
+        return cls({code: atom for code, atom in vocab.code_to_atom.items() if atom != PAD_ATOM})
 
 
 class CohortDataset(Dataset):
     """events.parquet sorted by (subject_id, time_seconds); subjects.parquet holds per-subject row offsets, sex, birth."""
 
-    def __init__(self, data_dir: str | Path, ancestors: AncestorMap, max_events: int = 4096):
+    def __init__(self, data_dir: str | Path, code_atoms: CodeAtomMap, max_events: int = 4096):
         data_dir = Path(data_dir)
         events = pq.read_table(data_dir / "events.parquet", columns=["time_seconds", "code", "value"], memory_map=True)
         self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
@@ -67,7 +57,7 @@ class CohortDataset(Dataset):
         self.sex = subjects["sex"].to_numpy()
         self.birth_seconds = subjects["birth_seconds"].to_numpy()
         self.censor_seconds = subjects["censor_seconds"].to_numpy()
-        self.ancestors = ancestors
+        self.code_atoms = code_atoms
         self.max_events = max_events
 
     def __len__(self) -> int:
@@ -79,68 +69,56 @@ class CohortDataset(Dataset):
         times = self.event_times[s:stop]
         codes = self.event_codes
         birth = float(self.birth_seconds[idx])
-        ancestors = self.ancestors
+        code_atoms = self.code_atoms
         max_events = self.max_events
 
-        static_bags: list[list[int]] = []
-        event_bags: list[list[int]] = []
+        static_atoms: list[int] = []
+        event_atoms: list[int] = []
         event_ages: list[float] = []
         event_values: list[float] = []
         values = self.event_values
         for offset, t in enumerate(times, start=s):
-            bag = ancestors.bag(codes[offset])
-            if not bag:
+            atom = code_atoms.atom(codes[offset])
+            if atom == PAD_ATOM:
                 continue
             delta_days = (t - birth) / 86400.0
             if delta_days <= 0.5:
-                static_bags.append(bag)
-            elif len(event_bags) < max_events:
-                event_bags.append(bag)
+                static_atoms.append(atom)
+            elif len(event_atoms) < max_events:
+                event_atoms.append(atom)
                 event_ages.append(delta_days)
                 event_values.append(float(values[offset]))
-                if len(event_bags) == max_events:
+                if len(event_atoms) == max_events:
                     break
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
             "sex": int(self.sex[idx]),
-            "static_bags": static_bags,
-            "event_bags": event_bags,
+            "static_atoms": static_atoms,
+            "event_atoms": event_atoms,
             "event_ages": np.asarray(event_ages, dtype=np.float32),
             "event_values": np.asarray(event_values, dtype=np.float32),
             "censor_age_days": float(censor_age_days),
         }
 
 
-def _pack(bags_per_seq: list[list[list[int]]]) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
-    """Pack [[bag, ...], ...] into (atoms, offsets, (B, S)) for nn.EmbeddingBag. Always emits S >= 1."""
-    B = len(bags_per_seq)
-    S = max((len(seq) for seq in bags_per_seq), default=0)
+def _pad_atoms(seqs: list[list[int]]) -> torch.Tensor:
+    """Pad per-subject atom sequences. Always emits S >= 1."""
+    B = len(seqs)
+    S = max((len(seq) for seq in seqs), default=0)
     S = max(S, 1)
-    flat_offsets: list[int] = []
-    flat_atoms: list[int] = []
-    running = 0
-    for seq in bags_per_seq:
-        for s in range(S):
-            flat_offsets.append(running)
-            if s < len(seq):
-                flat_atoms.extend(seq[s])
-                running += len(seq[s])
-            else:
-                flat_atoms.append(PAD_ATOM)
-                running += 1
-    return (
-        torch.tensor(flat_atoms, dtype=torch.long),
-        torch.tensor(flat_offsets, dtype=torch.long),
-        (B, S),
-    )
+    out = torch.full((B, S), PAD_ATOM, dtype=torch.long)
+    for i, seq in enumerate(seqs):
+        if seq:
+            out[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
+    return out
 
 
 def collate(batch: list[dict]) -> dict:
     B = len(batch)
-    static_atoms, static_offsets, static_shape = _pack([b["static_bags"] for b in batch])
-    event_atoms, event_offsets, event_shape = _pack([b["event_bags"] for b in batch])
-    M, T = static_shape[1], event_shape[1]
+    static_atoms = _pad_atoms([b["static_atoms"] for b in batch])
+    event_atoms = _pad_atoms([b["event_atoms"] for b in batch])
+    M, T = static_atoms.shape[1], event_atoms.shape[1]
 
     static_pad = torch.ones(B, M, dtype=torch.bool)
     event_pad = torch.ones(B, T, dtype=torch.bool)
@@ -148,22 +126,19 @@ def collate(batch: list[dict]) -> dict:
     event_values = torch.full((B, T), float("nan"), dtype=torch.float32)
     target_atoms = torch.zeros(B, T, dtype=torch.long)
     for i, b in enumerate(batch):
-        static_pad[i, : len(b["static_bags"])] = False
-        n_ev = len(b["event_bags"])
+        static_pad[i, : len(b["static_atoms"])] = False
+        n_ev = len(b["event_atoms"])
         event_pad[i, :n_ev] = False
         if n_ev:
             event_ages[i, :n_ev] = torch.from_numpy(b["event_ages"])
             event_values[i, :n_ev] = torch.from_numpy(b["event_values"])
-            target_atoms[i, :n_ev] = torch.tensor([bag[0] for bag in b["event_bags"]], dtype=torch.long)
+            target_atoms[i, :n_ev] = event_atoms[i, :n_ev]
     static_pad[:, 0] = False
 
     return {
         "static_atoms": static_atoms,
-        "static_offsets": static_offsets,
         "static_pad": static_pad,
-        "static_shape": static_shape,
         "event_atoms": event_atoms,
-        "event_offsets": event_offsets,
         "event_pad": event_pad,
         "event_ages": event_ages,
         "event_values": event_values,

@@ -75,6 +75,6 @@ def test_value_head_sample():
     with torch.no_grad():
         out = model(**batch)
         leaf = batch["target_atoms"][:, -1].clamp(min=0)
-        z = model.value_head.sample(out["hidden"][:, -1], model.embed.bag.weight[leaf])
+        z = model.value_head.sample(out["hidden"][:, -1], model.embed.weight[leaf])
     assert z.shape == (out["hidden"].shape[0],)
     assert torch.isfinite(z).all()

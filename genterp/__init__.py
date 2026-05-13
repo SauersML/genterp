@@ -1,8 +1,8 @@
 from genterp.modeling import (
-    AncestorEmbedding,
+    AtomEmbedding,
+    ContinuousTimeRoPE,
     Genterp,
     GenterpConfig,
-    GompertzRoPE,
     MarkedTPPHead,
     SetTransformer,
     ValueHead,
@@ -12,12 +12,12 @@ from genterp.modeling import (
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts
 
 __all__ = [
-    "AncestorEmbedding",
+    "AtomEmbedding",
     "CLTConfig",
     "CrossLayerTranscoder",
+    "ContinuousTimeRoPE",
     "Genterp",
     "GenterpConfig",
-    "GompertzRoPE",
     "MarkedTPPHead",
     "SetTransformer",
     "ValueHead",

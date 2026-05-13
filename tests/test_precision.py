@@ -41,7 +41,7 @@ def test_clt_under_bf16():
         pre_mlp, mlp_out = harvest_transcoder_acts(model, batch)
     assert torch.isfinite(pre_mlp).all() and torch.isfinite(mlp_out).all()
 
-    clt = CrossLayerTranscoder(CLTConfig(n_layers=pre_mlp.shape[1], dim=pre_mlp.shape[2], n_features=64, l0_coef=1e-3))
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=pre_mlp.shape[1], dim=pre_mlp.shape[2], n_features=64, k_per_token=16))
     opt = torch.optim.Adam(clt.parameters(), lr=5e-3)
     init = clt.loss(pre_mlp, mlp_out)["recon"].item()
     for _ in range(50):

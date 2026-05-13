@@ -10,7 +10,7 @@ import torch
 import transformers
 from transformers.trainer_utils import get_last_checkpoint
 
-from genterp.data import AncestorMap, AtomVocab, CohortDataset, collate
+from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
 
 
@@ -68,8 +68,7 @@ def main() -> None:
     etl = Path.home() / "genterp" / "etl"
     output_dir = Path.home() / "genterp" / "runs"
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
-    ancestors = AncestorMap.from_omop_concept_ancestor(vocab, json.loads((etl / "ancestors.json").read_text()))
-    dataset = CohortDataset(etl, ancestors)
+    dataset = CohortDataset(etl, CodeAtomMap.from_vocab(vocab))
 
     cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
     model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))

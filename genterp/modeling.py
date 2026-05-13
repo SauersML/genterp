@@ -8,47 +8,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-
-GM_ALPHA = 5e-5
-GM_LAMBDA = 1e-3
-GM_BETA_FEMALE = 0.080
-GM_BETA_MALE = 0.090
-H_SCALE = 1000.0
 ROPE_BASE = 10000.0
-PERIODIC_DAYS = (1.0, 7.0, 365.25)
 
 
-def gompertz_makeham_H(age_years: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-    return (GM_ALPHA / beta) * torch.expm1(beta * age_years) + GM_LAMBDA * age_years
+class ContinuousTimeRoPE(nn.Module):
+    """Single-band continuous-time RoPE on age in days.
 
-
-class GompertzRoPE(nn.Module):
-    """Two-band continuous-time RoPE: H(age) on low band, raw days on high band with circadian/weekly/annual periods."""
+    Geometric ROPE frequency basis on raw age — wavelengths span from a day
+    or two up to ~10⁴ days, covering same-encounter spacing through lifetime
+    ordering. No hazard warping, no calendar periodicity baked in (calendar
+    effects belong in tokens, not positional encoding). Static tokens get
+    zero rotation.
+    """
 
     def __init__(self, head_dim: int):
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError("head_dim must be even")
         n_rot = head_dim // 2
-        n_low = n_rot // 2
-        n_high = n_rot - n_low
+        freq = 1.0 / (ROPE_BASE ** (torch.arange(n_rot, dtype=torch.float32) / max(n_rot, 1)))
+        self.register_buffer("freq", freq, persistent=False)
 
-        low_freq = 1.0 / (ROPE_BASE ** (torch.arange(n_low, dtype=torch.float32) / max(n_low, 1)))
-        periods = [PERIODIC_DAYS[i % len(PERIODIC_DAYS)] / (i // len(PERIODIC_DAYS) + 1) for i in range(n_high)]
-        high_freq = 2 * math.pi / torch.tensor(periods, dtype=torch.float32)
-
-        self.register_buffer("low_freq", low_freq, persistent=False)
-        self.register_buffer("high_freq", high_freq, persistent=False)
-        self.n_low = n_low
-        self.n_high = n_high
-
-    def angles(self, age_days: torch.Tensor, beta: torch.Tensor, is_static: torch.Tensor) -> torch.Tensor:
-        t = age_days.float()
-        b = beta.float().unsqueeze(-1) if beta.dim() == 1 else beta.float()
-        H = gompertz_makeham_H(t / 365.25, b) * H_SCALE
-        low = H.unsqueeze(-1) * self.low_freq.float()
-        high = t.unsqueeze(-1) * self.high_freq.float()
-        return torch.cat([low, high], dim=-1).masked_fill(is_static.unsqueeze(-1), 0.0)
+    def angles(self, age_days: torch.Tensor, is_static: torch.Tensor) -> torch.Tensor:
+        return (age_days.float().unsqueeze(-1) * self.freq.float()).masked_fill(is_static.unsqueeze(-1), 0.0)
 
     @staticmethod
     def apply(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
@@ -84,7 +66,7 @@ class SwiGLU(nn.Module):
 
 
 class CausalRoPEAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, rope: GompertzRoPE, dropout: float = 0.0):
+    def __init__(self, dim: int, heads: int, rope: ContinuousTimeRoPE, dropout: float = 0.0):
         super().__init__()
         if dim % heads != 0:
             raise ValueError("dim must be divisible by heads")
@@ -109,7 +91,7 @@ class CausalRoPEAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, heads: int, rope: GompertzRoPE, mlp_mult: int = 4, dropout: float = 0.0):
+    def __init__(self, dim: int, heads: int, rope: ContinuousTimeRoPE, mlp_mult: int = 4, dropout: float = 0.0):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = CausalRoPEAttention(dim, heads, rope, dropout)
@@ -165,18 +147,22 @@ class SetTransformer(nn.Module):
         return self.pma(seeds, x, pad)
 
 
-class AncestorEmbedding(nn.Module):
-    """Sum-pooled bag embedding over OMOP concept_ancestor closures."""
+class AtomEmbedding(nn.Module):
+    """Atom embedding for collapsed OMOP event codes."""
 
     def __init__(self, n_atoms: int, dim: int, padding_idx: int = 0):
         super().__init__()
-        self.bag = nn.EmbeddingBag(n_atoms, dim, mode="sum", padding_idx=padding_idx)
-        nn.init.normal_(self.bag.weight, std=0.02)
+        self.embedding = nn.Embedding(n_atoms, dim, padding_idx=padding_idx)
+        nn.init.normal_(self.embedding.weight, std=0.02)
         with torch.no_grad():
-            self.bag.weight[padding_idx].zero_()
+            self.embedding.weight[padding_idx].zero_()
 
-    def forward(self, atoms: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-        return self.bag(atoms, offsets)
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.embedding.weight
+
+    def forward(self, atoms: torch.Tensor) -> torch.Tensor:
+        return self.embedding(atoms)
 
 
 def _log1p_signed(z: torch.Tensor) -> torch.Tensor:
@@ -324,25 +310,24 @@ class GenterpConfig:
 
 
 class Genterp(nn.Module):
-    """Clinical FM: ancestor-bag tokens, value-modulated, Set-Transformer static prefix, Gompertz two-band RoPE, marked-TPP head, gaussian value head."""
+    """Clinical FM: collapsed atom tokens, value-modulated, Set-Transformer static prefix, continuous-time RoPE, marked-TPP head, gaussian value head."""
 
     def __init__(self, cfg: GenterpConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = AncestorEmbedding(cfg.n_atoms, cfg.dim, padding_idx=cfg.pad_atom_idx)
+        self.embed = AtomEmbedding(cfg.n_atoms, cfg.dim, padding_idx=cfg.pad_atom_idx)
         self.value_mod = ValueModulator(cfg.dim, cfg.n_atoms, cfg.value_mlp_hidden)
         self.static_encoder = SetTransformer(cfg.dim, cfg.n_heads, cfg.n_static_blocks, cfg.k_static_summary, cfg.mlp_mult)
-        self.rope = GompertzRoPE(cfg.dim // cfg.n_heads)
+        self.rope = ContinuousTimeRoPE(cfg.dim // cfg.n_heads)
         self.blocks = nn.ModuleList(
             Block(cfg.dim, cfg.n_heads, self.rope, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
         )
         self.norm = RMSNorm(cfg.dim)
         self.tpp = MarkedTPPHead(cfg.dim, cfg.n_atoms, cfg.n_time_mix, cfg.mark_rank, cfg.time_phi_dim)
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
-        self.register_buffer("_beta_by_sex", torch.tensor([GM_BETA_FEMALE, GM_BETA_MALE]), persistent=False)
 
-    def _embed(self, atoms: torch.Tensor, offsets: torch.Tensor, shape: tuple[int, int]) -> torch.Tensor:
-        return self.embed(atoms, offsets).view(*shape, self.cfg.dim)
+    def _embed(self, atoms: torch.Tensor) -> torch.Tensor:
+        return self.embed(atoms)
 
     def _attn_mask(self, K: int, T: int, event_pad: torch.Tensor | None, device: torch.device) -> torch.Tensor:
         S = K + T
@@ -360,34 +345,29 @@ class Genterp(nn.Module):
     def forward(
         self,
         static_atoms: torch.Tensor,
-        static_offsets: torch.Tensor,
         static_pad: torch.Tensor,
-        static_shape: tuple[int, int],
         event_atoms: torch.Tensor,
-        event_offsets: torch.Tensor,
         event_ages: torch.Tensor,
         event_pad: torch.Tensor,
-        sex: torch.Tensor,
         target_atoms: torch.Tensor,
         event_values: torch.Tensor,
         return_transcoder_acts: bool = False,
         **loss_only_kwargs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        del loss_only_kwargs  # censor_age and other loss-side fields ride the same batch dict
-        B, M = static_shape
+        del loss_only_kwargs  # censor_age + sex + other loss-only or external fields ride the same batch dict
+        B = static_atoms.shape[0]
         T = event_ages.shape[1]
         K = self.cfg.k_static_summary
         device = event_ages.device
 
-        summary = self.static_encoder(self._embed(static_atoms, static_offsets, (B, M)), static_pad)
-        events = self._embed(event_atoms, event_offsets, (B, T))
+        summary = self.static_encoder(self._embed(static_atoms), static_pad)
+        events = self._embed(event_atoms)
         events = self.value_mod(events, target_atoms, event_values)
         x = torch.cat([summary, events], dim=1)
 
-        beta = self._beta_by_sex[sex]
         is_static = (torch.arange(K + T, device=device) < K).expand(B, -1)
         ages_full = F.pad(event_ages, (K, 0), value=0.0)
-        angles = self.rope.angles(ages_full, beta, is_static)
+        angles = self.rope.angles(ages_full, is_static)
         mask = self._attn_mask(K, T, event_pad, device)
 
         pre_mlps: list[torch.Tensor] = []
@@ -425,7 +405,7 @@ class Genterp(nn.Module):
             self.tpp,
             self.value_mod,
             self.value_head,
-            self.embed.bag.weight,
+            self.embed.weight,
             out["hidden"],
             event_ages,
             target_atoms,

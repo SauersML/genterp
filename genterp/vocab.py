@@ -8,7 +8,7 @@ def collapse_vocabulary(
     coverage: dict[str, int],
     ancestors: dict[str, dict[str, int]],
     threshold: int = 50,
-) -> tuple[dict[str, int], dict[str, list[str]]]:
+) -> dict[str, int]:
     """Roll rare cohort concepts up the IS-A DAG.
 
     coverage[c] is the number of distinct patients with at least one event whose
@@ -23,9 +23,8 @@ def collapse_vocabulary(
         minimizing (coverage[a], hops(c→a), a). Most-specific surviving
         ancestor, deterministic tie-break.
 
-    Returns (atom_idx, ancestor_codes):
-      atom_idx[code]       = dense atom in [1..V] of code's target
-      ancestor_codes[code] = strict vocab ancestors of code's target
+    Returns:
+      atom_idx[code] = dense atom in [1..V] of code's target
     Codes with no eligible ancestor are absent (dropped).
     """
     if threshold < 1:
@@ -47,11 +46,4 @@ def collapse_vocabulary(
 
     vocab = sorted(set(targets.values()))
     atom_of = {v: i + 1 for i, v in enumerate(vocab)}
-    vocab_set = set(vocab)
-
-    atom_idx = {c: atom_of[t] for c, t in targets.items()}
-    ancestor_codes = {
-        c: sorted(a for a in ancestors.get(t, {}) if a in vocab_set)
-        for c, t in targets.items()
-    }
-    return atom_idx, ancestor_codes
+    return {c: atom_of[t] for c, t in targets.items()}

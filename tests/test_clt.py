@@ -22,7 +22,8 @@ def test_clt_training():
     assert n_layers == cfg.n_layers and dim == cfg.dim
     assert n_tokens > 0
 
-    clt = CrossLayerTranscoder(CLTConfig(n_layers=n_layers, dim=dim, n_features=128, l0_coef=1e-3))
+    K = 32
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=n_layers, dim=dim, n_features=128, k_per_token=K))
     opt = torch.optim.Adam(clt.parameters(), lr=1e-2)
 
     init_recon = clt.loss(pre_mlp, mlp_out)["recon"].item()
@@ -33,7 +34,8 @@ def test_clt_training():
         opt.step()
     final = clt.loss(pre_mlp, mlp_out)
     assert final["recon"].item() < init_recon
-    assert final["n_active"].item() < clt.cfg.n_features
+    # BatchTopK caps average activity at K per token per layer; the model may use fewer.
+    assert 0 < final["n_active"].item() <= K + 1e-4
 
 
 def test_clt_cross_layer_decoder_mask():
@@ -49,3 +51,19 @@ def test_clt_cross_layer_decoder_mask():
     for s in range(L):
         for t in range(s):
             assert grad[s, t].abs().max().item() == 0.0
+
+
+def test_clt_recon_loss_normalizes_per_layer_activation_scale():
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=2, dim=2, n_features=4))
+    pre_mlp = torch.zeros(2, 2, 2)
+    mlp_out = torch.tensor(
+        [
+            [[1.0, -1.0], [10.0, -10.0]],
+            [[1.0, -1.0], [10.0, -10.0]],
+        ]
+    )
+
+    out = clt.loss(pre_mlp, mlp_out)
+
+    assert torch.allclose(clt.per_layer_std, torch.tensor([1.0, 10.0]))
+    assert torch.allclose(out["recon"], torch.tensor(2.0))

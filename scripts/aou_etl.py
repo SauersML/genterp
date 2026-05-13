@@ -246,9 +246,8 @@ def main() -> None:
         for d, ancs in anc.items() if d in code_of
     }
 
-    atom_idx, ancestor_codes = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
+    atom_idx = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
     _write_json(out_dir / "vocab.json", atom_idx)
-    _write_json(out_dir / "ancestors.json", ancestor_codes)
 
     stats_df = (
         events_all.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
