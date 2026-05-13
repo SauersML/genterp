@@ -55,6 +55,14 @@ def _cuda_bf16_supported() -> bool:
     return bool(torch.cuda.is_bf16_supported())
 
 
+def _cuda_fp16_supported(capability: tuple[int, int]) -> bool:
+    return capability[0] >= 7
+
+
+def _cuda_bf16_runtime_supported(capability: tuple[int, int]) -> bool:
+    return capability[0] >= 8 and _cuda_bf16_supported()
+
+
 def _cuda_capability(index: int, props: Any) -> tuple[int, int]:
     major = getattr(props, "major", None)
     minor = getattr(props, "minor", None)
@@ -64,9 +72,21 @@ def _cuda_capability(index: int, props: Any) -> tuple[int, int]:
     return int(capability[0]), int(capability[1])
 
 
+def _cuda_sm_count(props: Any) -> int:
+    return int(getattr(props, "multi_processor_count", 0))
+
+
+def _cuda_precision_tier(capability: tuple[int, int]) -> int:
+    if capability[0] >= 8:
+        return 2
+    if _cuda_fp16_supported(capability):
+        return 1
+    return 0
+
+
 def _cuda_score(index: int, props: Any) -> tuple[int, int, int, int]:
     capability = _cuda_capability(index, props)
-    return capability[0], capability[1], int(props.total_memory), -index
+    return _cuda_precision_tier(capability), int(props.total_memory), _cuda_sm_count(props), -index
 
 
 def _cuda_devices_are_homogeneous(props: list[Any]) -> bool:
@@ -74,11 +94,15 @@ def _cuda_devices_are_homogeneous(props: list[Any]) -> bool:
         return False
     first_capability = _cuda_capability(0, props[0])
     first_memory = int(props[0].total_memory)
+    first_sms = _cuda_sm_count(props[0])
     for index, item in enumerate(props[1:], start=1):
         if _cuda_capability(index, item) != first_capability:
             return False
         memory = int(item.total_memory)
         if abs(memory - first_memory) / max(first_memory, 1) > 0.05:
+            return False
+        sms = _cuda_sm_count(item)
+        if sms and first_sms and abs(sms - first_sms) / max(first_sms, 1) > 0.05:
             return False
     return True
 
@@ -104,10 +128,12 @@ def get_torch_runtime() -> TorchRuntime:
         props: Any = all_props[device_index]
         capability = _cuda_capability(device_index, props)
         name = str(getattr(props, "name", "CUDA"))
-        bf16 = _cuda_bf16_supported()
+        bf16 = _cuda_bf16_runtime_supported(capability)
+        fp16 = not bf16 and _cuda_fp16_supported(capability)
         tf32 = capability[0] >= 8
         compile_model = capability[0] >= 8
         large_hopper = capability[0] >= 9
+        fused_optimizer = _cuda_fp16_supported(capability)
         active_device_count = device_count if use_data_parallel else 1
         return TorchRuntime(
             device=torch.device("cuda", device_index),
@@ -116,12 +142,12 @@ def get_torch_runtime() -> TorchRuntime:
             cuda_capability=capability,
             per_device_train_batch_size=batch_size_for_cuda_memory(props.total_memory),
             bf16=bf16,
-            fp16=not bf16,
+            fp16=fp16,
             tf32=tf32,
             torch_compile=compile_model,
             torch_compile_backend="inductor" if compile_model else None,
             torch_compile_mode="max-autotune" if large_hopper else "reduce-overhead" if compile_model else None,
-            optim="adamw_torch_fused",
+            optim="adamw_torch_fused" if fused_optimizer else "adamw_torch",
             use_data_parallel=use_data_parallel,
             dataloader_num_workers=_cuda_dataloader_workers(active_device_count),
             dataloader_pin_memory=True,

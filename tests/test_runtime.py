@@ -24,7 +24,13 @@ def test_cuda_runtime_uses_all_homogeneous_bf16_devices(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda index: SimpleNamespace(total_memory=180 * GIB, name=f"accelerator-{index}", major=9, minor=0),
+        lambda index: SimpleNamespace(
+            total_memory=180 * GIB,
+            name=f"accelerator-{index}",
+            major=9,
+            minor=0,
+            multi_processor_count=120,
+        ),
     )
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
 
@@ -54,7 +60,13 @@ def test_cuda_runtime_uses_fp16_without_unsupported_newer_cuda_features(monkeypa
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _: SimpleNamespace(total_memory=16 * GIB, name="accelerator", major=7, minor=5),
+        lambda _: SimpleNamespace(
+            total_memory=16 * GIB,
+            name="accelerator",
+            major=7,
+            minor=5,
+            multi_processor_count=40,
+        ),
     )
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
 
@@ -71,16 +83,44 @@ def test_cuda_runtime_uses_fp16_without_unsupported_newer_cuda_features(monkeypa
     assert not runtime.use_data_parallel
 
 
+def test_cuda_runtime_keeps_pre_tensor_core_devices_in_fp32(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            total_memory=8 * GIB,
+            name="accelerator",
+            major=6,
+            minor=1,
+            multi_processor_count=20,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.cuda_capability == (6, 1)
+    assert runtime.per_device_train_batch_size == 1
+    assert not runtime.bf16
+    assert not runtime.fp16
+    assert not runtime.tf32
+    assert not runtime.torch_compile
+    assert runtime.optim == "adamw_torch"
+
+
 def test_cuda_runtime_picks_best_visible_mixed_gpu(monkeypatch):
     set_devices = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
     props = [
-        SimpleNamespace(total_memory=16 * GIB, name="small", major=7, minor=5),
-        SimpleNamespace(total_memory=180 * GIB, name="largest-newest", major=9, minor=0),
-        SimpleNamespace(total_memory=80 * GIB, name="large", major=8, minor=0),
-        SimpleNamespace(total_memory=24 * GIB, name="newer-small", major=8, minor=9),
+        SimpleNamespace(total_memory=16 * GIB, name="small", major=7, minor=5, multi_processor_count=40),
+        SimpleNamespace(total_memory=180 * GIB, name="largest-newest", major=9, minor=0, multi_processor_count=120),
+        SimpleNamespace(total_memory=80 * GIB, name="large", major=8, minor=0, multi_processor_count=108),
+        SimpleNamespace(total_memory=24 * GIB, name="newer-small", major=8, minor=9, multi_processor_count=60),
     ]
     monkeypatch.setattr(
         torch.cuda,
@@ -95,6 +135,28 @@ def test_cuda_runtime_picks_best_visible_mixed_gpu(monkeypatch):
     assert not runtime.use_data_parallel
     assert set_devices == [1]
     assert "strategy=single_gpu" in accelerator_label(runtime)
+
+
+def test_cuda_runtime_prefers_larger_fp16_device_over_smaller_fp16_device(monkeypatch):
+    set_devices = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
+    props = [
+        SimpleNamespace(total_memory=8 * GIB, name="legacy", major=6, minor=1, multi_processor_count=20),
+        SimpleNamespace(total_memory=16 * GIB, name="compact-fp16", major=7, minor=5, multi_processor_count=40),
+        SimpleNamespace(total_memory=16 * GIB, name="wide-fp16", major=7, minor=0, multi_processor_count=80),
+    ]
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: props[index])
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.device == torch.device("cuda", 2)
+    assert runtime.cuda_capability == (7, 0)
+    assert runtime.fp16
+    assert not runtime.use_data_parallel
+    assert set_devices == [2]
 
 
 def test_mps_runtime_avoids_cuda_only_options(monkeypatch):
