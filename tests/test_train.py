@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -9,10 +10,13 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 from genterp.runtime import TorchRuntime
 from genterp.train import (
     GenterpTrainer,
+    _limit_eval_worker,
+    build_training_args,
     checkpoint_is_complete,
     checkpoint_matches_runtime,
     checkpoint_runtime_state,
     final_model_path,
+    gradient_checkpointing_enabled,
     latest_checkpoint,
     model_dir_is_complete,
     save_final_model,
@@ -144,6 +148,23 @@ def test_runtime_state_detects_hardware_profile_change(tmp_path: Path):
     assert not checkpoint_matches_runtime(tmp_path, _runtime(bf16=False, fp16=False, optim="adamw_torch"))
 
 
+def test_training_args_use_wsd_and_cuda_gradient_checkpointing(tmp_path: Path):
+    runtime = _runtime()
+    args = build_training_args(tmp_path, runtime)
+
+    assert gradient_checkpointing_enabled(runtime)
+    assert args["lr_scheduler_type"] == "warmup_stable_decay"
+    assert args["warmup_steps"] == 500
+    assert args["max_steps"] == 50_000
+    assert args["lr_scheduler_kwargs"] == {
+        "num_decay_steps": 5_000,
+        "decay_type": "linear",
+        "min_lr_ratio": 0.0,
+    }
+    assert args["gradient_checkpointing"] is True
+    assert args["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
+
+
 def test_trainer_uses_dataset_lengths_for_grouped_sampling(tmp_path: Path):
     dataset = _LengthDataset()
     trainer = GenterpTrainer(
@@ -177,3 +198,17 @@ def test_trainer_skips_incompatible_optimizer_and_scaler_state(tmp_path: Path, m
 
     trainer._load_optimizer_and_scheduler(str(tmp_path))
     trainer._load_scaler(str(tmp_path))
+
+
+def test_dataloader_worker_thread_limits(monkeypatch):
+    set_threads = []
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.setattr(torch, "set_num_threads", set_threads.append)
+
+    _limit_eval_worker(0)
+
+    assert set_threads == [1]
+    assert os.environ["OMP_NUM_THREADS"] == "1"
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+    assert os.environ["MKL_NUM_THREADS"] == "1"
+    assert os.environ["NUMEXPR_NUM_THREADS"] == "1"

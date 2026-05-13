@@ -78,17 +78,108 @@ class CausalRoPEAttention(nn.Module):
         self.rope = rope
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor, angles: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def _packed_prefix_causal_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        static_len: int,
+        event_pad: torch.Tensor,
+    ) -> torch.Tensor:
+        B, S, H, D = q.shape
+        valid_events = (~event_pad).sum(dim=1)
+        out = q.new_zeros(B, S, H, D)
+
+        out[:, :static_len] = F.scaled_dot_product_attention(
+            q[:, :static_len].transpose(1, 2),
+            k[:, :static_len].transpose(1, 2),
+            v[:, :static_len].transpose(1, 2),
+            dropout_p=self.dropout if self.training else 0.0,
+        ).transpose(1, 2)
+
+        if valid_events.max().item() == 0:
+            return out
+
+        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            try:
+                from flash_attn import flash_attn_varlen_func
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("flash-attn is required for packed CUDA attention") from exc
+
+            q_parts: list[torch.Tensor] = []
+            k_parts: list[torch.Tensor] = []
+            v_parts: list[torch.Tensor] = []
+            q_lens: list[int] = []
+            kv_lens: list[int] = []
+            for b, event_len_t in enumerate(valid_events.tolist()):
+                event_len = int(event_len_t)
+                q_lens.append(event_len)
+                kv_lens.append(static_len + event_len)
+                k_parts.append(k[b, : static_len + event_len])
+                v_parts.append(v[b, : static_len + event_len])
+                if event_len > 0:
+                    q_parts.append(q[b, static_len : static_len + event_len])
+
+            q_packed = torch.cat(q_parts, dim=0)
+            k_packed = torch.cat(k_parts, dim=0)
+            v_packed = torch.cat(v_parts, dim=0)
+            cu_q = F.pad(torch.tensor(q_lens, device=q.device, dtype=torch.int32).cumsum(0), (1, 0))
+            cu_kv = F.pad(torch.tensor(kv_lens, device=q.device, dtype=torch.int32).cumsum(0), (1, 0))
+            event_out = flash_attn_varlen_func(
+                q_packed,
+                k_packed,
+                v_packed,
+                cu_q,
+                cu_kv,
+                int(max(q_lens)),
+                int(max(kv_lens)),
+                dropout_p=self.dropout if self.training else 0.0,
+                causal=True,
+            )
+            offset = 0
+            for b, event_len_t in enumerate(valid_events.tolist()):
+                event_len = int(event_len_t)
+                if event_len == 0:
+                    continue
+                out[b, static_len : static_len + event_len] = event_out[offset : offset + event_len]
+                offset += event_len
+            return out
+
+        for b, event_len_t in enumerate(valid_events.tolist()):
+            event_len = int(event_len_t)
+            if event_len == 0:
+                continue
+            kv_len = static_len + event_len
+            qe = q[b, static_len : static_len + event_len].transpose(0, 1).unsqueeze(0)
+            ke = k[b, :kv_len].transpose(0, 1).unsqueeze(0)
+            ve = v[b, :kv_len].transpose(0, 1).unsqueeze(0)
+            q_idx = torch.arange(static_len, kv_len, device=q.device).view(event_len, 1)
+            kv_idx = torch.arange(kv_len, device=q.device).view(1, kv_len)
+            mask = (kv_idx <= q_idx).view(1, 1, event_len, kv_len)
+            out[b, static_len:kv_len] = F.scaled_dot_product_attention(
+                qe,
+                ke,
+                ve,
+                attn_mask=mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            ).squeeze(0).transpose(0, 1)
+        return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        angles: torch.Tensor,
+        event_pad: torch.Tensor,
+        static_len: int,
+    ) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = rearrange(q, "b s (h d) -> b h s d", h=self.heads)
-        k = rearrange(k, "b s (h d) -> b h s d", h=self.heads)
-        v = rearrange(v, "b s (h d) -> b h s d", h=self.heads)
-        q = self.rope.apply(q, angles)
-        k = self.rope.apply(k, angles)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0
-        )
-        return self.proj(rearrange(out, "b h s d -> b s (h d)"))
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.heads)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.heads)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.heads)
+        q = self.rope.apply(q.transpose(1, 2), angles).transpose(1, 2)
+        k = self.rope.apply(k.transpose(1, 2), angles).transpose(1, 2)
+        out = self._packed_prefix_causal_attention(q, k, v, static_len, event_pad)
+        return self.proj(rearrange(out, "b s h d -> b s (h d)"))
 
 
 class Block(nn.Module):
@@ -99,9 +190,15 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, mlp_mult)
 
-    def forward(self, x: torch.Tensor, angles: torch.Tensor, attn_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        angles: torch.Tensor,
+        event_pad: torch.Tensor,
+        static_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (post_block_residual, pre_mlp_residual, mlp_additive_output)."""
-        x = x + self.attn(self.norm1(x), angles, attn_mask)
+        x = x + self.attn(self.norm1(x), angles, event_pad, static_len)
         mlp_out = self.mlp(self.norm2(x))
         return x + mlp_out, x, mlp_out
 
@@ -306,17 +403,25 @@ class MarkedTPPHead(nn.Module):
         return torch.cat([phases.sin(), phases.cos()], dim=-1)
 
     def time_params(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        log_w_raw, mu, log_sigma = self.time_proj(hidden).chunk(3, dim=-1)
+        log_w_raw, mu, log_sigma = self.time_logits(hidden).chunk(3, dim=-1)
         return log_w_raw.log_softmax(dim=-1), mu, log_sigma.clamp(-5.0, 5.0)
+
+    def time_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.time_proj(hidden)
 
     def mark_features(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
         phi = self._phi(delta_t)
         return self.mark_h_proj(hidden) + self.mark_time_proj(phi)
 
     def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-        return self.mark_out(self.mark_features(hidden, delta_t)).log_softmax(dim=-1)
+        return self.mark_logits(hidden, delta_t).log_softmax(dim=-1)
+
+    def mark_logits(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        return self.mark_out(self.mark_features(hidden, delta_t))
 
     def sampled_mark_nll(self, hidden: torch.Tensor, delta_t: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if target.numel() == 0:
+            return hidden.sum() * 0.0
         features = self.mark_features(hidden, delta_t)
         k = min(self.sampled_mark_negatives, max(self.n_marks - 1, 1))
         negatives = torch.multinomial(self.mark_noise_probs, k, replacement=False)
@@ -386,7 +491,6 @@ class Genterp(nn.Module):
             cfg.sampled_mark_negatives,
         )
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
-        self._attn_base_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
         self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
         self.gradient_checkpointing = False
         self._gradient_checkpointing_func = checkpoint
@@ -405,28 +509,6 @@ class Genterp(nn.Module):
             cached = torch.arange(K + T, device=device).lt(K).unsqueeze(0)
             self._static_mask_cache[cache_key] = cached
         return cached.expand(B, -1)
-
-    def _attn_base_mask(self, K: int, T: int, device: torch.device) -> torch.Tensor:
-        cache_key = (K, T, *self._device_key(device))
-        cached = self._attn_base_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        S = K + T
-        i = torch.arange(S, device=device).unsqueeze(1)
-        j = torch.arange(S, device=device).unsqueeze(0)
-        allow = ~(((j >= K) & (j > i)) | ((i < K) & (j >= K)))
-        mask = allow.unsqueeze(0).unsqueeze(0)
-        self._attn_base_cache[cache_key] = mask
-        return mask
-
-    def _attn_mask(self, K: int, T: int, event_pad: torch.Tensor | None, device: torch.device) -> torch.Tensor:
-        mask = self._attn_base_mask(K, T, device)
-        if event_pad is not None:
-            B = event_pad.shape[0]
-            pad_full = torch.zeros(B, K + T, dtype=torch.bool, device=device)
-            pad_full[:, K:] = event_pad
-            mask = mask & ~pad_full[:, None, None, :]
-        return mask
 
     def forward(
         self,
@@ -454,15 +536,14 @@ class Genterp(nn.Module):
         is_static = self._static_mask(B, K, T, device)
         ages_full = F.pad(event_ages, (K, 0), value=0.0)
         angles = self.rope.angles(ages_full, is_static)
-        mask = self._attn_mask(K, T, event_pad, device)
 
         pre_mlps: list[torch.Tensor] = []
         mlp_outs: list[torch.Tensor] = []
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, mask)
+                x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, event_pad, K)
             else:
-                x, pre_mlp, mlp_out = blk(x, angles, mask)
+                x, pre_mlp, mlp_out = blk(x, angles, event_pad, K)
             if return_transcoder_acts:
                 pre_mlps.append(pre_mlp[:, K:])
                 mlp_outs.append(mlp_out[:, K:])
@@ -531,7 +612,6 @@ def marked_tpp_value_loss(
     any_mask = real_mask | censor_mask
     n_real = real_mask.sum()
     n_censor = censor_mask.sum()
-    n_any = n_real + n_censor
 
     delta_any = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)[any_mask]
     log_w, mu, log_sigma = tpp.time_params(h_pred[any_mask])

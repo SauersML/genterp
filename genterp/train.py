@@ -27,6 +27,9 @@ from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_run
 RUNTIME_STATE_FILE = "genterp_runtime.json"
 FINAL_POINTER_FILE = "final_checkpoint.json"
 CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
+MAX_STEPS = 50_000
+WARMUP_STEPS = 500
+WSD_DECAY_STEPS = MAX_STEPS // 10
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -40,6 +43,7 @@ class GenterpHFConfig(transformers.PretrainedConfig):
 class GenterpForCausalLM(transformers.PreTrainedModel):
     config_class = GenterpHFConfig
     main_input_name = "event_atoms"
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: GenterpHFConfig):
         super().__init__(config)
@@ -400,8 +404,62 @@ def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch
     return mu, sigma, has_mag
 
 
+def gradient_checkpointing_enabled(runtime: TorchRuntime) -> bool:
+    return runtime.device.type == "cuda" and runtime.auto_find_batch_size
+
+
+def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[str, object]:
+    use_gradient_checkpointing = gradient_checkpointing_enabled(runtime)
+    training_args: dict[str, object] = {
+        "output_dir": str(output_dir),
+        "per_device_train_batch_size": runtime.per_device_train_batch_size,
+        "per_device_eval_batch_size": runtime.per_device_train_batch_size,
+        "learning_rate": 3e-4,
+        "warmup_steps": WARMUP_STEPS,
+        "max_steps": MAX_STEPS,
+        "lr_scheduler_type": "warmup_stable_decay",
+        "lr_scheduler_kwargs": {
+            "num_decay_steps": WSD_DECAY_STEPS,
+            "decay_type": "linear",
+            "min_lr_ratio": 0.0,
+        },
+        "bf16": runtime.bf16,
+        "fp16": runtime.fp16,
+        "tf32": runtime.tf32,
+        "torch_compile": runtime.torch_compile,
+        "save_strategy": "steps",
+        "save_steps": 1,
+        "eval_strategy": "steps",
+        "eval_steps": 500,
+        "prediction_loss_only": True,
+        "logging_steps": 1,
+        "logging_first_step": True,
+        "optim": runtime.optim,
+        "dataloader_num_workers": runtime.dataloader_num_workers,
+        "dataloader_persistent_workers": True,
+        "dataloader_pin_memory": runtime.dataloader_pin_memory,
+        "dataloader_prefetch_factor": runtime.dataloader_prefetch_factor,
+        "dataloader_drop_last": True,
+        "train_sampling_strategy": "group_by_length",
+        "length_column_name": "length",
+        "remove_unused_columns": False,
+        "report_to": "none",
+        "skip_memory_metrics": True,
+        "restore_callback_states_from_checkpoint": True,
+        "save_safetensors": True,
+        "auto_find_batch_size": runtime.auto_find_batch_size,
+        "gradient_checkpointing": use_gradient_checkpointing,
+    }
+    if use_gradient_checkpointing:
+        training_args["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+    if runtime.torch_compile:
+        training_args["torch_compile_backend"] = runtime.torch_compile_backend
+        training_args["torch_compile_mode"] = runtime.torch_compile_mode
+    return training_args
+
+
 def main() -> None:
-    setup = ProgressLogger("train_setup", total_units=14)
+    setup = ProgressLogger("train_setup", total_units=15)
     setup.start_unit("configure torch runtime", "selecting accelerator, precision, optimizer, and dataloader settings")
     runtime = configure_torch_runtime()
     setup.finish_unit(
@@ -453,6 +511,10 @@ def main() -> None:
         print("genterp train hardware profile changed; resuming model weights and rebuilding optimizer state")
     setup.finish_unit("load or initialize model", f"{model_source} params={count_parameters(model):,}")
 
+    setup.start_unit("configure mark negative sampler", "frequency-weighted atom negatives from training events")
+    model.model.tpp.set_mark_noise_distribution(torch.from_numpy(train_dataset.atom_counts(model.model.cfg.n_atoms)))
+    setup.finish_unit("configure mark negative sampler", f"negatives={model.model.cfg.sampled_mark_negatives:,}")
+
     setup.start_unit("load value modulation stats", f"path={etl / 'value_stats.json'}")
     mu, sigma, has_mag = _load_value_stats(etl / "value_stats.json", vocab)
     setup.finish_unit("load value modulation stats", f"magnitude_atoms={int(has_mag.sum().item()):,}")
@@ -462,47 +524,12 @@ def main() -> None:
     setup.finish_unit("apply value modulation stats", f"magnitude_atoms={int(has_mag.sum().item()):,}")
 
     setup.start_unit("build training arguments", "max_steps=50000 with per-step logging and checkpoint saves")
-    training_args = dict(
-        output_dir=str(output_dir),
-        per_device_train_batch_size=runtime.per_device_train_batch_size,
-        per_device_eval_batch_size=runtime.per_device_train_batch_size,
-        learning_rate=3e-4,
-        warmup_steps=500,
-        max_steps=50_000,
-        lr_scheduler_type="cosine",
-        bf16=runtime.bf16,
-        fp16=runtime.fp16,
-        tf32=runtime.tf32,
-        torch_compile=runtime.torch_compile,
-        save_strategy="steps",
-        save_steps=1,
-        eval_strategy="steps",
-        eval_steps=500,
-        prediction_loss_only=True,
-        logging_steps=1,
-        logging_first_step=True,
-        optim=runtime.optim,
-        dataloader_num_workers=runtime.dataloader_num_workers,
-        dataloader_persistent_workers=True,
-        dataloader_pin_memory=runtime.dataloader_pin_memory,
-        dataloader_prefetch_factor=runtime.dataloader_prefetch_factor,
-        dataloader_drop_last=True,
-        train_sampling_strategy="group_by_length",
-        length_column_name="length",
-        remove_unused_columns=False,
-        report_to="none",
-        skip_memory_metrics=True,
-        restore_callback_states_from_checkpoint=True,
-        save_safetensors=True,
-        auto_find_batch_size=runtime.auto_find_batch_size,
-    )
-    if runtime.torch_compile:
-        training_args["torch_compile_backend"] = runtime.torch_compile_backend
-        training_args["torch_compile_mode"] = runtime.torch_compile_mode
+    training_args = build_training_args(output_dir, runtime)
     setup.finish_unit(
         "build training arguments",
         f"max_steps={training_args['max_steps']:,} logging_steps={training_args['logging_steps']} "
-        f"save_steps={training_args['save_steps']} eval_steps={training_args['eval_steps']}",
+        f"save_steps={training_args['save_steps']} eval_steps={training_args['eval_steps']} "
+        f"lr_scheduler={training_args['lr_scheduler_type']} gradient_checkpointing={training_args['gradient_checkpointing']}",
     )
 
     setup.start_unit("instantiate Trainer", "attaching runtime-state and verbose progress callbacks")

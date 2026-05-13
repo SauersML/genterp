@@ -9,12 +9,24 @@ from genterp.modeling import (
     ValueModulator,
     marked_tpp_value_loss,
 )
-from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts, unwrap_genterp_model
+from genterp.transcoder import (
+    CLTConfig,
+    CrossLayerTranscoder,
+    FeatureActivationWindow,
+    FeatureGraphEdge,
+    feature_to_feature_attribution_graph,
+    feature_to_output_attribution,
+    harvest_transcoder_acts,
+    top_activating_examples,
+    unwrap_genterp_model,
+)
 
 __all__ = [
     "AtomEmbedding",
     "CLTConfig",
     "CrossLayerTranscoder",
+    "FeatureActivationWindow",
+    "FeatureGraphEdge",
     "ContinuousTimeRoPE",
     "Genterp",
     "GenterpConfig",
@@ -22,7 +34,10 @@ __all__ = [
     "SetTransformer",
     "ValueHead",
     "ValueModulator",
+    "feature_to_feature_attribution_graph",
+    "feature_to_output_attribution",
     "harvest_transcoder_acts",
+    "top_activating_examples",
     "unwrap_genterp_model",
     "marked_tpp_value_loss",
 ]

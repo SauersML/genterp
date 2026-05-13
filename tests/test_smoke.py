@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from genterp import Genterp
+from genterp.modeling import marked_tpp_value_loss
 from tests._factories import make_batch, tiny_config
 
 
@@ -44,6 +45,49 @@ def test_mark_output_uses_atom_embedding_weight():
     model = Genterp(tiny_config())
 
     assert model.tpp.mark_out.weight is model.embed.embedding.weight
+
+
+def test_mark_loss_samples_negatives_only_while_training(monkeypatch):
+    cfg = tiny_config(n_atoms=32)
+    model = Genterp(cfg)
+    batch = make_batch(n_atoms=cfg.n_atoms)
+    out = model(**batch)
+    sampled_calls = []
+
+    def sampled_mark_nll(hidden, delta_t, target):
+        sampled_calls.append(target.shape[0])
+        return hidden.sum() * 0.0
+
+    monkeypatch.setattr(model.tpp, "sampled_mark_nll", sampled_mark_nll)
+    model.train()
+    marked_tpp_value_loss(
+        model.tpp,
+        model.value_mod,
+        model.value_head,
+        model.embed.weight,
+        out["hidden"],
+        batch["event_ages"],
+        batch["target_atoms"],
+        batch["event_values"],
+        batch["event_pad"],
+        batch["censor_age"],
+    )
+
+    model.eval()
+    marked_tpp_value_loss(
+        model.tpp,
+        model.value_mod,
+        model.value_head,
+        model.embed.weight,
+        out["hidden"],
+        batch["event_ages"],
+        batch["target_atoms"],
+        batch["event_values"],
+        batch["event_pad"],
+        batch["censor_age"],
+    )
+
+    assert sampled_calls == [int((~batch["event_pad"][:, :-1] & ~batch["event_pad"][:, 1:]).sum().item())]
 
 
 def test_transcoder_acts():

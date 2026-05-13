@@ -25,7 +25,7 @@ from pathlib import Path
 import polars as pl
 import psutil
 import pyarrow.parquet as pq
-from google.cloud import bigquery
+from google.cloud import bigquery, bigquery_storage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.progress import ProgressLogger
@@ -39,7 +39,6 @@ def _mem_str() -> str:
     return f"RSS={_PROC.memory_info().rss / 1e9:.2f}GB"
 
 _WORK = ProgressLogger("aou_etl", total_units=11)
-REST_PAGE_SIZE = 100_000
 
 
 def _log(msg: str) -> None:
@@ -95,14 +94,14 @@ def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
 def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_path: Path) -> None:
     """Submit/reuse a BQ job and stream its Arrow batches directly to a Parquet file.
 
-    Never materializes the full result Arrow table in process memory. For large
-    event scans this is the difference between fitting in RAM and getting
-    SIGKILL'd by the kernel.
+    Uses the BigQuery Storage API (gRPC + parallel streams) — typically 20–50×
+    faster than REST pagination for large results. Never materializes the full
+    Arrow table in process memory.
     """
     if out_path.exists():
         _log(f"cache hit:  {out_path.name}")
         return
-    _log(f"streaming:  {out_path.name} (no full materialization)")
+    _log(f"streaming:  {out_path.name} (BQ Storage API, parallel streams)")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     if tmp.exists():
@@ -110,30 +109,44 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 
     t0 = time.monotonic()
     job = _submit_or_reuse_job(client, sql, label)
-    # Do not use the BigQuery Storage API here. Its parallel Arrow downloader
-    # can allocate multiprocessing semaphores and leak them on shutdown under
-    # very large result sets. REST pages are slower but keep memory and OS
-    # resources bounded and predictable.
-    iterable = job.result(page_size=REST_PAGE_SIZE).to_arrow_iterable(bqstorage_client=None)
 
-    writer: pq.ParquetWriter | None = None
-    rows = 0
-    batches = 0
+    bqs_client = bigquery_storage.BigQueryReadClient()
     try:
-        for batch in iterable:
-            if writer is None:
-                writer = pq.ParquetWriter(tmp, batch.schema, compression="zstd")
-            assert writer is not None
-            writer.write_batch(batch)
-            rows += batch.num_rows
-            batches += 1
-            if batches % 50 == 0:
-                _log(f"  stream:    {label} rows={rows:,} batches={batches}")
+        iterable = job.result().to_arrow_iterable(bqstorage_client=bqs_client)
+        writer: pq.ParquetWriter | None = None
+        rows = 0
+        batches = 0
+        t_first: float | None = None
+        t_last_log = time.monotonic()
+        try:
+            for batch in iterable:
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, batch.schema, compression="zstd")
+                    t_first = time.monotonic()
+                    _log(f"  stream:    {label} first batch in {t_first - t0:.1f}s rows={batch.num_rows:,}")
+                assert writer is not None
+                writer.write_batch(batch)
+                rows += batch.num_rows
+                batches += 1
+                # Log every 2 seconds — fast enough to feel live, sparse enough for big runs.
+                now = time.monotonic()
+                if now - t_last_log >= 2.0:
+                    elapsed = now - (t_first or t0)
+                    rate = rows / max(elapsed, 1e-6)
+                    _log(f"  stream:    {label} rows={rows:,} batches={batches} rate={rate/1e6:.2f}M/s")
+                    t_last_log = now
+        finally:
+            if writer is not None:
+                writer.close()
     finally:
-        if writer is not None:
-            writer.close()
+        try:
+            bqs_client.transport.close()
+        except Exception:
+            pass
     tmp.replace(out_path)
-    _log(f"streamed:   {out_path.name} rows={rows:,} batches={batches} in {time.monotonic() - t0:.1f}s")
+    elapsed = time.monotonic() - t0
+    rate = rows / max(elapsed, 1e-6)
+    _log(f"streamed:   {out_path.name} rows={rows:,} batches={batches} in {elapsed:.1f}s ({rate/1e6:.2f}M rows/s)")
 
 
 THRESHOLD = 500
@@ -547,7 +560,7 @@ def main() -> None:
     atom_expr = pl.col("code").replace_strict(atom_idx, return_dtype=pl.UInt32).alias("atom")
     final_lf = (
         events_lf.select(["subject_id", "time_seconds", "code", "value"])
-        .filter(pl.col("code").is_in(keep_codes))
+        .filter(pl.col("code").is_in(keep_codes.implode()))
         .select(["subject_id", "time_seconds", atom_expr, "value"])
     )
     _sink_parquet(final_lf, final_events_path, "final_events")

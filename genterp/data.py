@@ -92,7 +92,7 @@ class CohortDataset(Dataset):
         counts = np.bincount(np.asarray(self.event_atoms), minlength=n_atoms)[:n_atoms].astype(np.float32, copy=False)
         counts[PAD_ATOM] = 0.0
         if counts.sum() <= 0:
-            raise ValueError("event atom cache has no non-PAD atoms")
+            raise ValueError("events.parquet has no non-PAD atoms")
         return counts
 
     def __getitem__(self, idx: int) -> dict:
@@ -112,7 +112,7 @@ class CohortDataset(Dataset):
         static_atoms_arr = atoms[static_idx]
         event_atoms_arr = atoms[event_idx]
         event_ages_arr = delta_days[event_idx]
-        event_values_arr = np.asarray(self.event_values[s:stop])[event_idx]
+        event_values_arr = np.asarray(self.event_values[s + event_idx])
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {

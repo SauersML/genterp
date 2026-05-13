@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import torch
 
-from genterp import CLTConfig, CrossLayerTranscoder, Genterp, harvest_transcoder_acts, unwrap_genterp_model
+from genterp import (
+    CLTConfig,
+    CrossLayerTranscoder,
+    Genterp,
+    feature_to_feature_attribution_graph,
+    feature_to_output_attribution,
+    harvest_transcoder_acts,
+    top_activating_examples,
+    unwrap_genterp_model,
+)
 from genterp.transcoder import _JumpReLU
 from tests._factories import make_batch, tiny_config
 
@@ -59,18 +68,18 @@ def test_harvest_transcoder_acts_accepts_saved_training_wrapper():
 
 
 def test_clt_cross_layer_decoder_mask():
-    """Decoder weights below the diagonal (target < source) must stay zero — no backward flow."""
+    """Decoder only stores same-layer and strict future-layer writes."""
     torch.manual_seed(0)
     clt = CrossLayerTranscoder(CLTConfig(n_layers=4, dim=8, n_features=16))
     x = torch.randn(5, 4, 8)
     target = torch.randn(5, 4, 8)
     out = clt.loss(x, target)
     out["loss"].backward()
-    grad = clt.dec_weight.grad
-    L = clt.cfg.n_layers
-    for s in range(L):
-        for t in range(s):
-            assert grad[s, t].abs().max().item() == 0.0
+
+    assert all(s < t for s, t in zip(clt._off_s_idx.tolist(), clt._off_t_idx.tolist(), strict=True))
+    assert clt.diag_W.grad is not None
+    assert clt.off_blocks is not None
+    assert clt.off_blocks.grad is not None
 
 
 def test_clt_sparsity_tanh_uses_same_layer_decoder_contribution_scale():
@@ -79,9 +88,9 @@ def test_clt_sparsity_tanh_uses_same_layer_decoder_contribution_scale():
 
     with torch.no_grad():
         clt.per_layer_std.fill_(2.0)
-        clt.dec_weight.zero_()
-        clt.dec_weight[0, 0, 0] = torch.tensor([0.2, 0.0])
-        clt.dec_weight[0, 0, 1] = torch.tensor([0.0, 2.0])
+        clt.diag_W.zero_()
+        clt.diag_W[0, 0] = torch.tensor([0.2, 0.0])
+        clt.diag_W[0, 1] = torch.tensor([0.0, 2.0])
 
     sparsity = clt._sparsity(features)
 
@@ -155,3 +164,66 @@ def test_clt_eval_loss_does_not_initialize_per_layer_activation_scale():
 
     assert not clt.per_layer_std_initialized.item()
     assert torch.allclose(clt.per_layer_std, torch.ones(2))
+
+
+def test_top_activating_examples_returns_event_windows():
+    cfg = tiny_config(n_layers=2)
+    model = Genterp(cfg).eval()
+    batch = make_batch(B=2, T=8, n_atoms=cfg.n_atoms)
+    batch["event_pad"][1, -2:] = True
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=cfg.n_layers, dim=cfg.dim, n_features=8)).eval()
+
+    windows = top_activating_examples(model, clt, batch, layer=0, feature=0, k=3, window_radius=1)
+
+    assert len(windows) == 3
+    assert all(window.layer == 0 and window.feature == 0 for window in windows)
+    assert all(window.event_atoms.numel() <= 3 for window in windows)
+    assert all(not batch["event_pad"][window.batch_index, window.token_index] for window in windows)
+
+
+def test_feature_to_output_attribution_shapes():
+    cfg = tiny_config(n_atoms=32, dim=16, n_heads=4, n_layers=2)
+    model = Genterp(cfg).eval()
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=cfg.n_layers, dim=cfg.dim, n_features=5)).eval()
+    n_tokens = 4
+    pre_mlp = torch.randn(n_tokens, cfg.n_layers, cfg.dim)
+    hidden = torch.randn(n_tokens, cfg.dim)
+    delta_t = torch.ones(n_tokens)
+
+    out = feature_to_output_attribution(
+        clt,
+        model.tpp,
+        hidden,
+        pre_mlp,
+        delta_t,
+        mark_indices=[1, 2],
+        time_indices=[0, 1, 2],
+    )
+
+    assert out["features"].shape == (n_tokens, cfg.n_layers, clt.cfg.n_features)
+    assert out["mark_grad"].shape == (n_tokens, cfg.n_layers, clt.cfg.n_features, 2)
+    assert out["time_grad"].shape == (n_tokens, cfg.n_layers, clt.cfg.n_features, 3)
+    assert out["mark_activation_attribution"].shape == out["mark_grad"].shape
+    assert out["time_activation_attribution"].shape == out["time_grad"].shape
+
+
+def test_feature_to_feature_graph_uses_decoder_to_encoder_effects():
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=2, dim=2, n_features=2)).eval()
+    with torch.no_grad():
+        clt.enc_weight.zero_()
+        clt.diag_W.zero_()
+        assert clt.off_blocks is not None
+        clt.off_blocks.zero_()
+        clt.enc_weight[1, 0] = torch.tensor([1.0, 0.0])
+        clt.enc_weight[1, 1] = torch.tensor([0.0, 1.0])
+        clt.off_blocks[0, 1] = torch.tensor([3.0, 4.0])
+
+    edges = feature_to_feature_attribution_graph(clt, top_k_per_layer_pair=2)
+
+    assert [(edge.source_layer, edge.target_layer) for edge in edges] == [(0, 1), (0, 1)]
+    assert edges[0].source_feature == 1
+    assert edges[0].target_feature == 1
+    assert edges[0].weight == 4.0
+    assert edges[1].source_feature == 1
+    assert edges[1].target_feature == 0
+    assert edges[1].weight == 3.0
