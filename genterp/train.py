@@ -173,6 +173,18 @@ class GenterpTrainer(transformers.Trainer):
             )
         return super()._get_train_sampler(train_dataset)
 
+    def _get_eval_sampler(self, eval_dataset) -> torch.utils.data.Sampler | None:
+        """Mirror the train sampler: feed our pre-computed lengths so LengthGroupedSampler
+        doesn't try to auto-infer them by probing ``dataset[0]['input_ids']`` (we don't have
+        that key — our items are plain dicts of tensors keyed by event/static fields)."""
+        if (
+            eval_dataset is not None
+            and self.args.train_sampling_strategy == "group_by_length"
+            and hasattr(eval_dataset, "lengths")
+        ):
+            return LengthGroupedSampler(self.args.eval_batch_size, lengths=eval_dataset.lengths)
+        return super()._get_eval_sampler(eval_dataset)
+
     def _get_dataloader(
         self,
         dataset: Dataset,
