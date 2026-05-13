@@ -13,17 +13,19 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import polars as pl
 import psutil
+import pyarrow as pa
 import pyarrow.parquet as pq
 from google.cloud import bigquery, bigquery_storage
 
@@ -88,6 +90,74 @@ def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
     job = _submit_or_reuse_job(client, sql, label)
     table = job.to_arrow(progress_bar_type="tqdm", create_bqstorage_client=False)
     _log(f"  bq done:   {label} rows={table.num_rows:,} in {time.monotonic() - t0:.1f}s")
+    return table
+
+
+def _wait_with_progress(job: bigquery.QueryJob, label: str, poll_s: float = 5.0) -> None:
+    """Block until ``job`` is DONE, logging state and bytes-processed every poll_s seconds.
+
+    Without this, a long aggregation query (coverage over 1B events, etc.) goes silent
+    for minutes between submit and result — indistinguishable from a hang.
+    """
+    t0 = time.monotonic()
+    last_log = t0
+    while not job.done():
+        time.sleep(min(poll_s, 1.0))
+        if time.monotonic() - last_log < poll_s:
+            continue
+        try:
+            job.reload()
+        except Exception as exc:
+            _log(f"  bq poll:    {label} reload failed ({exc.__class__.__name__}); retrying")
+            last_log = time.monotonic()
+            continue
+        bytes_proc = (job.total_bytes_processed or 0) / 1e9
+        slot_ms = getattr(job, "slot_millis", None) or 0
+        _log(
+            f"  bq running: {label} state={job.state} bytes_scanned={bytes_proc:.2f}GB "
+            f"slot_time={slot_ms/1000:.1f}s elapsed={time.monotonic()-t0:.1f}s"
+        )
+        last_log = time.monotonic()
+    if job.error_result:
+        raise RuntimeError(f"BQ {label} failed: {job.error_result}")
+
+
+def _run_aggregation(
+    client: bigquery.Client,
+    sql: str,
+    label: str,
+    parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
+) -> pa.Table:
+    """Submit a BQ aggregation query, log live progress, download via Storage API.
+
+    For analytic queries (coverage, ancestors, concept codes) where we need to *see*
+    the query making progress. Job-id caching is skipped because parameters change the
+    result, and these queries are anyway one-shot per CDR (the outer JSON cache handles
+    persistence across runs).
+    """
+    t0 = time.monotonic()
+    job_config = bigquery.QueryJobConfig(query_parameters=list(parameters or []))
+    _log(f"  bq submit:  {label}")
+    job = client.query(sql, job_config=job_config)
+    _log(f"  bq job_id:  {label} {job.job_id}")
+
+    _wait_with_progress(job, label)
+    t_done = time.monotonic()
+    _log(f"  bq query:   {label} completed in {t_done-t0:.1f}s; downloading via Storage API")
+
+    bqs_client = bigquery_storage.BigQueryReadClient()
+    try:
+        batches = list(job.result().to_arrow_iterable(bqstorage_client=bqs_client))
+        table = pa.Table.from_batches(batches) if batches else pa.table({})
+    finally:
+        try:
+            bqs_client.transport.close()
+        except Exception:
+            pass
+    _log(
+        f"  bq done:    {label} rows={table.num_rows:,} download={time.monotonic()-t_done:.1f}s "
+        f"total={time.monotonic()-t0:.1f}s"
+    )
     return table
 
 
@@ -352,60 +422,92 @@ def _all_events_sql(cdr: str) -> str:
     """
 
 
-def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[int]):
-    _log(f"  bq query: coverage (concept_ancestor JOIN cohort events, {len(cohort_ids):,} cohort ids)")
-    t0 = time.monotonic()
-    cov_rows = list(client.query(
-        f"""
-        WITH events AS (
-          {_non_drug_events_cte(cdr, with_time=False)}
-          UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
-          UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
-        )
-        SELECT ca.ancestor_concept_id AS aid, COUNT(DISTINCT events.person_id) AS n
-        FROM events JOIN `{cdr}.concept_ancestor` ca ON ca.descendant_concept_id = events.cid
-        GROUP BY ca.ancestor_concept_id
-        """
-    ).result())
-    cov = {int(r["aid"]): int(r["n"]) for r in cov_rows}
-    _log(f"  bq done:  coverage rows={len(cov):,} in {time.monotonic() - t0:.1f}s")
+def _coverage_sql(cdr: str) -> str:
+    """Coverage = approximate number of distinct subjects with any descendant of each concept.
 
-    _log("  bq query: ancestor closure (concept_ancestor for cohort+ancestors)")
-    t0 = time.monotonic()
-    anc: dict[int, dict[int, int]] = {}
-    for r in client.query(
-        f"""
-        WITH relevant AS (
-          SELECT DISTINCT cid FROM UNNEST(@cohort) AS cid
-          UNION DISTINCT SELECT DISTINCT ancestor_concept_id FROM `{cdr}.concept_ancestor` WHERE descendant_concept_id IN UNNEST(@cohort)
+    Uses ``APPROX_COUNT_DISTINCT`` (HyperLogLog++) instead of exact ``COUNT(DISTINCT)``.
+    On 1B+ events the exact path takes minutes of single-shuffle BQ time; the HLL++ path
+    runs in parallel and finishes in seconds with ≤2% relative error — well below the
+    granularity that matters at threshold=500.
+    """
+    return f"""
+    WITH events AS (
+      {_non_drug_events_cte(cdr, with_time=False)}
+      UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
+      UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
+    )
+    SELECT ca.ancestor_concept_id AS aid, APPROX_COUNT_DISTINCT(events.person_id) AS n
+    FROM events JOIN `{cdr}.concept_ancestor` ca ON ca.descendant_concept_id = events.cid
+    GROUP BY ca.ancestor_concept_id
+    """
+
+
+def _ancestor_closure_sql(cdr: str) -> str:
+    return f"""
+    WITH relevant AS (
+      SELECT DISTINCT cid FROM UNNEST(@cohort) AS cid
+      UNION DISTINCT SELECT DISTINCT ancestor_concept_id FROM `{cdr}.concept_ancestor` WHERE descendant_concept_id IN UNNEST(@cohort)
+    )
+    SELECT descendant_concept_id AS d, ancestor_concept_id AS a, min_levels_of_separation AS hops
+    FROM `{cdr}.concept_ancestor`
+    WHERE descendant_concept_id IN (SELECT cid FROM relevant) AND min_levels_of_separation > 0
+    """
+
+
+def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[int]):
+    """Run coverage + ancestor closure in PARALLEL; both stream Arrow via Storage API.
+
+    Independent queries — no reason to wait on coverage before submitting ancestor
+    closure. ThreadPoolExecutor is fine here: BigQuery client objects are thread-safe
+    and the work is I/O-bound (GIL is released during gRPC waits).
+    """
+    cohort_param = bigquery.ArrayQueryParameter("cohort", "INT64", cohort_ids)
+
+    def run_coverage() -> pa.Table:
+        return _run_aggregation(client, _coverage_sql(cdr), "coverage")
+
+    def run_ancestors() -> pa.Table:
+        return _run_aggregation(
+            client, _ancestor_closure_sql(cdr), "ancestor_closure", parameters=[cohort_param]
         )
-        SELECT descendant_concept_id AS d, ancestor_concept_id AS a, min_levels_of_separation AS hops
-        FROM `{cdr}.concept_ancestor`
-        WHERE descendant_concept_id IN (SELECT cid FROM relevant) AND min_levels_of_separation > 0
-        """,
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("cohort", "INT64", cohort_ids),
-        ]),
-    ).result():
-        anc.setdefault(int(r["d"]), {})[int(r["a"])] = int(r["hops"])
-    _log(f"  bq done:  ancestors descendants={len(anc):,} in {time.monotonic() - t0:.1f}s")
+
+    _log(f"submitting coverage + ancestor closure in parallel (cohort={len(cohort_ids):,})")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="bq") as pool:
+        cov_future = pool.submit(run_coverage)
+        anc_future = pool.submit(run_ancestors)
+        cov_table = cov_future.result()
+        anc_table = anc_future.result()
+
+    _log(f"converting coverage Arrow → dict (rows={cov_table.num_rows:,})")
+    cov_aids = cov_table.column("aid").to_pylist()
+    cov_ns = cov_table.column("n").to_pylist()
+    cov = {int(a): int(n) for a, n in zip(cov_aids, cov_ns, strict=True)}
+
+    _log(f"converting ancestor closure Arrow → nested dict (rows={anc_table.num_rows:,})")
+    anc: dict[int, dict[int, int]] = {}
+    anc_d = anc_table.column("d").to_pylist()
+    anc_a = anc_table.column("a").to_pylist()
+    anc_h = anc_table.column("hops").to_pylist()
+    for d, a, h in zip(anc_d, anc_a, anc_h, strict=True):
+        anc.setdefault(int(d), {})[int(a)] = int(h)
+    _log(f"  derived: coverage_ancestors={len(cov):,} descendants_with_ancestors={len(anc):,}")
     return cov, anc
 
 
 def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int, str]:
     if not ids:
         return {}
-    _log(f"  bq query: concept codes for {len(ids):,} ids")
-    t0 = time.monotonic()
-    rows = list(client.query(
-        f"SELECT concept_id, vocabulary_id, concept_code FROM `{cdr}.concept` WHERE concept_id IN UNNEST(@ids)",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("ids", "INT64", list(ids)),
-        ]),
-    ).result())
-    out = {int(r["concept_id"]): f"{r['vocabulary_id']}/{r['concept_code']}" for r in rows}
-    _log(f"  bq done:  concept codes resolved={len(out):,} in {time.monotonic() - t0:.1f}s")
-    return out
+    sql = f"SELECT concept_id, vocabulary_id, concept_code FROM `{cdr}.concept` WHERE concept_id IN UNNEST(@ids)"
+    table = _run_aggregation(
+        client,
+        sql,
+        f"concept_codes (n={len(ids):,})",
+        parameters=[bigquery.ArrayQueryParameter("ids", "INT64", list(ids))],
+    )
+    cids = table.column("concept_id").to_pylist()
+    vocabs = table.column("vocabulary_id").to_pylist()
+    codes = table.column("concept_code").to_pylist()
+    return {int(c): f"{v}/{k}" for c, v, k in zip(cids, vocabs, codes, strict=True)}
 
 
 def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: str, cohort_ids: list[int], cache_dir: Path):
