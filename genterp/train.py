@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -15,7 +17,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from genterp.data import AtomVocab, CodeAtomMap, CohortDataset, collate
 from genterp.modeling import Genterp, GenterpConfig
-from genterp.runtime import accelerator_label, configure_torch_runtime
+from genterp.runtime import accelerator_label, configure_torch_runtime, should_launch_distributed
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -104,6 +106,26 @@ def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch
     return mu, sigma, has_mag
 
 
+def distributed_launch_command(module: str = "genterp.train") -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc-per-node={torch.cuda.device_count()}",
+        "-m",
+        module,
+    ]
+
+
+def launch_distributed_if_needed() -> bool:
+    if not should_launch_distributed():
+        return False
+    command = distributed_launch_command()
+    print(f"genterp train launching {torch.cuda.device_count()} GPU workers automatically")
+    raise SystemExit(subprocess.run(command).returncode)
+
+
 def main() -> None:
     runtime = configure_torch_runtime()
     if runtime.device.type != "cuda" or runtime.device.index in (None, 0):
@@ -168,4 +190,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    launch_distributed_if_needed()
     main()

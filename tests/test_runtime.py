@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from genterp.runtime import GIB, accelerator_label, batch_size_for_cuda_memory, get_torch_runtime
+from genterp.runtime import GIB, accelerator_label, batch_size_for_cuda_memory, get_torch_runtime, should_launch_distributed
 
 
 def test_cuda_batch_size_scales_with_visible_memory():
@@ -95,6 +95,23 @@ def test_cuda_runtime_binds_local_rank(monkeypatch):
     assert runtime.device == torch.device("cuda", 3)
     assert runtime.cuda_name == "GPU 3"
     assert set_devices == [3]
+
+
+def test_should_launch_distributed_for_parent_with_multiple_cuda_gpus(monkeypatch):
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    assert should_launch_distributed()
+
+
+def test_should_not_launch_distributed_inside_worker(monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    assert not should_launch_distributed()
 
 
 def test_mps_runtime_avoids_cuda_only_options(monkeypatch):

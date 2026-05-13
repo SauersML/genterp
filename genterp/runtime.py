@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,21 +55,15 @@ def _cuda_bf16_supported() -> bool:
     return bool(torch.cuda.is_bf16_supported())
 
 
-def _local_rank() -> int | None:
-    value = os.environ.get("LOCAL_RANK")
-    if value is None:
-        return None
-    try:
-        rank = int(value)
-    except ValueError:
-        return None
-    return rank if rank >= 0 else None
+def is_distributed_worker() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def should_launch_distributed() -> bool:
+    return torch.cuda.is_available() and torch.cuda.device_count() > 1 and not is_distributed_worker()
 
 
 def _cuda_device_index(device_count: int) -> int:
-    rank = _local_rank()
-    if rank is not None and rank < device_count:
-        return rank
     return torch.cuda.current_device()
 
 
