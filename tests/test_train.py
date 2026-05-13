@@ -9,10 +9,13 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 from genterp.runtime import TorchRuntime
 from genterp.train import (
     GenterpTrainer,
+    checkpoint_is_complete,
     checkpoint_matches_runtime,
     checkpoint_runtime_state,
     final_model_path,
     latest_checkpoint,
+    model_dir_is_complete,
+    save_final_model,
     write_runtime_state,
 )
 
@@ -25,6 +28,13 @@ class _LengthDataset:
 
     def __getitem__(self, idx: int) -> dict:
         return {"event_atoms": [1] * self.lengths[idx]}
+
+
+class _SaveModelTrainer:
+    state = type("State", (), {"global_step": 7})()
+
+    def save_model(self, path: str) -> None:
+        _write_model_dir(Path(path))
 
 
 def _runtime(*, bf16: bool = True, fp16: bool = False, optim: str = "adamw_torch_fused") -> TorchRuntime:
@@ -49,17 +59,39 @@ def _runtime(*, bf16: bool = True, fp16: bool = False, optim: str = "adamw_torch
     )
 
 
+def _write_model_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text("{}")
+    (path / "model.safetensors").write_bytes(b"weights")
+
+
+def _write_complete_checkpoint(path: Path, runtime: TorchRuntime | None = None) -> None:
+    _write_model_dir(path)
+    (path / "trainer_state.json").write_text("{}")
+    (path / "optimizer.pt").write_bytes(b"optimizer")
+    (path / "scheduler.pt").write_bytes(b"scheduler")
+    write_runtime_state(path, runtime or _runtime())
+
+
 def test_latest_checkpoint_empty_dir(tmp_path: Path):
     assert latest_checkpoint(tmp_path) is None
 
 
-def test_latest_checkpoint_selects_highest_step(tmp_path: Path):
-    for step in (2, 10):
-        checkpoint = tmp_path / f"checkpoint-{step}"
-        checkpoint.mkdir()
-        (checkpoint / "trainer_state.json").write_text("{}")
+def test_latest_checkpoint_selects_highest_complete_step(tmp_path: Path):
+    _write_complete_checkpoint(tmp_path / "checkpoint-2")
+    _write_complete_checkpoint(tmp_path / "checkpoint-10")
 
     assert latest_checkpoint(tmp_path) == str(tmp_path / "checkpoint-10")
+
+
+def test_latest_checkpoint_ignores_partial_higher_step(tmp_path: Path):
+    _write_complete_checkpoint(tmp_path / "checkpoint-2")
+    partial = tmp_path / "checkpoint-10"
+    _write_model_dir(partial)
+    (partial / "trainer_state.json").write_text("{}")
+
+    assert not checkpoint_is_complete(partial)
+    assert latest_checkpoint(tmp_path) == str(tmp_path / "checkpoint-2")
 
 
 def test_final_model_path_requires_saved_config(tmp_path: Path):
@@ -70,7 +102,31 @@ def test_final_model_path_requires_saved_config(tmp_path: Path):
     assert final_model_path(tmp_path) is None
 
     (final / "config.json").write_text("{}")
+    assert final_model_path(tmp_path) is None
+
+    (final / "model.safetensors").write_bytes(b"weights")
+    assert model_dir_is_complete(final)
     assert final_model_path(tmp_path) == str(final)
+
+
+def test_final_model_path_uses_atomic_pointer(tmp_path: Path):
+    old_final = tmp_path / "final-1"
+    new_final = tmp_path / "final-2"
+    _write_model_dir(old_final)
+    _write_model_dir(new_final)
+    (tmp_path / "final_checkpoint.json").write_text('{"path": "final-2"}')
+
+    assert final_model_path(tmp_path) == str(new_final)
+
+
+def test_save_final_model_writes_versioned_final_and_pointer(tmp_path: Path):
+    save_final_model(_SaveModelTrainer(), tmp_path, _runtime())
+
+    final_path = final_model_path(tmp_path)
+
+    assert final_path is not None
+    assert Path(final_path).name.startswith("final-7-")
+    assert checkpoint_runtime_state(final_path) is not None
 
 
 def test_runtime_state_round_trips(tmp_path: Path):

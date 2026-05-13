@@ -240,7 +240,9 @@ def main() -> None:
     etl = Path.home() / "genterp" / "etl"
     output_dir = Path.home() / "genterp" / "runs"
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
-    dataset = CohortDataset(etl, CodeAtomMap.from_vocab(vocab))
+    code_atoms = CodeAtomMap.from_vocab(vocab)
+    train_dataset = CohortDataset(etl, code_atoms, split="train")
+    eval_dataset = CohortDataset(etl, code_atoms, split="test")
 
     cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
     resume_checkpoint = latest_checkpoint(output_dir)
@@ -258,6 +260,7 @@ def main() -> None:
     training_args = dict(
         output_dir=str(output_dir),
         per_device_train_batch_size=runtime.per_device_train_batch_size,
+        per_device_eval_batch_size=runtime.per_device_train_batch_size,
         learning_rate=3e-4,
         warmup_steps=500,
         max_steps=50_000,
@@ -266,7 +269,11 @@ def main() -> None:
         fp16=runtime.fp16,
         tf32=runtime.tf32,
         torch_compile=runtime.torch_compile,
-        save_steps=2_000,
+        save_strategy="steps",
+        save_steps=1,
+        eval_strategy="steps",
+        eval_steps=500,
+        prediction_loss_only=True,
         logging_steps=50,
         optim=runtime.optim,
         dataloader_num_workers=runtime.dataloader_num_workers,
@@ -290,15 +297,15 @@ def main() -> None:
     trainer = GenterpTrainer(
         model=model,
         args=transformers.TrainingArguments(**training_args),
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collate,
         runtime=runtime,
         reset_training_state_on_resume=reset_training_state,
         callbacks=[RuntimeStateCallback(runtime)],
     )
     trainer.train(resume_from_checkpoint=resume_checkpoint)
-    trainer.save_model(str(output_dir / "final"))
-    write_runtime_state(output_dir / "final", runtime)
+    save_final_model(trainer, output_dir, runtime)
 
 
 if __name__ == "__main__":

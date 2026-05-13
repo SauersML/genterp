@@ -44,9 +44,19 @@ class CodeAtomMap:
 
 
 class CohortDataset(Dataset):
-    """events.parquet sorted by (subject_id, time_seconds); subjects.parquet holds per-subject row offsets, sex, birth."""
+    """events.parquet sorted by (subject_id, time_seconds); subjects.parquet holds per-subject row offsets, sex, birth.
 
-    def __init__(self, data_dir: str | Path, code_atoms: CodeAtomMap, max_events: int = 4096):
+    ``split`` filters subjects.parquet by the ETL-assigned split column (e.g. "train", "test").
+    The shared events.parquet is unchanged — splits just expose different subject row-ranges.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        code_atoms: CodeAtomMap,
+        max_events: int = 4096,
+        split: str | None = None,
+    ):
         data_dir = Path(data_dir)
         events_path = data_dir / "events.parquet"
         events = pq.read_table(events_path, columns=["time_seconds", "code", "value"], memory_map=True)
@@ -55,6 +65,15 @@ class CohortDataset(Dataset):
         self.event_atoms = _cached_event_atoms(data_dir, events_path, event_codes, code_atoms)
         self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
+        if split is not None:
+            if "split" not in subjects.columns:
+                raise ValueError(
+                    f"subjects.parquet has no 'split' column; rerun aou_etl to materialize it (requested split={split!r})"
+                )
+            subjects = subjects.filter(pl.col("split") == split)
+            if subjects.height == 0:
+                raise ValueError(f"no subjects in split={split!r}")
+        self.split = split
         self.start = subjects["start"].to_numpy()
         self.end = subjects["end"].to_numpy()
         self.sex = subjects["sex"].to_numpy()
