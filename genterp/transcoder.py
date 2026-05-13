@@ -354,6 +354,17 @@ def _as_index_tensor(indices: Iterable[int] | torch.Tensor | None, default: torc
     return torch.tensor(list(indices), device=device, dtype=torch.long)
 
 
+def _feature_hidden_effects(clt: CrossLayerTranscoder, ref: torch.Tensor) -> torch.Tensor:
+    effects = clt.diag_W.detach().to(device=ref.device, dtype=ref.dtype).clone()
+    for source_layer, target_layer in zip(clt._off_s_idx.tolist(), clt._off_t_idx.tolist(), strict=True):
+        effects[source_layer] = effects[source_layer] + _decoder_block(clt, source_layer, target_layer).detach().to(
+            device=ref.device,
+            dtype=ref.dtype,
+        )
+    return effects
+
+
+@torch.no_grad()
 def feature_to_output_attribution(
     clt: CrossLayerTranscoder,
     tpp: MarkedTPPHead,
@@ -364,36 +375,31 @@ def feature_to_output_attribution(
     mark_indices: Iterable[int] | torch.Tensor | None = None,
     time_indices: Iterable[int] | torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Gradient and activation-gradient attribution from CLT features to mark/time logits."""
-    features = clt.encode(pre_mlp.detach()).requires_grad_(True)
-    decoded = clt.decode(features)
-    hidden_proxy = hidden.detach() + decoded.sum(dim=1) - decoded.detach().sum(dim=1)
-
-    mark_logits = tpp.mark_logits(hidden_proxy, delta_t)
-    time_logits = tpp.time_logits(hidden_proxy)
+    """Exact gradient and activation-gradient attribution from CLT features to mark/time logits."""
+    features = clt.encode(pre_mlp.detach())
+    hidden_ref = hidden.detach()
+    mark_logits = tpp.mark_logits(hidden_ref, delta_t)
+    time_logits = tpp.time_logits(hidden_ref)
     mark_idx = _as_index_tensor(mark_indices, mark_logits.argmax(dim=-1).unique(sorted=True), hidden.device)
     time_idx = _as_index_tensor(time_indices, torch.arange(time_logits.shape[-1], device=hidden.device), hidden.device)
 
-    mark_grads = []
-    for idx in mark_idx.tolist():
-        grad = torch.autograd.grad(mark_logits[:, idx].sum(), features, retain_graph=True)[0]
-        mark_grads.append(grad)
-    time_grads = []
-    for idx in time_idx.tolist():
-        grad = torch.autograd.grad(time_logits[:, idx].sum(), features, retain_graph=True)[0]
-        time_grads.append(grad)
-
-    mark_grad = torch.stack(mark_grads, dim=-1) if mark_grads else features.new_empty(*features.shape, 0)
-    time_grad = torch.stack(time_grads, dim=-1) if time_grads else features.new_empty(*features.shape, 0)
+    feature_effects = _feature_hidden_effects(clt, hidden_ref)
+    mark_weight = tpp.mark_out.weight.index_select(0, mark_idx).to(device=hidden.device, dtype=hidden.dtype)
+    mark_hidden_grad = mark_weight @ tpp.mark_h_proj.weight.to(device=hidden.device, dtype=hidden.dtype)
+    time_hidden_grad = tpp.time_proj.weight.index_select(0, time_idx).to(device=hidden.device, dtype=hidden.dtype)
+    mark_grad_one = torch.einsum("lfd,md->lfm", feature_effects, mark_hidden_grad)
+    time_grad_one = torch.einsum("lfd,td->lft", feature_effects, time_hidden_grad)
+    mark_grad = mark_grad_one.unsqueeze(0).expand(features.shape[0], -1, -1, -1)
+    time_grad = time_grad_one.unsqueeze(0).expand(features.shape[0], -1, -1, -1)
     feature_values = features.detach()
     return {
         "features": feature_values,
         "mark_indices": mark_idx.detach(),
         "time_indices": time_idx.detach(),
-        "mark_grad": mark_grad.detach(),
-        "time_grad": time_grad.detach(),
-        "mark_activation_attribution": mark_grad.detach() * feature_values.unsqueeze(-1),
-        "time_activation_attribution": time_grad.detach() * feature_values.unsqueeze(-1),
+        "mark_grad": mark_grad,
+        "time_grad": time_grad,
+        "mark_activation_attribution": mark_grad * feature_values.unsqueeze(-1),
+        "time_activation_attribution": time_grad * feature_values.unsqueeze(-1),
     }
 
 

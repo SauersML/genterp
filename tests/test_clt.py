@@ -82,6 +82,60 @@ def test_clt_cross_layer_decoder_mask():
     assert clt.off_blocks.grad is not None
 
 
+def test_clt_low_rank_off_diagonal_storage_shapes():
+    """When off_diagonal_rank is set, off-diagonals live in U (per pair) and V (per source)."""
+    L, F, D, r = 4, 16, 8, 3
+    clt = CrossLayerTranscoder(
+        CLTConfig(n_layers=L, dim=D, n_features=F, off_diagonal_rank=r)
+    )
+    n_off = L * (L - 1) // 2
+
+    assert clt.off_blocks is None
+    assert clt.diag_W.shape == (L, F, D)
+    assert clt.off_U is not None and clt.off_U.shape == (n_off, F, r)
+    assert clt.off_V is not None and clt.off_V.shape == (L, r, D)
+
+
+def test_clt_low_rank_decode_matches_explicit_uv_product():
+    """The factorized decode path must agree with the materialized U @ V[s] block-product."""
+    torch.manual_seed(0)
+    L, F, D, r = 3, 7, 5, 2
+    clt = CrossLayerTranscoder(
+        CLTConfig(n_layers=L, dim=D, n_features=F, off_diagonal_rank=r)
+    ).eval()
+    features = torch.randn(4, L, F)
+
+    with torch.no_grad():
+        out = clt.decode(features)
+
+    assert clt.off_U is not None and clt.off_V is not None
+    expected = torch.einsum("nlf,lfd->nld", features, clt.diag_W) + clt.dec_bias
+    for pair_idx, (s, t) in enumerate(zip(clt._off_s_idx.tolist(), clt._off_t_idx.tolist(), strict=True)):
+        block = clt.off_U[pair_idx] @ clt.off_V[s]
+        expected[:, t, :] = expected[:, t, :] + features[:, s, :] @ block
+    assert torch.allclose(out, expected, atol=1e-5)
+
+
+def test_clt_low_rank_trains_and_lowers_recon_loss():
+    """A factorized CLT should still optimize: param count drops, learning still works."""
+    torch.manual_seed(0)
+    L, F, D, r = 3, 32, 8, 4
+    clt = CrossLayerTranscoder(
+        CLTConfig(n_layers=L, dim=D, n_features=F, off_diagonal_rank=r, sparsity_coef=1e-3)
+    )
+    pre_mlp = torch.randn(16, L, D)
+    mlp_out = torch.randn(16, L, D)
+    opt = torch.optim.Adam(clt.parameters(), lr=5e-2)
+
+    init_recon = clt.loss(pre_mlp, mlp_out)["recon"].item()
+    for _ in range(100):
+        out = clt.loss(pre_mlp, mlp_out)
+        opt.zero_grad()
+        out["loss"].backward()
+        opt.step()
+    assert clt.loss(pre_mlp, mlp_out)["recon"].item() < init_recon
+
+
 def test_clt_sparsity_tanh_uses_same_layer_decoder_contribution_scale():
     clt = CrossLayerTranscoder(CLTConfig(n_layers=1, dim=2, n_features=2))
     features = torch.tensor([[[10.0, 1.0]]])
@@ -205,6 +259,33 @@ def test_feature_to_output_attribution_shapes():
     assert out["time_grad"].shape == (n_tokens, cfg.n_layers, clt.cfg.n_features, 3)
     assert out["mark_activation_attribution"].shape == out["mark_grad"].shape
     assert out["time_activation_attribution"].shape == out["time_grad"].shape
+
+
+def test_feature_to_output_attribution_matches_autograd():
+    cfg = tiny_config(n_atoms=32, dim=16, n_heads=4, n_layers=2)
+    model = Genterp(cfg).eval()
+    clt = CrossLayerTranscoder(CLTConfig(n_layers=cfg.n_layers, dim=cfg.dim, n_features=5)).eval()
+    pre_mlp = torch.randn(3, cfg.n_layers, cfg.dim)
+    hidden = torch.randn(3, cfg.dim)
+    delta_t = torch.ones(3)
+
+    out = feature_to_output_attribution(
+        clt,
+        model.tpp,
+        hidden,
+        pre_mlp,
+        delta_t,
+        mark_indices=[1],
+        time_indices=[0],
+    )
+    features = clt.encode(pre_mlp.detach()).requires_grad_(True)
+    decoded = clt.decode(features)
+    hidden_proxy = hidden.detach() + decoded.sum(dim=1) - decoded.detach().sum(dim=1)
+    mark_grad = torch.autograd.grad(model.tpp.mark_logits(hidden_proxy, delta_t)[:, 1].sum(), features, retain_graph=True)[0]
+    time_grad = torch.autograd.grad(model.tpp.time_logits(hidden_proxy)[:, 0].sum(), features)[0]
+
+    assert torch.allclose(out["mark_grad"].squeeze(-1), mark_grad, atol=1e-6)
+    assert torch.allclose(out["time_grad"].squeeze(-1), time_grad, atol=1e-6)
 
 
 def test_feature_to_feature_graph_uses_decoder_to_encoder_effects():

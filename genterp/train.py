@@ -486,8 +486,15 @@ def main() -> None:
     eval_dataset = CohortDataset(etl, split="test")
     setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
 
-    setup.start_unit("construct model config", "dim=512 heads=8 layers=8")
-    cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
+    tiny = os.environ.get("GENTERP_TINY") == "1"
+    if tiny:
+        # ~1000× fewer transformer params: dim 32 vs 512 (16×), 2 vs 8 layers (4×).
+        # Per-layer dense weights scale as L·dim² → 4·256 = 1024×.
+        setup.start_unit("construct model config", "GENTERP_TINY=1 → dim=32 heads=2 layers=2")
+        cfg = GenterpConfig(n_atoms=len(vocab), dim=32, n_heads=2, n_layers=2)
+    else:
+        setup.start_unit("construct model config", "dim=512 heads=8 layers=8")
+        cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
     setup.finish_unit("construct model config", f"n_atoms={cfg.n_atoms:,} dim={cfg.dim} layers={cfg.n_layers}")
 
     setup.start_unit("inspect checkpoints", f"output_dir={output_dir}")

@@ -59,3 +59,24 @@ def test_packed_prefix_causal_attention_matches_dense_mask_on_valid_tokens():
     valid[:, static_len:] = ~event_pad
     assert torch.allclose(packed[valid], dense[valid], atol=1e-5, rtol=1e-5)
     assert torch.equal(packed[~valid], torch.zeros_like(packed[~valid]))
+
+
+def test_packed_attention_rejects_non_right_padded_event_mask():
+    dim = 16
+    heads = 4
+    static_len = 3
+    event_len = 4
+    rope = ContinuousTimeRoPE(dim // heads)
+    attn = CausalRoPEAttention(dim, heads, rope).eval()
+    x = torch.randn(1, static_len + event_len, dim)
+    event_pad = torch.tensor([[False, True, False, True]])
+    event_ages = torch.arange(event_len, dtype=torch.float32).unsqueeze(0)
+    is_static = torch.arange(static_len + event_len).lt(static_len).unsqueeze(0)
+    angles = rope.angles(F.pad(event_ages, (static_len, 0), value=0.0), is_static)
+
+    try:
+        attn(x, angles, event_pad, static_len)
+    except ValueError as exc:
+        assert "right-padded" in str(exc)
+    else:
+        raise AssertionError("non-right-padded event mask should fail")

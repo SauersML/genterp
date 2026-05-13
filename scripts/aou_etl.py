@@ -151,6 +151,18 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 
 THRESHOLD = 500
 TEST_SPLIT_PERCENT = 20
+TINY = os.environ.get("GENTERP_TINY") == "1"
+TINY_PERSON_MOD = 10  # GENTERP_TINY samples 1 in N person_ids end-to-end
+
+
+def _tiny_predicate(person_col: str) -> str:
+    """SQL fragment restricting to 1/TINY_PERSON_MOD of person_ids when GENTERP_TINY is set.
+
+    Pushed inside each per-domain WHERE so BigQuery prunes on the source tables and
+    scans ~10% of rows — keeps the same code path as full runs but ~10× cheaper /
+    faster end-to-end.
+    """
+    return f" AND MOD({person_col}, {TINY_PERSON_MOD}) = 0" if TINY else ""
 
 
 def split_for_subject(subject_id: int) -> str:
@@ -170,7 +182,8 @@ NON_DRUG_TABLES = [
 
 def _cache_key(cdr: str) -> str:
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
-    return f"{key}_threshold-{THRESHOLD}_values-v2"
+    suffix = f"_tiny{TINY_PERSON_MOD}x" if TINY else ""
+    return f"{key}_threshold-{THRESHOLD}_values-v2{suffix}"
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -266,8 +279,9 @@ def _cache_json(path: Path, build: Callable[[], object]) -> object:
 def _non_drug_events_cte(cdr: str, with_time: bool) -> str:
     sel = "person_id, {c} AS cid, {t} AS t" if with_time else "person_id, {c} AS cid"
     where = "{c} > 0 AND {t} IS NOT NULL" if with_time else "{c} > 0"
+    tiny = _tiny_predicate("person_id")
     parts = [
-        f"SELECT {sel.format(c=col, t=tcol)} FROM `{cdr}.{tbl}` WHERE {where.format(c=col, t=tcol)}"
+        f"SELECT {sel.format(c=col, t=tcol)} FROM `{cdr}.{tbl}` WHERE {where.format(c=col, t=tcol)}{tiny}"
         for tbl, col, tcol in NON_DRUG_TABLES
     ]
     return "\n  UNION ALL ".join(parts)
@@ -284,7 +298,7 @@ def _drug_events_sql(cdr: str) -> str:
     FROM `{cdr}.drug_exposure` de
     JOIN `{cdr}.drug_strength` ds ON ds.drug_concept_id = de.drug_concept_id
     JOIN `{cdr}.concept` c ON c.concept_id = ds.ingredient_concept_id
-    WHERE de.drug_concept_id > 0 AND de.drug_exposure_start_datetime IS NOT NULL
+    WHERE de.drug_concept_id > 0 AND de.drug_exposure_start_datetime IS NOT NULL{_tiny_predicate("de.person_id")}
     """
 
 
@@ -312,16 +326,20 @@ def _measurement_events_sql(cdr: str) -> str:
       m.measurement_concept_id AS cid,
       m.value_as_number AS value
     FROM `{cdr}.measurement` m JOIN `{cdr}.concept` c ON c.concept_id = m.measurement_concept_id
-    WHERE m.measurement_concept_id > 0 AND m.measurement_datetime IS NOT NULL
+    WHERE m.measurement_concept_id > 0 AND m.measurement_datetime IS NOT NULL{_tiny_predicate("m.person_id")}
     """
 
 
-def _all_events_sorted_sql(cdr: str) -> str:
-    """One combined event stream sorted by (subject_id, time_seconds) — sort happens in BigQuery.
+def _all_events_sql(cdr: str) -> str:
+    """One combined event stream, unsorted.
 
-    Polars `.sort()` is not streaming-compatible, so a global Python sort of 400M+ rows would
-    materialize and OOM. Pushing the sort to BQ lets it use the warehouse's distributed sort
-    and stream already-sorted Arrow batches back to disk.
+    A global ``ORDER BY`` at BigQuery looks attractive but defeats the BQ Storage API: a
+    sorted result requires a single final-stage worker, so ``to_arrow_iterable`` falls
+    back to a single read stream and throughput collapses to REST-API levels
+    (~25K rows/sec for 434M rows ≈ hours). With no ORDER BY, BQ writes results in
+    parallel shards and the Storage API streams them concurrently — typically 1–5M
+    rows/sec on AoU workspaces. We sort downstream with polars streaming sort,
+    which spills to disk and never materializes the full table in RAM.
     """
     return f"""
     WITH events AS (
@@ -331,7 +349,6 @@ def _all_events_sorted_sql(cdr: str) -> str:
     )
     SELECT subject_id, time_seconds, code, cid, value
     FROM events
-    ORDER BY subject_id, time_seconds
     """
 
 
@@ -488,6 +505,8 @@ def main() -> None:
     _set_bq_job_cache_dir(cache_dir / "bq_jobs")
     _log(f"CDR={cdr}")
     _log(f"cache_dir={cache_dir}")
+    if TINY:
+        _log(f"GENTERP_TINY=1 active: sampling 1/{TINY_PERSON_MOD} of person_ids end-to-end")
     _WORK.finish_unit("validate AoU CDR configuration", f"out_dir={out_dir} cache_dir={cache_dir}")
     client_instance: bigquery.Client | None = None
 
@@ -498,18 +517,18 @@ def main() -> None:
             client_instance = bigquery.Client()
         return client_instance
 
-    all_sorted_path = cache_dir / "all_events_sorted.parquet"
+    all_events_path = cache_dir / "all_events.parquet"
 
     _WORK.start_unit(
-        "pull all events (combined + sorted in BQ)",
-        "single query: UNION ALL non-drug/drug/measurement with ORDER BY (subject_id, time_seconds) on BQ side",
+        "pull all events (combined, unsorted)",
+        "single query: UNION ALL non-drug/drug/measurement; no ORDER BY so BQ Storage API parallel streams kick in",
     )
-    _stream_query_to_parquet(client(), _all_events_sorted_sql(cdr), "all_events_sorted", all_sorted_path)
-    _WORK.finish_unit("pull all events (combined + sorted in BQ)", f"path={all_sorted_path.name}")
+    _stream_query_to_parquet(client(), _all_events_sql(cdr), "all_events", all_events_path)
+    _WORK.finish_unit("pull all events (combined, unsorted)", f"path={all_events_path.name}")
 
-    _WORK.start_unit("build lazy event scan", "scanning the sorted all-events parquet as a lazy frame")
-    source_key = _path_fingerprint(all_sorted_path)
-    events_lf = pl.scan_parquet(str(all_sorted_path)).select(
+    _WORK.start_unit("build lazy event scan", "scanning all-events parquet as a lazy frame")
+    source_key = _path_fingerprint(all_events_path)
+    events_lf = pl.scan_parquet(str(all_events_path)).select(
         ["subject_id", "time_seconds", "code", "cid", "value"]
     )
     _log(f"source event fingerprint={source_key}")
@@ -552,8 +571,8 @@ def main() -> None:
     _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
     _WORK.start_unit(
-        "filter final events",
-        "streaming filter+atom encode to final parquet; source already sorted by BQ, no Python sort or join",
+        "filter and sort final events",
+        "streaming filter + atom-encode + (subject_id, time_seconds) sort to final parquet (polars spills to disk)",
     )
     final_events_path = cache_dir / f"events-{source_key}-{vocab_key}-atom-v1.parquet"
     keep_codes = pl.Series("code", list(atom_idx.keys()))
@@ -562,13 +581,14 @@ def main() -> None:
         events_lf.select(["subject_id", "time_seconds", "code", "value"])
         .filter(pl.col("code").is_in(keep_codes.implode()))
         .select(["subject_id", "time_seconds", atom_expr, "value"])
+        .sort(["subject_id", "time_seconds"])
     )
     _sink_parquet(final_lf, final_events_path, "final_events")
     _log(f"copying final events to: {out_dir / 'events.parquet'}")
     pl.scan_parquet(str(final_events_path)).sink_parquet(out_dir / "events.parquet", compression="zstd")
     final_events_lf = pl.scan_parquet(str(final_events_path))
     final_rows = final_events_lf.select(pl.len()).collect(streaming=True).item()
-    _WORK.finish_unit("filter final events", f"rows={final_rows:,}")
+    _WORK.finish_unit("filter and sort final events", f"rows={final_rows:,}")
 
     _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
     persons = _cache_parquet(
@@ -581,7 +601,8 @@ def main() -> None:
                     birth_datetime,
                     TIMESTAMP(DATE(year_of_birth, COALESCE(month_of_birth, 1), COALESCE(day_of_birth, 1)))
                   )) AS birth_seconds
-                FROM `{cdr}.person`""", "person"),
+                FROM `{cdr}.person`
+                WHERE TRUE{_tiny_predicate("person_id")}""", "person"),
             "person",
         ),
     )
@@ -593,7 +614,9 @@ def main() -> None:
         lambda: _arrow_to_polars(
             _query_to_arrow(client(), f"""SELECT CAST(person_id AS INT64) AS subject_id,
                            UNIX_SECONDS(TIMESTAMP(MAX(observation_period_end_date))) AS censor_seconds
-                    FROM `{cdr}.observation_period` GROUP BY person_id""", "observation_period"),
+                    FROM `{cdr}.observation_period`
+                    WHERE TRUE{_tiny_predicate("person_id")}
+                    GROUP BY person_id""", "observation_period"),
             "observation_period",
         ),
     )

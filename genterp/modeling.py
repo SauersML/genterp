@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,25 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
 ROPE_BASE = 10000.0
+
+
+@lru_cache(maxsize=1)
+def _flash_attn_varlen_func():
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("flash-attn is required for packed CUDA attention") from exc
+    return flash_attn_varlen_func
+
+
+def _assert_right_padded_event_mask(event_pad: torch.Tensor) -> None:
+    if event_pad.ndim != 2:
+        raise ValueError("event_pad must have shape (batch, events)")
+    if event_pad.numel() == 0:
+        return
+    invalid = event_pad[:, :-1] & ~event_pad[:, 1:]
+    if invalid.any().item():
+        raise ValueError("event_pad must be right-padded: valid events cannot appear after padding")
 
 
 class ContinuousTimeRoPE(nn.Module):
@@ -87,82 +107,66 @@ class CausalRoPEAttention(nn.Module):
         event_pad: torch.Tensor,
     ) -> torch.Tensor:
         B, S, H, D = q.shape
+        _assert_right_padded_event_mask(event_pad)
         valid_events = (~event_pad).sum(dim=1)
         out = q.new_zeros(B, S, H, D)
+        dropout_p = self.dropout if self.training else 0.0
 
-        out[:, :static_len] = F.scaled_dot_product_attention(
-            q[:, :static_len].transpose(1, 2),
-            k[:, :static_len].transpose(1, 2),
-            v[:, :static_len].transpose(1, 2),
-            dropout_p=self.dropout if self.training else 0.0,
-        ).transpose(1, 2)
+        if static_len > 0:
+            out[:, :static_len] = F.scaled_dot_product_attention(
+                q[:, :static_len].transpose(1, 2),
+                k[:, :static_len].transpose(1, 2),
+                v[:, :static_len].transpose(1, 2),
+                dropout_p=dropout_p,
+            ).transpose(1, 2)
 
         if valid_events.max().item() == 0:
             return out
 
         if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
-            try:
-                from flash_attn import flash_attn_varlen_func
-            except ModuleNotFoundError as exc:
-                raise RuntimeError("flash-attn is required for packed CUDA attention") from exc
-
-            q_parts: list[torch.Tensor] = []
-            k_parts: list[torch.Tensor] = []
-            v_parts: list[torch.Tensor] = []
-            q_lens: list[int] = []
-            kv_lens: list[int] = []
-            for b, event_len_t in enumerate(valid_events.tolist()):
-                event_len = int(event_len_t)
-                q_lens.append(event_len)
-                kv_lens.append(static_len + event_len)
-                k_parts.append(k[b, : static_len + event_len])
-                v_parts.append(v[b, : static_len + event_len])
-                if event_len > 0:
-                    q_parts.append(q[b, static_len : static_len + event_len])
-
-            q_packed = torch.cat(q_parts, dim=0)
-            k_packed = torch.cat(k_parts, dim=0)
-            v_packed = torch.cat(v_parts, dim=0)
-            cu_q = F.pad(torch.tensor(q_lens, device=q.device, dtype=torch.int32).cumsum(0), (1, 0))
-            cu_kv = F.pad(torch.tensor(kv_lens, device=q.device, dtype=torch.int32).cumsum(0), (1, 0))
-            event_out = flash_attn_varlen_func(
+            event_keep = ~event_pad
+            kv_keep = torch.ones(B, S, dtype=torch.bool, device=q.device)
+            kv_keep[:, static_len:] = event_keep
+            q_lens = valid_events.to(torch.int32)
+            kv_lens = q_lens + static_len
+            q_packed = q[:, static_len:][event_keep].contiguous()
+            k_packed = k[kv_keep].contiguous()
+            v_packed = v[kv_keep].contiguous()
+            cu_q = F.pad(q_lens.cumsum(0), (1, 0))
+            cu_kv = F.pad(kv_lens.cumsum(0), (1, 0))
+            event_out = _flash_attn_varlen_func()(
                 q_packed,
                 k_packed,
                 v_packed,
                 cu_q,
                 cu_kv,
-                int(max(q_lens)),
-                int(max(kv_lens)),
-                dropout_p=self.dropout if self.training else 0.0,
+                int(q_lens.max().item()),
+                int(kv_lens.max().item()),
+                dropout_p=dropout_p,
                 causal=True,
             )
-            offset = 0
-            for b, event_len_t in enumerate(valid_events.tolist()):
-                event_len = int(event_len_t)
-                if event_len == 0:
-                    continue
-                out[b, static_len : static_len + event_len] = event_out[offset : offset + event_len]
-                offset += event_len
+            out[:, static_len:][event_keep] = event_out
             return out
 
-        for b, event_len_t in enumerate(valid_events.tolist()):
+        for event_len_t in valid_events.unique(sorted=True).tolist():
             event_len = int(event_len_t)
             if event_len == 0:
                 continue
             kv_len = static_len + event_len
-            qe = q[b, static_len : static_len + event_len].transpose(0, 1).unsqueeze(0)
-            ke = k[b, :kv_len].transpose(0, 1).unsqueeze(0)
-            ve = v[b, :kv_len].transpose(0, 1).unsqueeze(0)
+            rows = valid_events == event_len
+            qe = q[rows, static_len : static_len + event_len].transpose(1, 2)
+            ke = k[rows, :kv_len].transpose(1, 2)
+            ve = v[rows, :kv_len].transpose(1, 2)
             q_idx = torch.arange(static_len, kv_len, device=q.device).view(event_len, 1)
             kv_idx = torch.arange(kv_len, device=q.device).view(1, kv_len)
             mask = (kv_idx <= q_idx).view(1, 1, event_len, kv_len)
-            out[b, static_len:kv_len] = F.scaled_dot_product_attention(
+            out[rows, static_len:kv_len] = F.scaled_dot_product_attention(
                 qe,
                 ke,
                 ve,
                 attn_mask=mask,
-                dropout_p=self.dropout if self.training else 0.0,
-            ).squeeze(0).transpose(0, 1)
+                dropout_p=dropout_p,
+            ).transpose(1, 2)
         return out
 
     def forward(
