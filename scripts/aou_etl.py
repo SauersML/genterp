@@ -20,17 +20,26 @@ from collections.abc import Callable
 from pathlib import Path
 
 import polars as pl
+import psutil
+import pyarrow.parquet as pq
 from google.cloud import bigquery
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.progress import ProgressLogger
 from genterp.vocab import collapse_vocabulary
 
+
+_PROC = psutil.Process()
+
+
+def _mem_str() -> str:
+    return f"RSS={_PROC.memory_info().rss / 1e9:.2f}GB"
+
 _WORK = ProgressLogger("aou_etl", total_units=14)
 
 
 def _log(msg: str) -> None:
-    _WORK.log(msg)
+    _WORK.log(f"{msg} [{_mem_str()}]")
 
 
 _BQ_JOB_CACHE_DIR: Path | None = None
@@ -49,7 +58,8 @@ def _bq_job_id_file(sql: str) -> Path | None:
     return _BQ_JOB_CACHE_DIR / f"{key}.txt"
 
 
-def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
+def _submit_or_reuse_job(client: bigquery.Client, sql: str, label: str) -> bigquery.QueryJob:
+    """Resume a prior server-side BQ job for this exact SQL if still available, else submit a fresh one."""
     job_id_file = _bq_job_id_file(sql)
     if job_id_file is not None and job_id_file.exists():
         prev_id = job_id_file.read_text().strip()
@@ -57,22 +67,65 @@ def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
             job = client.get_job(prev_id)
             if job.state == "DONE" and job.error_result is None:
                 _log(f"  bq reuse:  {label} job_id={prev_id} (server-cached result)")
-                t0 = time.monotonic()
-                table = job.to_arrow(progress_bar_type="tqdm")
-                _log(f"  bq done:   {label} rows={table.num_rows:,} reused in {time.monotonic() - t0:.1f}s")
-                return table
+                return job
             _log(f"  bq prior job state={job.state}; resubmitting")
         except Exception as exc:
             _log(f"  bq prior job lookup failed ({exc.__class__.__name__}); resubmitting")
-    _log(f"  bq query: {label}")
-    t0 = time.monotonic()
+    _log(f"  bq submit: {label}")
     job = client.query(sql)
     if job_id_file is not None:
         job_id_file.write_text(job.job_id or "")
         _log(f"  bq job_id={job.job_id} (recorded for resume)")
+    return job
+
+
+def _query_to_arrow(client: bigquery.Client, sql: str, label: str):
+    """One-shot Arrow Table fetch — only safe for small results (concept lookup, censor, person)."""
+    t0 = time.monotonic()
+    job = _submit_or_reuse_job(client, sql, label)
     table = job.to_arrow(progress_bar_type="tqdm")
     _log(f"  bq done:   {label} rows={table.num_rows:,} in {time.monotonic() - t0:.1f}s")
     return table
+
+
+def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_path: Path) -> None:
+    """Submit/reuse a BQ job and stream its Arrow batches directly to a Parquet file.
+
+    Never materializes the full result Arrow table in process memory. For large
+    event scans this is the difference between fitting in RAM and getting
+    SIGKILL'd by the kernel.
+    """
+    if out_path.exists():
+        _log(f"cache hit:  {out_path.name}")
+        return
+    _log(f"streaming:  {out_path.name} (no full materialization)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    t0 = time.monotonic()
+    job = _submit_or_reuse_job(client, sql, label)
+    iterable = job.result().to_arrow_iterable()
+
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    batches = 0
+    try:
+        for batch in iterable:
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, batch.schema, compression="zstd")
+            assert writer is not None
+            writer.write_batch(batch)
+            rows += batch.num_rows
+            batches += 1
+            if batches % 50 == 0:
+                _log(f"  stream:    {label} rows={rows:,} batches={batches}")
+    finally:
+        if writer is not None:
+            writer.close()
+    tmp.replace(out_path)
+    _log(f"streamed:   {out_path.name} rows={rows:,} batches={batches} in {time.monotonic() - t0:.1f}s")
 
 
 THRESHOLD = 500
@@ -150,11 +203,28 @@ def _cache_parquet(path: Path, build: Callable[[], pl.DataFrame]) -> pl.DataFram
 
 
 def _arrow_to_polars(arrow_table, label: str) -> pl.DataFrame:
-    _log(f"  arrow→polars: {label} (rows={arrow_table.num_rows:,}); converting Arrow table to polars DataFrame")
+    """Used only for small results (person, observation_period)."""
+    _log(f"  arrow→polars: {label} (rows={arrow_table.num_rows:,})")
     t0 = time.monotonic()
     df = pl.from_arrow(arrow_table)
     _log(f"  arrow→polars done: {label} rows={df.height:,} columns={len(df.columns):,} in {time.monotonic() - t0:.1f}s")
     return df
+
+
+def _sink_parquet(lf: pl.LazyFrame, path: Path, label: str) -> None:
+    """Streaming sink: never materialize the full frame in memory."""
+    if path.exists():
+        _log(f"cache hit:  {path.name}")
+        return
+    _log(f"sink:       {path.name} (streaming)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    t0 = time.monotonic()
+    lf.sink_parquet(tmp, compression="zstd")
+    tmp.replace(path)
+    _log(f"sunk:       {path.name} bytes={path.stat().st_size:,} in {time.monotonic() - t0:.1f}s")
 
 
 def _cache_json(path: Path, build: Callable[[], object]) -> object:
@@ -182,9 +252,8 @@ def _non_drug_events_cte(cdr: str, with_time: bool) -> str:
     return "\n  UNION ALL ".join(parts)
 
 
-def _drug_events_arrow(client: bigquery.Client, cdr: str):
-    """Drug exposures, exploded to ingredient codes via drug_strength."""
-    sql = f"""
+def _drug_events_sql(cdr: str) -> str:
+    return f"""
     SELECT
       CAST(de.person_id AS INT64) AS subject_id,
       UNIX_SECONDS(de.drug_exposure_start_datetime) AS time_seconds,
@@ -196,11 +265,10 @@ def _drug_events_arrow(client: bigquery.Client, cdr: str):
     JOIN `{cdr}.concept` c ON c.concept_id = ds.ingredient_concept_id
     WHERE de.drug_concept_id > 0 AND de.drug_exposure_start_datetime IS NOT NULL
     """
-    return _query_to_arrow(client, sql, "drug_exposure → ingredient")
 
 
-def _non_drug_events_arrow(client: bigquery.Client, cdr: str):
-    sql = f"""
+def _non_drug_events_sql(cdr: str) -> str:
+    return f"""
     WITH events AS (
       {_non_drug_events_cte(cdr, with_time=True)}
     )
@@ -212,11 +280,10 @@ def _non_drug_events_arrow(client: bigquery.Client, cdr: str):
       CAST(NULL AS FLOAT64) AS value
     FROM events JOIN `{cdr}.concept` c ON c.concept_id = events.cid
     """
-    return _query_to_arrow(client, sql, "condition+procedure+observation+visit+device")
 
 
-def _measurement_events_arrow(client: bigquery.Client, cdr: str):
-    sql = f"""
+def _measurement_events_sql(cdr: str) -> str:
+    return f"""
     SELECT
       CAST(m.person_id AS INT64) AS subject_id,
       UNIX_SECONDS(m.measurement_datetime) AS time_seconds,
@@ -226,7 +293,6 @@ def _measurement_events_arrow(client: bigquery.Client, cdr: str):
     FROM `{cdr}.measurement` m JOIN `{cdr}.concept` c ON c.concept_id = m.measurement_concept_id
     WHERE m.measurement_concept_id > 0 AND m.measurement_datetime IS NOT NULL
     """
-    return _query_to_arrow(client, sql, "measurement (with value_as_number)")
 
 
 def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[int]):
@@ -326,19 +392,21 @@ def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: 
     return cached
 
 
-def _cached_own_counts(events_all: pl.DataFrame, cache_dir: Path, source_key: str) -> dict[int, int]:
-    payload = _cache_json(
-        cache_dir / f"own_counts-{source_key}.json",
-        lambda: [
-            [int(r["cid"]), int(r["n"])]
-            for r in events_all.group_by("cid").agg(pl.col("subject_id").n_unique().alias("n")).iter_rows(named=True)
-        ],
-    )
+def _cached_own_counts(events_lf: pl.LazyFrame, cache_dir: Path, source_key: str) -> dict[int, int]:
+    def build() -> list[list[int]]:
+        df = (
+            events_lf.group_by("cid")
+            .agg(pl.col("subject_id").n_unique().alias("n"))
+            .collect(streaming=True)
+        )
+        return [[int(r["cid"]), int(r["n"])] for r in df.iter_rows(named=True)]
+
+    payload = _cache_json(cache_dir / f"own_counts-{source_key}.json", build)
     return {int(cid): int(n) for cid, n in payload}
 
 
 def _cached_value_stats(
-    events_all: pl.DataFrame,
+    events_lf: pl.LazyFrame,
     atom_idx: dict[str, int],
     cache_dir: Path,
     source_key: str,
@@ -346,7 +414,7 @@ def _cached_value_stats(
 ) -> dict[str, dict[str, float]]:
     def build() -> dict[str, dict[str, float]]:
         stats_df = (
-            events_all.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
+            events_lf.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
             .group_by("code")
             .agg(
                 pl.col("value").mean().alias("mu"),
@@ -354,6 +422,7 @@ def _cached_value_stats(
                 pl.len().alias("n"),
             )
             .filter(pl.col("n") >= THRESHOLD)
+            .collect(streaming=True)
         )
         return {
             r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
@@ -389,43 +458,35 @@ def main() -> None:
             client_instance = bigquery.Client()
         return client_instance
 
-    _WORK.start_unit("pull non-drug events", "condition, procedure, observation, visit, and device domains")
-    non_drug = _cache_parquet(
-        cache_dir / "non_drug_events.parquet",
-        lambda: _arrow_to_polars(_non_drug_events_arrow(client(), cdr), "non_drug_events"),
-    )
-    _WORK.finish_unit("pull non-drug events", f"rows={non_drug.height:,}")
+    non_drug_path = cache_dir / "non_drug_events.parquet"
+    drug_path = cache_dir / "drug_events.parquet"
+    meas_path = cache_dir / "measurement_events.parquet"
 
-    _WORK.start_unit("pull drug events", "drug_exposure joined through drug_strength to ingredient concepts")
-    drug = _cache_parquet(
-        cache_dir / "drug_events.parquet",
-        lambda: _arrow_to_polars(_drug_events_arrow(client(), cdr), "drug_events"),
-    )
-    _WORK.finish_unit("pull drug events", f"rows={drug.height:,}")
+    _WORK.start_unit("pull non-drug events", "streaming condition/procedure/observation/visit/device to parquet")
+    _stream_query_to_parquet(client(), _non_drug_events_sql(cdr), "non_drug_events", non_drug_path)
+    _WORK.finish_unit("pull non-drug events", f"path={non_drug_path.name}")
 
-    _WORK.start_unit("pull measurement events", "measurement rows with value_as_number preserved")
-    meas = _cache_parquet(
-        cache_dir / "measurement_events.parquet",
-        lambda: _arrow_to_polars(_measurement_events_arrow(client(), cdr), "measurement_events"),
-    )
-    _WORK.finish_unit("pull measurement events", f"rows={meas.height:,}")
+    _WORK.start_unit("pull drug events", "streaming drug_exposure ⨝ drug_strength → ingredients to parquet")
+    _stream_query_to_parquet(client(), _drug_events_sql(cdr), "drug_events", drug_path)
+    _WORK.finish_unit("pull drug events", f"path={drug_path.name}")
 
-    _WORK.start_unit("concatenate event streams", "normalizing source columns before combining domains")
-    source_events_path = cache_dir / "all_source_events.parquet"
-    events_all = _cache_parquet(
-        source_events_path,
-        lambda: pl.concat([
-            non_drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
-            drug.select(["subject_id", "time_seconds", "code", "cid", "value"]),
-            meas.select(["subject_id", "time_seconds", "code", "cid", "value"]),
-        ]),
-    )
-    source_key = _path_fingerprint(source_events_path)
-    _log(f"source event fingerprint={source_key}; total rows={events_all.height:,}")
-    _WORK.finish_unit("concatenate event streams", f"rows={events_all.height:,} source_key={source_key}")
+    _WORK.start_unit("pull measurement events", "streaming measurement rows (value_as_number preserved) to parquet")
+    _stream_query_to_parquet(client(), _measurement_events_sql(cdr), "measurement_events", meas_path)
+    _WORK.finish_unit("pull measurement events", f"path={meas_path.name}")
 
-    _WORK.start_unit("count distinct subjects per source concept", "grouping all source events by concept_id")
-    own_by_cid = _cached_own_counts(events_all, cache_dir, source_key)
+    _WORK.start_unit("build lazy event scan", "scanning three domain parquets as a single lazy frame")
+    source_paths = [non_drug_path, drug_path, meas_path]
+    source_key = hashlib.sha256(
+        "|".join(f"{p.name}:{_path_fingerprint(p)}" for p in source_paths).encode()
+    ).hexdigest()[:16]
+    events_lf = pl.scan_parquet([str(p) for p in source_paths]).select(
+        ["subject_id", "time_seconds", "code", "cid", "value"]
+    )
+    _log(f"source event fingerprint={source_key}")
+    _WORK.finish_unit("build lazy event scan", f"source_key={source_key}")
+
+    _WORK.start_unit("count distinct subjects per source concept", "lazy group_by over scanned event parquets")
+    own_by_cid = _cached_own_counts(events_lf, cache_dir, source_key)
     _WORK.finish_unit("count distinct subjects per source concept", f"unique concept_ids={len(own_by_cid):,}")
 
     _WORK.start_unit("collapse vocabulary", f"threshold={THRESHOLD:,}; resolving ancestors and concept codes if cache is cold")
@@ -454,22 +515,26 @@ def main() -> None:
     _write_json(out_dir / "vocab.json", atom_idx)
     _WORK.finish_unit("collapse vocabulary", f"atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
 
-    _WORK.start_unit("compute per-atom value stats", "mean and stddev over finite numeric measurements")
+    _WORK.start_unit("compute per-atom value stats", "lazy mean/stddev over finite numeric measurements")
     vocab_key = _stable_json_fingerprint(atom_idx)
-    stats = _cached_value_stats(events_all, atom_idx, cache_dir, source_key, vocab_key)
+    stats = _cached_value_stats(events_lf, atom_idx, cache_dir, source_key, vocab_key)
     _write_json(out_dir / "value_stats.json", stats)
     _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
-    _WORK.start_unit("filter and sort final events", "keeping collapsed-vocab codes and sorting by subject/time")
-    final_events = _cache_parquet(
-        cache_dir / f"events-{source_key}-{vocab_key}.parquet",
-        lambda: events_all.select(["subject_id", "time_seconds", "code", "value"])
-        .filter(pl.col("code").is_in(set(atom_idx.keys())))
-        .sort(["subject_id", "time_seconds"]),
+    _WORK.start_unit("filter and sort final events", "streaming filter+sort to final parquet")
+    final_events_path = cache_dir / f"events-{source_key}-{vocab_key}.parquet"
+    keep_codes = set(atom_idx.keys())
+    final_lf = (
+        events_lf.select(["subject_id", "time_seconds", "code", "value"])
+        .filter(pl.col("code").is_in(keep_codes))
+        .sort(["subject_id", "time_seconds"])
     )
-    _log(f"writing final events parquet: {out_dir / 'events.parquet'} rows={final_events.height:,}")
-    final_events.write_parquet(out_dir / "events.parquet")
-    _WORK.finish_unit("filter and sort final events", f"rows={final_events.height:,}")
+    _sink_parquet(final_lf, final_events_path, "final_events")
+    _log(f"copying final events to: {out_dir / 'events.parquet'}")
+    pl.scan_parquet(str(final_events_path)).sink_parquet(out_dir / "events.parquet", compression="zstd")
+    final_events_lf = pl.scan_parquet(str(final_events_path))
+    final_rows = final_events_lf.select(pl.len()).collect(streaming=True).item()
+    _WORK.finish_unit("filter and sort final events", f"rows={final_rows:,}")
 
     _WORK.start_unit("pull person demographics", "sex and birth timestamp from OMOP person")
     persons = _cache_parquet(
@@ -500,10 +565,12 @@ def main() -> None:
     )
     _WORK.finish_unit("pull observation-period censoring", f"rows={censor.height:,}")
 
-    _WORK.start_unit("build subject metadata", "row offsets, demographics, censoring, and deterministic split labels")
-    offsets = final_events.with_row_index("row").group_by("subject_id", maintain_order=True).agg(
-        pl.col("row").min().alias("start"),
-        pl.col("row").max().alias("end"),
+    _WORK.start_unit("build subject metadata", "row offsets, demographics, censoring, deterministic split labels")
+    offsets = (
+        final_events_lf.with_row_index("row")
+        .group_by("subject_id", maintain_order=True)
+        .agg(pl.col("row").min().alias("start"), pl.col("row").max().alias("end"))
+        .collect(streaming=True)
     )
     _log(f"subject offsets computed: subjects_with_events={offsets.height:,}")
     subjects = (
@@ -516,7 +583,10 @@ def main() -> None:
         )
         .sort("subject_id")
     )
-    subjects = _cache_parquet(cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet", lambda: subjects)
+    subjects = _cache_parquet(
+        cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet",
+        lambda: subjects,
+    )
     _log(f"writing final subjects parquet: {out_dir / 'subjects.parquet'} rows={subjects.height:,}")
     subjects.write_parquet(out_dir / "subjects.parquet")
     _WORK.finish_unit("build subject metadata", f"subjects={subjects.height:,}")
@@ -527,7 +597,7 @@ def main() -> None:
     _WORK.finish_unit(
         "summarize ETL artifacts",
         f"vocab={len(set(atom_idx.values())):,}  "
-        f"events={final_events.height:,}  "
+        f"events={final_rows:,}  "
         f"subjects={subjects.height:,}  "
         f"magnitude_atoms={len(stats):,}  "
         f"split[{split_summary}]  "

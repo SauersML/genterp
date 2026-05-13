@@ -76,6 +76,40 @@ def test_collate_empty_static_is_nan_safe():
     assert torch.isfinite(out["event_ages"]).all()
 
 
+def test_cohort_dataset_keeps_most_recent_events_when_history_exceeds_max(tmp_path):
+    """Older subjects (10k events, max_events=4096) must train on the most RECENT events,
+    not the first 4096 (which would be childhood records for a 70-year-old)."""
+    n_static = 3
+    n_events = 100
+    times = list(range(n_static)) + [86400 * (n_static + 1 + i) for i in range(n_events)]
+    pl.DataFrame(
+        {
+            "subject_id": [1] * len(times),
+            "time_seconds": times,
+            "code": ["S"] * n_static + [f"E{i}" for i in range(n_events)],
+            "value": [None] * len(times),
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "start": [0],
+            "end": [len(times) - 1],
+            "sex": [0],
+            "birth_seconds": [0],
+            "censor_seconds": [86400 * 10_000],
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+
+    code_atoms = CodeAtomMap({"S": 1, **{f"E{i}": i + 2 for i in range(n_events)}})
+    max_events = 10
+    item = CohortDataset(tmp_path, code_atoms, max_events=max_events)[0]
+
+    # Should be the *last* 10 events (E90..E99 → atoms 92..101), not the first 10.
+    assert item["event_atoms"] == [i + 2 for i in range(n_events - max_events, n_events)]
+    assert item["length"] == max_events
+
+
 def test_cohort_dataset_persists_encoded_atom_cache(tmp_path):
     pl.DataFrame(
         {

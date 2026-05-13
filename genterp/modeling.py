@@ -177,21 +177,21 @@ def _log_ndtr(x: torch.Tensor) -> torch.Tensor:
 
 
 class ValueModulator(nn.Module):
-    """Per-event multiplicative value modulation.
+    """Per-event multiplicative value modulation, conditioned on the concept itself.
 
-      e_token = e_concept * (tanh(MLP(log1p_signed(z))) if has_magnitude else 1)
+      e_token = e_concept * (tanh(MLP([log1p_signed(z), e_concept])) if has_magnitude else 1)
 
-    where z = (value - μ[leaf_atom]) / σ[leaf_atom] and has_magnitude is a per-
-    event mask derived from the atom-level flag AND value-finiteness. (μ, σ,
-    atom_has_mag) are populated from the ETL stats file before training. Last-
-    layer bias = 2 → tanh ≈ 0.96 at init so magnitude events start near identity
-    multiplication and the value MLP learns the modulation pattern from there.
+    z = (value - μ[leaf_atom]) / σ[leaf_atom]; has_magnitude is the atom-level
+    flag AND value-finiteness. The MLP is conditioned on the concept embedding,
+    so the same z gets different modulation patterns for, e.g., HbA1c vs sodium.
+    (μ, σ, atom_has_mag) come from the ETL value_stats.json. Last-layer bias = 2
+    → tanh ≈ 0.96 at init so magnitude events start near identity multiplication.
     """
 
     def __init__(self, dim: int, n_atoms: int, hidden: int = 64):
         super().__init__()
         self.value_mlp = nn.Sequential(
-            nn.Linear(1, hidden),
+            nn.Linear(1 + dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, dim),
         )
@@ -219,8 +219,9 @@ class ValueModulator(nn.Module):
 
     def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         has_mag = self.event_has_magnitude(leaf_atom, value)
-        x = self.z_score(leaf_atom, value).unsqueeze(-1)
-        modulation = torch.tanh(self.value_mlp(x)).to(e_concept.dtype)
+        z = self.z_score(leaf_atom, value).unsqueeze(-1)
+        mlp_input = torch.cat([z, e_concept.float()], dim=-1)
+        modulation = torch.tanh(self.value_mlp(mlp_input)).to(e_concept.dtype)
         return torch.where(has_mag.unsqueeze(-1), e_concept * modulation, e_concept)
 
 
@@ -507,7 +508,10 @@ def marked_tpp_value_loss(
     mark_nll = mark_loss / n_real.clamp(min=1)
     value_nll = value_loss / n_mag.clamp(min=1)
     censor_nll = censor_loss / n_censor.clamp(min=1)
-    total = (time_loss + mark_loss + value_loss + censor_loss) / n_any.clamp(min=1)
+    # Each component is averaged over its own token population (n_real, n_real, n_mag, n_censor)
+    # before summing, so each per-token NLL contributes equally to the gradient. Pooling the raw
+    # sums over n_any would heavily underweight value (n_mag << n_real) and censor (one per subject).
+    total = time_nll + mark_nll + value_nll + censor_nll
 
     return {
         "loss": total,

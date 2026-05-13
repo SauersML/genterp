@@ -112,39 +112,38 @@ class CohortDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         s, e = int(self.start[idx]), int(self.end[idx])
         stop = e + 1
-        times = self.event_times[s:stop]
         birth = float(self.birth_seconds[idx])
-        atoms = self.event_atoms
         max_events = self.max_events
 
-        static_atoms: list[int] = []
-        event_atoms: list[int] = []
-        event_ages: list[float] = []
-        event_values: list[float] = []
-        values = self.event_values
-        for offset, t in enumerate(times, start=s):
-            atom = int(atoms[offset])
-            if atom == PAD_ATOM:
-                continue
-            delta_days = (t - birth) / 86400.0
-            if delta_days <= 0.5:
-                static_atoms.append(atom)
-            elif len(event_atoms) < max_events:
-                event_atoms.append(atom)
-                event_ages.append(delta_days)
-                event_values.append(float(values[offset]))
-                if len(event_atoms) == max_events:
-                    break
+        sub_atoms = np.asarray(self.event_atoms[s:stop])
+        sub_values = np.asarray(self.event_values[s:stop])
+        sub_times = np.asarray(self.event_times[s:stop])
+        ages = (sub_times - birth) / 86400.0
+
+        static_slot = ages <= 0.5
+        static_atoms_arr = sub_atoms[static_slot & (sub_atoms != PAD_ATOM)]
+
+        event_slot = ~static_slot & (sub_atoms != PAD_ATOM)
+        event_atoms_arr = sub_atoms[event_slot]
+        event_ages_arr = ages[event_slot]
+        event_values_arr = sub_values[event_slot]
+
+        # Keep the *most recent* max_events. Tail slicing matters for older subjects with
+        # long histories — head-slicing trains on childhood events and discards adulthood.
+        if event_atoms_arr.shape[0] > max_events:
+            event_atoms_arr = event_atoms_arr[-max_events:]
+            event_ages_arr = event_ages_arr[-max_events:]
+            event_values_arr = event_values_arr[-max_events:]
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
             "sex": int(self.sex[idx]),
-            "static_atoms": static_atoms,
-            "event_atoms": event_atoms,
-            "event_ages": np.asarray(event_ages, dtype=np.float32),
-            "event_values": np.asarray(event_values, dtype=np.float32),
+            "static_atoms": [int(a) for a in static_atoms_arr.tolist()],
+            "event_atoms": [int(a) for a in event_atoms_arr.tolist()],
+            "event_ages": event_ages_arr.astype(np.float32, copy=False),
+            "event_values": event_values_arr.astype(np.float32, copy=False),
             "censor_age_days": float(censor_age_days),
-            "length": len(event_atoms),
+            "length": int(event_atoms_arr.shape[0]),
         }
 
 

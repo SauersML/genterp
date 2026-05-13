@@ -2,11 +2,12 @@
 
 For each layer ℓ ∈ [0, L):
     preact[n, ℓ]   = W_enc[ℓ] @ pre_mlp[n, ℓ] + b_enc[ℓ]
-    features[n, ℓ] = preact * (preact > θ[ℓ])             # JumpReLU, per-feature θ
+    features[n, ℓ] = ReLU(preact) * (ReLU(preact) > θ[ℓ]) # JumpReLU, per-feature θ
 For each output layer t ∈ [0, L):
     recon[n, t]    = Σ_{ℓ ≤ t} W_dec[ℓ → t] @ features[n, ℓ] + b_dec[t]
 
-Loss = Σ_t MSE((recon - mlp_out) / σ_t)  +  sparsity_coef · Σ tanh(features / scale)
+Loss = Σ_t MSE((recon - mlp_out) / σ_t)
+     + sparsity_coef · Σ tanh(features · ||W_dec[ℓ → ℓ]||₂ / (σ_ℓ · scale))
 
 Per-feature thresholds θ live in log space (always positive) and are trained
 via STE backward through the JumpReLU forward. The tanh penalty is smooth
@@ -39,29 +40,31 @@ class CLTConfig:
     dim: int
     n_features: int
     init_log_threshold: float = -4.6   # ≈ log(0.01)
-    jumprelu_bandwidth: float = 1e-3
+    jumprelu_bandwidth_frac: float = 0.1
     sparsity_coef: float = 1e-3
-    sparsity_tanh_scale: float = 1.0
+    sparsity_tanh_contribution_scale: float = 1.0
     activation_std_momentum: float = 0.99
     activation_std_eps: float = 1e-6
 
+    def __post_init__(self) -> None:
+        if self.jumprelu_bandwidth_frac <= 0:
+            raise ValueError("jumprelu_bandwidth_frac must be > 0")
+
 
 class _JumpReLU(torch.autograd.Function):
-    """Forward: x · 𝟙[x > θ]. Backward: pass-through where active, rectangular STE on θ."""
+    """Forward: x * 1[x > theta]. Backward: pass-through on x, rectangular STE on theta."""
 
     @staticmethod
     def forward(ctx, x, theta, bandwidth):
-        ctx.save_for_backward(x, theta)
-        ctx.bandwidth = bandwidth
+        ctx.save_for_backward(x, theta, bandwidth)
         return x * (x > theta).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, theta = ctx.saved_tensors
-        bw = ctx.bandwidth
+        x, theta, bandwidth = ctx.saved_tensors
         grad_x = grad_output * (x > theta).to(grad_output.dtype)
-        in_band = ((x - theta).abs() < bw / 2).to(grad_output.dtype)
-        grad_theta = -grad_output * x * in_band / bw
+        in_band = ((x - theta).abs() < bandwidth / 2).to(grad_output.dtype)
+        grad_theta = -grad_output * theta * in_band / bandwidth
         while grad_theta.dim() > theta.dim():
             grad_theta = grad_theta.sum(0)
         return grad_x, grad_theta, None
@@ -97,13 +100,33 @@ class CrossLayerTranscoder(nn.Module):
     def _theta_like(self, ref: torch.Tensor) -> torch.Tensor:
         return self.log_threshold.exp().to(ref.dtype)
 
+    def _bandwidth_like(self, theta: torch.Tensor) -> torch.Tensor:
+        return theta.detach() * self.cfg.jumprelu_bandwidth_frac
+
     def encode(self, pre_mlp: torch.Tensor) -> torch.Tensor:
-        preact = self._preact(pre_mlp)
-        return _JumpReLU.apply(preact, self._theta_like(preact), self.cfg.jumprelu_bandwidth)
+        preact = self._preact(pre_mlp).relu()
+        theta = self._theta_like(preact)
+        return _JumpReLU.apply(preact, theta, self._bandwidth_like(theta))
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
         masked = self.dec_weight * self.dec_mask
         return torch.einsum("nsf,stfd->ntd", features, masked) + self.dec_bias
+
+    def _diagonal_decoder_norm(self) -> torch.Tensor:
+        layer_idx = torch.arange(self.cfg.n_layers, device=self.dec_weight.device)
+        return self.dec_weight.float()[layer_idx, layer_idx].norm(dim=-1)
+
+    def _sparsity(self, features: torch.Tensor) -> torch.Tensor:
+        per_layer_std = self.per_layer_std.view(1, self.cfg.n_layers, 1)
+        contribution = features.float() * self._diagonal_decoder_norm().view(
+            1, self.cfg.n_layers, self.cfg.n_features
+        )
+        normalized_contribution = contribution / per_layer_std
+        return (
+            torch.tanh(normalized_contribution / self.cfg.sparsity_tanh_contribution_scale)
+            .sum(dim=(-2, -1))
+            .mean()
+        )
 
     def forward(self, pre_mlp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = self.encode(pre_mlp)
@@ -119,14 +142,15 @@ class CrossLayerTranscoder(nn.Module):
         self.per_layer_std.mul_(self.cfg.activation_std_momentum).add_(batch_std, alpha=1.0 - self.cfg.activation_std_momentum)
 
     def loss(self, pre_mlp: torch.Tensor, mlp_out: torch.Tensor) -> dict[str, torch.Tensor]:
-        self._update_per_layer_std(mlp_out)
+        if self.training:
+            self._update_per_layer_std(mlp_out)
 
         features = self.encode(pre_mlp)
         recon = self.decode(features)
 
         per_layer_std = self.per_layer_std.view(1, self.cfg.n_layers, 1)
         recon_err = ((recon.float() - mlp_out.float()) / per_layer_std).pow(2).sum(dim=-1).mean()
-        sparsity = torch.tanh(features / self.cfg.sparsity_tanh_scale).sum(dim=(-2, -1)).mean()
+        sparsity = self._sparsity(features)
         total = recon_err + self.cfg.sparsity_coef * sparsity
 
         with torch.no_grad():
