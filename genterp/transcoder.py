@@ -207,7 +207,11 @@ class CrossLayerTranscoder(nn.Module):
             v_per_pair = self.off_V.index_select(0, self._off_s_idx)           # (N_off, r, D)
             out_per_pair = torch.einsum("npr,prd->npd", tmp, v_per_pair)        # (n, N_off, D)
 
-        accum.index_add_(1, self._off_t_idx, out_per_pair)
+        # Under autocast, the matmul ops above downcast to fp16/bf16 while
+        # accum keeps the dtype of `features` (which is fp32 — the JumpReLU
+        # custom autograd Function isn't autocast-aware and returns fp32).
+        # index_add_ requires matching dtypes; cast the source to match accum.
+        accum.index_add_(1, self._off_t_idx, out_per_pair.to(accum.dtype))
         return accum
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
