@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
@@ -39,11 +40,67 @@ class AtomVocab:
         return self.code_to_atom.get(code, PAD_ATOM)
 
 
+@dataclass
+class EventStore:
+    """Decompressed events.parquet columns, intended to be loaded *once* and shared.
+
+    Why this exists: ``pq.read_table(..., memory_map=True)`` does NOT avoid
+    decompression — it mmaps the on-disk *compressed* parquet bytes, then
+    decompresses every value into fresh Arrow heap buffers. For our 3.74GB
+    zstd events.parquet that's ~20GB of resident Arrow ChunkedArrays per call.
+
+    Train+eval datasets used to call ``pq.read_table`` independently, so the
+    second one tried to allocate another ~20GB on top of the first. On the
+    V100 box (~60GB RAM) the eval load got SIGKILLed by the kernel mid-read,
+    silently — no Python frame to dump a traceback.
+
+    Load once via ``EventStore.from_parquet``, hand the same instance to
+    every ``CohortDataset``, and the second dataset is effectively free.
+    """
+
+    time_seconds: pa.ChunkedArray
+    atom: pa.ChunkedArray
+    value: pa.ChunkedArray
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.atom.length())
+
+    @property
+    def num_chunks(self) -> int:
+        return int(self.atom.num_chunks)
+
+    @classmethod
+    def from_parquet(cls, path: str | Path) -> EventStore:
+        path = Path(path)
+        logger = ProgressLogger("event_store", total_units=2)
+        logger.start_unit("read events parquet (shared)", f"path={path}")
+        events = pq.read_table(
+            path, columns=["time_seconds", "atom", "value"], memory_map=True
+        )
+        logger.finish_unit("read events parquet (shared)", f"rows={events.num_rows:,}")
+        logger.start_unit(
+            "register event columns (shared)",
+            "kept as Arrow ChunkedArrays; per-subject slices land in numpy on demand",
+        )
+        store = cls(
+            time_seconds=events.column("time_seconds"),
+            atom=events.column("atom"),
+            value=events.column("value"),
+        )
+        logger.finish_unit("register event columns (shared)", f"chunks={store.num_chunks}")
+        return store
+
+
 class CohortDataset(Dataset):
     """events.parquet sorted by (subject_id, time_seconds); subjects.parquet holds per-subject row offsets, sex, birth.
 
     ``split`` filters subjects.parquet by the ETL-assigned split column (e.g. "train", "test").
     The shared events.parquet is unchanged — splits just expose different subject row-ranges.
+
+    Pass ``events`` (an :class:`EventStore` already loaded by the caller) to skip
+    re-reading the parquet — essential when constructing multiple datasets in
+    the same process (train + eval).
     """
 
     def __init__(
@@ -51,28 +108,15 @@ class CohortDataset(Dataset):
         data_dir: str | Path,
         max_events: int = 4096,
         split: str | None = None,
+        events: EventStore | None = None,
     ):
         data_dir = Path(data_dir)
-        logger = ProgressLogger(f"cohort_dataset:{split or 'all'}", total_units=6)
-        events_path = data_dir / "events.parquet"
-        logger.start_unit("read events parquet", f"path={events_path} columns=time_seconds,atom,value")
-        events = pq.read_table(events_path, columns=["time_seconds", "atom", "value"], memory_map=True)
-        logger.finish_unit("read events parquet", f"rows={events.num_rows:,}")
-
-        logger.start_unit(
-            "register event columns",
-            "keeping Arrow ChunkedArrays mmap-backed; per-subject slices land in numpy on demand",
-        )
-        # ``combine_chunks().to_numpy()`` allocates a single contiguous buffer per
-        # column — for 1B rows × 3 columns × ~8 bytes that's ~24GB of copy on
-        # top of the mmap, which OOMs the box. Keep the ChunkedArrays as-is:
-        # ``.slice(offset, length)`` is O(1) and ``.to_numpy()`` on the small
-        # per-subject slice (≈1.7K rows) materializes only what __getitem__
-        # actually needs.
-        self.event_times = events.column("time_seconds")
-        self.event_atoms = events.column("atom")
-        self.event_values = events.column("value")
-        logger.finish_unit("register event columns", f"rows={events.num_rows:,} chunks={self.event_atoms.num_chunks}")
+        logger = ProgressLogger(f"cohort_dataset:{split or 'all'}", total_units=4)
+        if events is None:
+            events = EventStore.from_parquet(data_dir / "events.parquet")
+        self.event_times = events.time_seconds
+        self.event_atoms = events.atom
+        self.event_values = events.value
 
         logger.start_unit("read subjects parquet", f"path={data_dir / 'subjects.parquet'}")
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")

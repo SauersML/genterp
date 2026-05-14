@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import atexit
+import faulthandler
 import json
 import os
 import re
 import shutil
+import signal
+import sys
+import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
@@ -14,16 +19,73 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 import torch
 import transformers
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 from transformers import trainer as hf_trainer
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
-from genterp.data import AtomVocab, CohortDataset, collate
+from genterp.data import AtomVocab, CohortDataset, EventStore, collate
 from genterp.modeling import Genterp, GenterpConfig
 from genterp.progress import ProgressLogger, count_parameters
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
+
+
+_PROC = psutil.Process()
+
+
+def _rss_str() -> str:
+    return f"RSS={_PROC.memory_info().rss/1e9:.2f}GB"
+
+
+def _install_crash_diagnostics() -> None:
+    """Same recipe as scripts/aou_etl.py: make non-OOM crashes loud.
+
+    The eval CohortDataset loading the events.parquet for the second time blew
+    the box's RAM ceiling and got SIGKILL'd silently. SIGKILL is uncatchable,
+    so the *mitigation* is to share the events store (see EventStore) — but
+    any *other* crash (segfault, unhandled exception, SIGTERM) should at least
+    print a Python traceback before exit. faulthandler covers segfaults/abort
+    signals; the signal handlers cover clean termination; sys.excepthook
+    catches anything that escapes the main module.
+    """
+    faulthandler.enable()
+    for name in ("SIGTERM", "SIGHUP", "SIGUSR1"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            faulthandler.register(sig, all_threads=True, chain=True)
+        except (ValueError, OSError):
+            pass
+
+    def _on_signal(signum: int, frame) -> None:
+        try:
+            label = signal.Signals(signum).name
+        except ValueError:
+            label = str(signum)
+        print(f"[train] FATAL: received {label} ({signum}); {_rss_str()}", file=sys.stderr, flush=True)
+        traceback.print_stack(frame)
+        sys.stderr.flush()
+        sys.exit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass
+
+    def _on_unhandled(exc_type, exc, tb) -> None:
+        print(f"[train] FATAL: unhandled {exc_type.__name__}: {exc}; {_rss_str()}", file=sys.stderr, flush=True)
+        traceback.print_exception(exc_type, exc, tb)
+        sys.stderr.flush()
+
+    sys.excepthook = _on_unhandled
+    atexit.register(lambda: print(f"[train] process exiting; final {_rss_str()}", file=sys.stderr, flush=True))
 
 RUNTIME_STATE_FILE = "genterp_runtime.json"
 FINAL_POINTER_FILE = "final_checkpoint.json"
@@ -554,7 +616,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     tiny = args.tiny
 
-    setup = ProgressLogger("train_setup", total_units=15)
+    _install_crash_diagnostics()
+    setup = ProgressLogger("train_setup", total_units=16)
     setup.start_unit("configure torch runtime", "selecting accelerator, precision, optimizer, and dataloader settings")
     runtime = configure_torch_runtime()
     setup.finish_unit(
@@ -573,12 +636,22 @@ def main(argv: list[str] | None = None) -> None:
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
     setup.finish_unit("load vocabulary", f"atoms={len(vocab):,} mapped_codes={len(vocab.code_to_atom):,}")
 
-    setup.start_unit("build training dataset", "split=train")
-    train_dataset = CohortDataset(etl, split="train")
-    setup.finish_unit("build training dataset", f"subjects={len(train_dataset):,}")
+    setup.start_unit(
+        "load events parquet (shared)",
+        "single decompressed copy reused by train + eval — prevents the ~20GB×2 OOM",
+    )
+    event_store = EventStore.from_parquet(etl / "events.parquet")
+    setup.finish_unit(
+        "load events parquet (shared)",
+        f"rows={event_store.num_rows:,} chunks={event_store.num_chunks} {_rss_str()}",
+    )
 
-    setup.start_unit("build evaluation dataset", "split=test")
-    eval_full = CohortDataset(etl, split="test")
+    setup.start_unit("build training dataset", "split=train; events shared from event_store")
+    train_dataset = CohortDataset(etl, split="train", events=event_store)
+    setup.finish_unit("build training dataset", f"subjects={len(train_dataset):,} {_rss_str()}")
+
+    setup.start_unit("build evaluation dataset", "split=test; events shared from event_store")
+    eval_full = CohortDataset(etl, split="test", events=event_store)
     # Cap each in-loop eval pass to a fixed subsample. The full ~12K test cohort at
     # batch_size=1 takes ~30min and OOM-risks the eval-worker fleet for no per-cycle
     # signal benefit. The subsample is deterministic (longest-first by length) so
