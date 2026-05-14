@@ -57,10 +57,10 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
 ROOT = Path.home() / "genterp"
 CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
-EDGE_QUANTILE = 0.995
-EDGE_MIN_ALPHA = 0.06
-EDGE_MAX_ALPHA = 0.65
-EDGE_ALPHA_GAMMA = 2.5
+EDGE_QUANTILE = 0.999
+EDGE_MIN_ALPHA = 0.10
+EDGE_MAX_ALPHA = 0.82
+EDGE_ALPHA_GAMMA = 1.7
 RNG_SEED = 7
 EPS = 1e-12
 LAYER_COLORS = np.asarray(
@@ -418,12 +418,13 @@ for source_layer, target_layer in pairs:
     if max_strength <= EPS:
         continue
     cutoff = float(np.quantile(strength.reshape(-1), EDGE_QUANTILE))
-    opacity = (strength / max_strength) ** EDGE_ALPHA_GAMMA
     source_features, target_features = np.where(strength >= cutoff)
     for s_feat, t_feat in zip(source_features, target_features, strict=True):
         s_flat = source_layer * n_features + s_feat
         t_flat = target_layer * n_features + t_feat
-        edges.append((s_flat, t_flat, float(scores[s_feat, t_feat]), float(opacity[s_feat, t_feat])))
+        importance = (strength[s_feat, t_feat] - cutoff) / max(max_strength - cutoff, EPS)
+        importance = float(np.clip(importance, 0.0, 1.0) ** EDGE_ALPHA_GAMMA)
+        edges.append((s_flat, t_flat, float(scores[s_feat, t_feat]), importance))
 
 fig, ax = plt.subplots(figsize=(12, 9), constrained_layout=True)
 graph_sc = ax.scatter(
@@ -442,6 +443,7 @@ if edges:
     weights = np.asarray([weight for _s_flat, _t_flat, weight, _alpha in edges])
     alphas = np.asarray([alpha for _s_flat, _t_flat, _weight, alpha in edges])
     alphas = EDGE_MIN_ALPHA + (EDGE_MAX_ALPHA - EDGE_MIN_ALPHA) * alphas
+    widths = 0.0013 + 0.0042 * np.asarray([alpha for _s_flat, _t_flat, _weight, alpha in edges])
     colors = np.zeros((len(edges), 4), dtype=float)
     colors[weights >= 0] = np.array([198 / 255, 40 / 255, 40 / 255, 1.0])
     colors[weights < 0] = np.array([21 / 255, 101 / 255, 192 / 255, 1.0])
@@ -456,10 +458,10 @@ if edges:
         scale_units="xy",
         scale=1,
         color=colors,
-        width=0.0012,
-        headwidth=3.2,
-        headlength=4.0,
-        headaxislength=3.6,
+        width=widths,
+        headwidth=5.2,
+        headlength=7.2,
+        headaxislength=5.8,
         minlength=0.0,
         pivot="tail",
         zorder=1,
