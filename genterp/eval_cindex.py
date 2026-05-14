@@ -495,6 +495,7 @@ def main(argv: list[str] | None = None) -> None:
     print("\n" + "═" * len(header))
     print(header)
     print("─" * len(header))
+    results: dict[str, dict[str, object]] = {}
     for d_idx, name in enumerate(disease_atoms):
         eligible_mask = ~prior_case[:, d_idx]
         n_eligible = int(eligible_mask.sum())
@@ -508,6 +509,18 @@ def main(argv: list[str] | None = None) -> None:
         )
         aid = disease_atoms[name]
         class_size = len(eq_classes.get(aid, []))
+        results[name] = {
+            "atom": aid,
+            "class_size": class_size,
+            "class_codes": eq_classes.get(aid, []),
+            "n_total": len(subjects),
+            "prior_cases": n_prior,
+            "n_eligible": n_eligible,
+            "events": events_observed,
+            "incidence_pct": incidence,
+            "c_index": None if math.isnan(c) else c,
+            "permissible_pairs": n_pairs,
+        }
         c_str = f"{c:.4f}" if not math.isnan(c) else "  nan  "
         print(
             f"  {name:<{name_width}}  {aid:>6}  {class_size:>5}  {n_prior:>7,}  "
@@ -519,6 +532,31 @@ def main(argv: list[str] | None = None) -> None:
     print("           events = incident cases in [landmark, +10y]; inc% = events / eligible;")
     print("           pairs = permissible pairs used in Harrell's C.")
     setup.finish_unit("compute Harrell C-index per disease", f"diseases={len(disease_atoms)}")
+
+    # Always dump results to a fixed path so notebooks/plots can pick them up
+    # without re-running the eval. Per-row arrays go alongside for bootstrap.
+    out_json = runs_dir / "cindex_results.json"
+    out_json.write_text(json.dumps({
+        "run_dir": str(runs_dir),
+        "final_model": str(final),
+        "landmark_age_years": LANDMARK_AGE_DAYS / 365.25,
+        "horizon_years": HORIZON_DAYS / 365.25,
+        "max_gap_years": MAX_GAP_DAYS / 365.25,
+        "n_subjects_eligible": len(subjects),
+        "results": results,
+    }, indent=2))
+    out_npz = runs_dir / "cindex_arrays.npz"
+    np.savez_compressed(
+        out_npz,
+        disease_names=np.asarray(list(disease_atoms.keys())),
+        disease_atoms=np.asarray(list(disease_atoms.values()), dtype=np.int64),
+        risks=all_risks,
+        time_to_event=time_to_event,
+        observed=observed,
+        prior_case=prior_case,
+    )
+    print(f"  wrote {out_json}")
+    print(f"  wrote {out_npz}")
 
 
 if __name__ == "__main__":
