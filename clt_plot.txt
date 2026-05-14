@@ -107,6 +107,10 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Subset
 from umap import UMAP
 
+for module_name in list(sys.modules):
+    if module_name == "genterp" or module_name.startswith("genterp."):
+        del sys.modules[module_name]
+
 from genterp.clt_train import load_clt_artifact  # noqa: E402
 from genterp.data import CohortDataset, EventStore, collate  # noqa: E402
 from genterp.train import GenterpForCausalLM, GenterpHFConfig, final_model_path  # noqa: E402
