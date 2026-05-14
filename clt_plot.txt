@@ -50,7 +50,6 @@ except ModuleNotFoundError:
     require("umap", "umap-learn")
     from umap import UMAP
 
-from matplotlib.collections import LineCollection
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
@@ -59,7 +58,8 @@ ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
 ROOT = Path.home() / "genterp"
 CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
 MAX_LABELS = 28
-MAX_GRAPH_EDGES = 100
+EDGE_MIN_ALPHA = 0.08
+EDGE_ALPHA_GAMMA = 2.5
 RNG_SEED = 7
 EPS = 1e-12
 LAYER_COLORS = np.asarray(
@@ -436,25 +436,20 @@ plt.show()
 edges = []
 for source_layer, target_layer in pairs:
     block = decoder_block(state, pairs, diag_w, source_layer, target_layer)
-    source_score = np.linalg.norm(block, axis=1) * np.log1p(enc_norm[source_layer])
-    target_score = enc_norm[target_layer] * theta_inv[target_layer]
-    source_candidates = top_indices(source_score, min(96, n_features))
-    target_candidates = top_indices(target_score, min(96, n_features))
-    scores = block[source_candidates] @ enc[target_layer, target_candidates].T
-    take = min(MAX_GRAPH_EDGES, scores.size)
-    chosen = np.argpartition(-np.abs(scores).reshape(-1), take - 1)[:take]
-    for item in chosen:
-        i = int(item // scores.shape[1])
-        j = int(item % scores.shape[1])
-        s_feat = int(source_candidates[i])
-        t_feat = int(target_candidates[j])
+    scores = block @ enc[target_layer].T
+    strength = np.abs(scores)
+    max_strength = float(strength.max()) if strength.size else 0.0
+    if max_strength <= EPS:
+        continue
+    opacity = (strength / max_strength) ** EDGE_ALPHA_GAMMA
+    source_features, target_features = np.where(opacity >= EDGE_MIN_ALPHA)
+    for s_feat, t_feat in zip(source_features, target_features, strict=True):
         s_flat = source_layer * n_features + s_feat
         t_flat = target_layer * n_features + t_feat
-        edges.append((s_flat, t_flat, float(scores[i, j])))
-edges = sorted(edges, key=lambda e: abs(e[2]), reverse=True)[:MAX_GRAPH_EDGES]
+        edges.append((s_flat, t_flat, float(scores[s_feat, t_feat]), float(opacity[s_feat, t_feat])))
 
 fig, ax = plt.subplots(figsize=(12, 9), constrained_layout=True)
-ax.scatter(
+graph_sc = ax.scatter(
     node_umap[:, 0],
     node_umap[:, 1],
     c=decoder_color,
@@ -465,13 +460,23 @@ ax.scatter(
     linewidths=0.25,
 )
 if edges:
-    max_edge = max(abs(edge[2]) for edge in edges)
-    segments, colors, widths = [], [], []
-    for s_flat, t_flat, weight in edges:
-        segments.append([node_umap[s_flat], node_umap[t_flat]])
-        colors.append("#c62828" if weight > 0 else "#1565c0")
-        widths.append(0.35 + 3.2 * abs(weight) / max_edge)
-    ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=0.32))
+    for s_flat, t_flat, weight, alpha in sorted(edges, key=lambda e: e[3]):
+        color = "#c62828" if weight > 0 else "#1565c0"
+        ax.annotate(
+            "",
+            xy=node_umap[t_flat],
+            xytext=node_umap[s_flat],
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": color,
+                "alpha": max(EDGE_MIN_ALPHA, min(0.82, alpha)),
+                "lw": 0.25 + 2.4 * alpha,
+                "mutation_scale": 5.0 + 9.0 * alpha,
+                "shrinkA": 5.5,
+                "shrinkB": 5.5,
+            },
+            zorder=1,
+        )
 ax.scatter(
     node_umap[top_nodes[:MAX_LABELS], 0],
     node_umap[top_nodes[:MAX_LABELS], 1],
@@ -481,7 +486,8 @@ ax.scatter(
     linewidths=1.2,
     alpha=0.85,
 )
-ax.set_title("Decoder-mediated CLT feature graph", loc="left")
+fig.colorbar(graph_sc, ax=ax, label="log10 decoder norm")
+ax.set_title(f"Decoder-mediated CLT feature graph ({len(edges):,} visible directional edges)", loc="left")
 ax.set_xlabel("node UMAP1")
 ax.set_ylabel("node UMAP2")
 plt.show()
