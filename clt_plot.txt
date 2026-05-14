@@ -52,7 +52,6 @@ except ModuleNotFoundError:
 
 from matplotlib.collections import LineCollection
 from matplotlib.colors import TwoSlopeNorm
-import matplotlib.patheffects as pe
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 
@@ -218,12 +217,6 @@ def decoder_block(state, pairs, diag_w, source_layer, target_layer):
 
 def node_label(flat, n_features):
     return f"L{int(flat) // n_features}F{int(flat) % n_features}"
-
-
-def label_points(ax, coords, nodes, *, fontsize=8):
-    for flat in nodes:
-        text = ax.text(coords[flat, 0], coords[flat, 1], node_label(flat, n_features), fontsize=fontsize)
-        text.set_path_effects([pe.withStroke(linewidth=3.0, foreground="white", alpha=0.9)])
 
 
 def layer_legend(ax, layers_present):
@@ -406,7 +399,6 @@ ax.scatter(
     linewidths=1.5,
     alpha=0.95,
 )
-label_points(ax, node_pca, top_nodes[:MAX_LABELS])
 ax.set_title(f"PCA of node weights ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
 ax.set_xlabel("PC1")
 ax.set_ylabel("PC2")
@@ -433,7 +425,6 @@ ax.scatter(
     linewidths=1.2,
     alpha=0.8,
 )
-label_points(ax, node_umap, top_nodes[:MAX_LABELS])
 ax.set_title("UMAP of node weights, colored by decoder norm", loc="left")
 ax.set_xlabel("UMAP1")
 ax.set_ylabel("UMAP2")
@@ -490,7 +481,6 @@ ax.scatter(
     linewidths=1.2,
     alpha=0.85,
 )
-label_points(ax, node_umap, top_nodes[:MAX_LABELS])
 ax.set_title("Decoder-mediated CLT feature graph", loc="left")
 ax.set_xlabel("node UMAP1")
 ax.set_ylabel("node UMAP2")
