@@ -152,16 +152,20 @@ class CohortDataset(Dataset):
         return len(self.start)
 
     def atom_counts(self, n_atoms: int) -> np.ndarray:
-        """Distinct atom counts over the materialized split, computed per-chunk.
+        """Atom counts over the materialized subject split.
 
-        Per-chunk ``bincount`` keeps peak memory bounded by one chunk's
-        ``uint32`` buffer rather than concatenating all 1B rows into a single
-        4GB numpy array up front. Result is the same.
+        The events store is shared by train and eval datasets, so counting the
+        raw Arrow chunks would silently include held-out subjects. Count only
+        this dataset's subject windows to keep sampled-mark training matched to
+        the training distribution and avoid train/eval leakage.
         """
         counts = np.zeros(n_atoms, dtype=np.float64)
-        for chunk in self.event_atoms.chunks:
-            chunk_np = np.asarray(chunk)
-            counts += np.bincount(chunk_np, minlength=n_atoms)[:n_atoms]
+        for start, end in zip(self.start, self.end, strict=True):
+            length = int(end) + 1 - int(start)
+            if length <= 0:
+                continue
+            atoms = self.event_atoms.slice(int(start), length).to_numpy(zero_copy_only=False)
+            counts += np.bincount(atoms, minlength=n_atoms)[:n_atoms]
         counts[PAD_ATOM] = 0.0
         if counts.sum() <= 0:
             raise ValueError("events.parquet has no non-PAD atoms")
@@ -201,11 +205,24 @@ class CohortDataset(Dataset):
         }
 
 
-def _pad_atoms(seqs: list[list[int]]) -> torch.Tensor:
-    """Pad per-subject atom sequences. Always emits S >= 1."""
+def _pad_size(size: int, pad_to_multiple_of: int | None) -> int:
+    if pad_to_multiple_of is None:
+        return size
+    if pad_to_multiple_of <= 0:
+        raise ValueError("pad_to_multiple_of must be > 0")
+    return ((size + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+
+
+def _pad_atoms(
+    seqs: list[list[int]],
+    *,
+    pad_to_multiple_of: int | None = None,
+    min_size: int = 1,
+) -> torch.Tensor:
+    """Pad per-subject atom sequences. Always emits S >= min_size."""
     B = len(seqs)
     S = max((len(seq) for seq in seqs), default=0)
-    S = max(S, 1)
+    S = _pad_size(max(S, min_size), pad_to_multiple_of)
     out = torch.full((B, S), PAD_ATOM, dtype=torch.long)
     for i, seq in enumerate(seqs):
         if seq:
@@ -213,10 +230,20 @@ def _pad_atoms(seqs: list[list[int]]) -> torch.Tensor:
     return out
 
 
-def collate(batch: list[dict]) -> dict:
+def collate(batch: list[dict], *, pad_to_multiple_of: int | None = None) -> dict:
     B = len(batch)
-    static_atoms = _pad_atoms([b["static_atoms"] for b in batch])
-    event_atoms = _pad_atoms([b["event_atoms"] for b in batch])
+    static_atoms = _pad_atoms([b["static_atoms"] for b in batch], pad_to_multiple_of=pad_to_multiple_of)
+    # Always reserve at least one trailing pad slot on the event axis so the
+    # censor transition (last real event -> first pad slot) is representable.
+    # Without min_size=max(n_ev)+1, batch_size=1 packs the row exactly to n_ev
+    # and the censor head sees zero tokens (n_censor == 0 every step).
+    event_seqs = [b["event_atoms"] for b in batch]
+    n_ev_max = max((len(seq) for seq in event_seqs), default=0)
+    event_atoms = _pad_atoms(
+        event_seqs,
+        pad_to_multiple_of=pad_to_multiple_of,
+        min_size=n_ev_max + 1,
+    )
     M, T = static_atoms.shape[1], event_atoms.shape[1]
 
     static_pad = torch.ones(B, M, dtype=torch.bool)

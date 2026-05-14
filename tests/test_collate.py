@@ -24,6 +24,14 @@ def test_pad_atoms_always_emits_at_least_one_slot():
     assert atoms[0, 0].item() == 0  # PAD
 
 
+def test_pad_atoms_can_align_to_multiple():
+    atoms = _pad_atoms([[1, 2, 3]], pad_to_multiple_of=8)
+
+    assert atoms.shape == (1, 8)
+    assert atoms[0, :3].tolist() == [1, 2, 3]
+    assert atoms[0, 3:].tolist() == [0, 0, 0, 0, 0]
+
+
 def test_collate_shapes_and_targets():
     batch = [
         {
@@ -45,15 +53,18 @@ def test_collate_shapes_and_targets():
     ]
     out = collate(batch)
 
+    # Event axis pads to max(n_ev)+1 so the censor transition (last real -> first pad)
+    # is always representable. Longest subject has 3 events -> T=4.
     assert out["static_atoms"].shape == (2, 2)
-    assert out["event_ages"].shape == (2, 3)
+    assert out["event_ages"].shape == (2, 4)
     assert out["static_atoms"].tolist() == [[7, 13], [31, 0]]
-    assert out["event_atoms"].tolist() == [[21, 23, 24], [41, 0, 0]]
-    assert out["target_atoms"].tolist() == [[21, 23, 24], [41, 0, 0]]
-    assert torch.allclose(out["event_values"][0], torch.tensor([1.5, torch.nan, -2.0]), equal_nan=True)
+    assert out["event_atoms"].tolist() == [[21, 23, 24, 0], [41, 0, 0, 0]]
+    assert out["target_atoms"].tolist() == [[21, 23, 24, 0], [41, 0, 0, 0]]
+    assert torch.allclose(out["event_values"][0, :3], torch.tensor([1.5, torch.nan, -2.0]), equal_nan=True)
+    assert torch.isnan(out["event_values"][0, 3]).item()
     assert out["event_values"][1, 0].item() == 0.25
     assert torch.isnan(out["event_values"][1, 1:]).all()
-    assert out["event_pad"].tolist() == [[False, False, False], [False, True, True]]
+    assert out["event_pad"].tolist() == [[False, False, False, True], [False, True, True, True]]
     assert out["static_pad"][:, 0].tolist() == [False, False]
     assert out["sex"].tolist() == [1, 0]
     assert out["censor_age"].tolist() == [30000.0, 25000.0]
