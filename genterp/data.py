@@ -164,8 +164,8 @@ class CohortDataset(Dataset):
             length = int(end) + 1 - int(start)
             if length <= 0:
                 continue
-            atoms = self.event_atoms.slice(int(start), length).to_numpy(zero_copy_only=False)
-            times = self.event_times.slice(int(start), length).to_numpy(zero_copy_only=False)
+            atoms = self.event_atoms.slice(int(start), length).to_numpy()
+            times = self.event_times.slice(int(start), length).to_numpy()
             delta_days = (times - float(birth)) / 86400.0
             event_atoms = atoms[(delta_days > 0.5) & (atoms != PAD_ATOM)][-self.max_events :]
             if event_atoms.size:
@@ -183,9 +183,9 @@ class CohortDataset(Dataset):
 
         # ChunkedArray.slice is O(1); .to_numpy() copies only the per-subject
         # window (≈1.7K rows), well below any memory concern.
-        atoms = self.event_atoms.slice(s, length).to_numpy(zero_copy_only=False)
-        times = self.event_times.slice(s, length).to_numpy(zero_copy_only=False)
-        values = self.event_values.slice(s, length).to_numpy(zero_copy_only=False)
+        atoms = self.event_atoms.slice(s, length).to_numpy()
+        times = self.event_times.slice(s, length).to_numpy()
+        values = self.event_values.slice(s, length).to_numpy()
         delta_days = (times - birth) / 86400.0
         real_atom = atoms != PAD_ATOM
 

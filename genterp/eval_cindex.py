@@ -114,7 +114,7 @@ def _build_subject_index(events: EventStore, etl_dir: Path) -> list[SubjectIndex
         if n_rows <= 1:
             skipped_no_history += 1
             continue
-        time_seconds = events.time_seconds.slice(start, n_rows).to_numpy(zero_copy_only=False)
+        time_seconds = events.time_seconds.slice(start, n_rows).to_numpy()
         ages_days = (time_seconds - birth_seconds) / 86400.0
         before = ages_days < LANDMARK_AGE_DAYS
         if not before.any():
@@ -167,9 +167,9 @@ class LandmarkDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         s = self.subjects[idx]
         n_rows = s.end - s.start + 1
-        atoms = self.events.atom.slice(s.start, n_rows).to_numpy(zero_copy_only=False)
-        times = self.events.time_seconds.slice(s.start, n_rows).to_numpy(zero_copy_only=False)
-        values = self.events.value.slice(s.start, n_rows).to_numpy(zero_copy_only=False)
+        atoms = self.events.atom.slice(s.start, n_rows).to_numpy()
+        times = self.events.time_seconds.slice(s.start, n_rows).to_numpy()
+        values = self.events.value.slice(s.start, n_rows).to_numpy()
         delta_days = (times - s.birth_seconds) / 86400.0
         real_atom = atoms != PAD_ATOM
         static_mask = (delta_days <= 0.5) & real_atom
@@ -283,8 +283,8 @@ def _build_outcome_table(
     set_arrays = [np.asarray(sorted(s), dtype=np.int64) for s in atom_sets.values()]
     for i, s in enumerate(subjects):
         n_rows = s.end - s.start + 1
-        atoms = events.atom.slice(s.start, n_rows).to_numpy(zero_copy_only=False)
-        times = events.time_seconds.slice(s.start, n_rows).to_numpy(zero_copy_only=False)
+        atoms = events.atom.slice(s.start, n_rows).to_numpy()
+        times = events.time_seconds.slice(s.start, n_rows).to_numpy()
         ages_days = (times - s.birth_seconds) / 86400.0
         pre_mask = ages_days < LANDMARK_AGE_DAYS
         post_mask = ages_days >= LANDMARK_AGE_DAYS
