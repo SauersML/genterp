@@ -181,12 +181,27 @@ def _bq_job_id_file(
     return _BQ_JOB_CACHE_DIR / f"{key}.txt"
 
 
-def _query_job_result_table_ref(job: bigquery.QueryJob) -> bigquery.TableReference:
-    """Return the anonymous result table reference for a completed query job."""
-    resource = job._properties.get("statistics", {}).get("query", {}).get("destinationTable")
-    if not resource:
-        raise RuntimeError(f"BQ job {job.job_id} did not expose a result destination table")
-    return bigquery.TableReference.from_api_repr(resource)
+def _query_job_result_table_ref(job: bigquery.QueryJob) -> bigquery.TableReference | None:
+    """Return the anonymous result table for a completed query job, or None
+    if BQ didn't materialize one (small/cached/stateless queries sometimes
+    skip the temp table and only expose results inline).
+
+    The official ``job.destination`` property is checked first; if missing,
+    we refresh the job (destination metadata sometimes lags the initial
+    response) and fall back to scraping the raw _properties dict.
+    """
+    if job.destination is not None:
+        return job.destination
+    try:
+        job.reload()
+    except Exception:
+        pass
+    if job.destination is not None:
+        return job.destination
+    resource = (job._properties or {}).get("statistics", {}).get("query", {}).get("destinationTable")
+    if resource:
+        return bigquery.TableReference.from_api_repr(resource)
+    return None
 
 
 def _parse_gs_uri(uri: str) -> tuple[str, str]:
@@ -329,21 +344,26 @@ def _run_aggregation(
     t_done = time.monotonic()
     _log(f"  bq query:   {label} completed in {t_done-t0:.1f}s; downloading via Storage API")
 
-    bqs_client = bigquery_storage.BigQueryReadClient()
-    try:
-        # Read from the anonymous destination via Storage API. `job.result()`
-        # tries to fetch results inline via REST first, which 403s with
-        # "Response too large to return" once the result set exceeds the
-        # REST cap — bypass it.
-        destination = _query_job_result_table_ref(job)
-        row_iter = client.list_rows(destination, selected_fields=job.schema or [])
-        batches = list(row_iter.to_arrow_iterable(bqstorage_client=bqs_client))
-        table = pa.Table.from_batches(batches) if batches else pa.table({})
-    finally:
+    destination = _query_job_result_table_ref(job)
+    if destination is not None:
+        # Large result with a materialized anonymous temp table — read via
+        # Storage API to bypass the REST "Response too large" cap.
+        bqs_client = bigquery_storage.BigQueryReadClient()
         try:
-            bqs_client.transport.close()
-        except Exception:
-            pass
+            row_iter = client.list_rows(destination, selected_fields=job.schema or [])
+            batches = list(row_iter.to_arrow_iterable(bqstorage_client=bqs_client))
+            table = pa.Table.from_batches(batches) if batches else pa.table({})
+        finally:
+            try:
+                bqs_client.transport.close()
+            except Exception:
+                pass
+    else:
+        # Small/cached result — BQ didn't bother with a destination. Fetch
+        # inline; this is safe because no-destination implies small enough
+        # to fit in the REST response.
+        _log(f"  bq inline:  {label} has no destination table; fetching results inline")
+        table = job.to_arrow(create_bqstorage_client=False)
     _log(
         f"  bq done:    {label} rows={table.num_rows:,} download={time.monotonic()-t_done:.1f}s "
         f"total={time.monotonic()-t0:.1f}s"
