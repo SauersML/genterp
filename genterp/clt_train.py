@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import uuid
 from collections.abc import Iterable, Iterator
@@ -31,6 +32,8 @@ CLT_FINAL_POINTER_FILE = "final_clt.json"
 CLT_CONFIG_FILE = "clt_config.json"
 CLT_STATE_FILE = "clt_state.pt"
 CLT_TRAINING_STATE_FILE = "clt_training_state.json"
+CLT_METRICS_FILE = "clt_metrics.jsonl"
+CLT_ARTIFACT_RE = re.compile(r"^(?:checkpoint|final)-(\d+)-[0-9a-f]+$")
 DEFAULT_STEPS = 10_000
 DEFAULT_EVAL_EVERY = 250
 DEFAULT_SAVE_EVERY = 1_000
@@ -290,6 +293,65 @@ def load_clt_artifact(path: str | Path, *, map_location: torch.device | str = "c
     return clt
 
 
+def _clt_artifact_step(path: Path) -> int:
+    match = CLT_ARTIFACT_RE.match(path.name)
+    if match is not None:
+        return int(match.group(1))
+    state_file = path / CLT_TRAINING_STATE_FILE
+    if state_file.is_file():
+        return int(json.loads(state_file.read_text()).get("step", 0))
+    return 0
+
+
+def _valid_clt_artifacts(output_dir: Path) -> list[Path]:
+    if not output_dir.is_dir():
+        return []
+    return [
+        path
+        for path in output_dir.iterdir()
+        if path.is_dir()
+        and CLT_ARTIFACT_RE.match(path.name)
+        and (path / CLT_CONFIG_FILE).is_file()
+        and (path / CLT_STATE_FILE).is_file()
+        and (path / CLT_TRAINING_STATE_FILE).is_file()
+    ]
+
+
+def latest_clt_artifact(output_dir: str | Path) -> Path | None:
+    artifacts = _valid_clt_artifacts(Path(output_dir))
+    if not artifacts:
+        return None
+    return max(artifacts, key=lambda path: (_clt_artifact_step(path), path.stat().st_mtime_ns))
+
+
+def warm_start_clt_from_latest(
+    clt: CrossLayerTranscoder,
+    output_dir: str | Path,
+    *,
+    runtime: TorchRuntime,
+) -> Path | None:
+    artifact = latest_clt_artifact(output_dir)
+    if artifact is None:
+        return None
+    loaded = load_clt_artifact(artifact, map_location=runtime.device)
+    if loaded.cfg != clt.cfg:
+        raise ValueError(
+            f"latest CLT artifact config at {artifact} does not match requested config; "
+            f"artifact={loaded.cfg!r} requested={clt.cfg!r}"
+        )
+    clt.load_state_dict(loaded.state_dict())
+    return artifact
+
+
+def _write_clt_metrics_row(metrics_dir: Path | None, row: dict[str, float | int | str]) -> None:
+    """Append a JSON row to <metrics_dir>/clt_metrics.jsonl. No-op when dir is None."""
+    if metrics_dir is None:
+        return
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    with (metrics_dir / "clt_metrics.jsonl").open("a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
 def train_clt(
     base_model: torch.nn.Module,
     clt: CrossLayerTranscoder,
@@ -299,8 +361,12 @@ def train_clt(
     runtime: TorchRuntime,
     training_cfg: CLTTrainingConfig,
     output_dir: str | Path | None = None,
+    start_step: int = 0,
 ) -> dict[str, float]:
-    logger = ProgressLogger("clt_train", total_units=training_cfg.steps)
+    if start_step < 0:
+        raise ValueError("start_step must be >= 0")
+    target_step = start_step + training_cfg.steps
+    logger = ProgressLogger("clt_train", total_units=target_step)
     torch.manual_seed(training_cfg.seed)
 
     base = unwrap_genterp_model(base_model)
@@ -318,8 +384,9 @@ def train_clt(
     generator.manual_seed(training_cfg.seed)
 
     last_metrics: dict[str, float] = {}
-    step = 0
-    while step < training_cfg.steps:
+    step = start_step
+    metrics_output_dir = Path(output_dir) if output_dir is not None else None
+    while step < target_step:
         had_batch = False
         for batch in train_dataloader:
             had_batch = True
@@ -357,8 +424,9 @@ def train_clt(
                     "n_active": float(metrics["n_active"].detach().float().item()),
                     "grad_norm": float(grad_norm.detach().float().item()),
                 }
-                logger.set_progress(step, training_cfg.steps)
-                if step == 1 or step % training_cfg.log_every == 0 or step == training_cfg.steps:
+                _write_clt_metrics_row(metrics_output_dir, {"kind": "train", "step": step, **last_metrics})
+                logger.set_progress(step, target_step)
+                if step == start_step + 1 or step % training_cfg.log_every == 0 or step == target_step:
                     logger.log(
                         "CLT optimizer step",
                         " ".join(
@@ -382,6 +450,10 @@ def train_clt(
                         max_batches=training_cfg.eval_batches,
                     )
                     last_metrics.update({f"eval_{key}": value for key, value in eval_metrics.items()})
+                    _write_clt_metrics_row(
+                        metrics_output_dir,
+                        {"kind": "eval", "step": step, **{f"eval_{key}": value for key, value in eval_metrics.items()}},
+                    )
                     logger.log(
                         "CLT evaluation",
                         f"eval_loss={eval_metrics['loss']:.5g} eval_recon={eval_metrics['recon']:.5g} "
@@ -399,9 +471,9 @@ def train_clt(
                         final=False,
                     )
 
-                if step >= training_cfg.steps:
+                if step >= target_step:
                     break
-            if step >= training_cfg.steps:
+            if step >= target_step:
                 break
         if not had_batch:
             raise ValueError("training dataloader produced no batches")
@@ -499,17 +571,22 @@ def main(argv: list[str] | None = None) -> None:
         n_features=n_features,
         off_diagonal_rank=off_diagonal_rank,
     )
-    setup.start_unit("initialize CLT", f"features={n_features:,} off_diagonal_rank={off_diagonal_rank}")
-    clt = CrossLayerTranscoder(clt_cfg).to(runtime.device)
-    setup.finish_unit("initialize CLT", f"params={count_parameters(clt):,}")
 
     setup.start_unit("prepare CLT output directory", f"path={output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     setup.finish_unit("prepare CLT output directory", f"path={output_dir}")
 
+    setup.start_unit("initialize CLT", f"features={n_features:,} off_diagonal_rank={off_diagonal_rank}")
+    clt = CrossLayerTranscoder(clt_cfg).to(runtime.device)
+    warm_start_artifact = warm_start_clt_from_latest(clt, output_dir, runtime=runtime)
+    start_step = _clt_artifact_step(warm_start_artifact) if warm_start_artifact is not None else 0
+    warm_start_detail = f" warm_start={warm_start_artifact.name} start_step={start_step:,}" if warm_start_artifact else ""
+    setup.finish_unit("initialize CLT", f"params={count_parameters(clt):,}{warm_start_detail}")
+
     setup.start_unit(
         "train CLT",
-        f"steps={training_cfg.steps:,} activation_batch_tokens={training_cfg.activation_batch_tokens:,}",
+        f"new_steps={training_cfg.steps:,} start_step={start_step:,} target_step={start_step + training_cfg.steps:,} "
+        f"activation_batch_tokens={training_cfg.activation_batch_tokens:,}",
     )
     metrics = train_clt(
         model,
@@ -519,6 +596,7 @@ def main(argv: list[str] | None = None) -> None:
         runtime=runtime,
         training_cfg=training_cfg,
         output_dir=output_dir,
+        start_step=start_step,
     )
     setup.finish_unit(
         "train CLT",
