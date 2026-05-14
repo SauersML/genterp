@@ -65,7 +65,7 @@ log_run "START self-update from git origin/main"
 if [ -z "${GENTERP_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   CURRENT_HEAD="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "[run.sh] current HEAD before update: $CURRENT_HEAD" >&2
-  if ! git -C "$SCRIPT_DIR" fetch --quiet origin main; then
+  if ! git -C "$SCRIPT_DIR" fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main'; then
     echo "[run.sh] FATAL: git fetch origin main failed — refusing to continue with stale code" >&2
     exit 1
   fi
