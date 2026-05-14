@@ -379,7 +379,14 @@ def _run_aggregation(
 
     bqs_client = bigquery_storage.BigQueryReadClient()
     try:
-        batches = list(job.result().to_arrow_iterable(bqstorage_client=bqs_client))
+        # Read from the anonymous destination via Storage API. `job.result()`
+        # tries to fetch results inline via REST first, which 403s with
+        # "Response too large to return" once the result set exceeds the
+        # REST cap — bypass it.
+        destination = job.destination
+        if destination is None:
+            raise RuntimeError(f"BQ job {job.job_id} has no destination — cannot stream results")
+        batches = list(client.list_rows(destination).to_arrow_iterable(bqstorage_client=bqs_client))
         table = pa.Table.from_batches(batches) if batches else pa.table({})
     finally:
         try:
@@ -399,6 +406,20 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
     Uses the BigQuery Storage API (gRPC + parallel streams) — typically 20–50×
     faster than REST pagination for large results. Never materializes the full
     Arrow table in process memory.
+
+    We use BigQuery's *anonymous* temp destination (auto-created per job) rather
+    than an explicit destination table for two reasons:
+
+      1. AoU workspace service accounts don't have ``bigquery.datasets.create``
+         on the workspace project, so creating a scratch dataset fails 403.
+      2. The "Response too large" error that motivated trying explicit
+         destinations only fires on the REST result-pagination path
+         (``job.result()`` polling). Reading the anonymous temp table via
+         the Storage API has no such size cap.
+
+    Polling waits via ``job.done() + job.reload()`` (no inline result fetch),
+    then we read ``job.destination`` (the anonymous temp) through Storage API.
+    Anonymous temps live ~24h, so the job-id cache reuses them on resume.
     """
     if out_path.exists():
         _log(f"cache hit:  {out_path.name} ({out_path.stat().st_size/1e9:.2f}GB)")
@@ -410,10 +431,12 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
         tmp.unlink()
 
     t0 = time.monotonic()
-    destination = _bq_destination_table_ref(client, sql, label)
-    job = _submit_or_reuse_job(client, sql, label, destination=destination)
+    job = _submit_or_reuse_job(client, sql, label)
     _wait_with_progress(job, label)
-    _set_bq_table_expiration(client, destination)
+    # job.destination is the anonymous temp BQ created for this query.
+    destination = job.destination
+    if destination is None:
+        raise RuntimeError(f"BQ job {job.job_id} has no destination — cannot stream results")
 
     bqs_client = bigquery_storage.BigQueryReadClient()
     try:
