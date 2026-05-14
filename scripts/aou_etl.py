@@ -478,6 +478,29 @@ def _sink_parquet(lf: pl.LazyFrame, path: Path, label: str) -> None:
     _log(f"sunk:       {path.name} ({path.stat().st_size/1e9:.2f}GB) in {time.monotonic() - t0:.1f}s")
 
 
+def _sweep_stale_tmp(cache_dir: Path) -> None:
+    """Delete ``*.tmp`` artifacts from previously crashed runs.
+
+    The atomic-write pattern is ``write_path.with_suffix(.tmp)`` then ``rename``.
+    If a process dies between the two, the .tmp survives — wasting disk and
+    confusing the cache banner ("HIT events-…parquet.tmp 1.30GB"). At startup,
+    no .tmp file is ever load-bearing, so they're always safe to remove.
+    """
+    if not cache_dir.exists():
+        return
+    swept = 0
+    bytes_freed = 0
+    for tmp in cache_dir.rglob("*.tmp"):
+        try:
+            bytes_freed += tmp.stat().st_size
+            tmp.unlink()
+            swept += 1
+        except OSError:
+            continue
+    if swept:
+        _log(f"swept {swept} stale .tmp file(s) from {cache_dir.name}, freed {bytes_freed/1e9:.2f}GB")
+
+
 def _summarize_cache_state(out_dir: Path, cache_dir: Path) -> None:
     """Print a single block of HIT/MISS status for every artifact this run will produce.
 
@@ -1088,6 +1111,7 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"cache_dir={cache_dir}")
     if TINY:
         _log(f"--tiny active: sampling 1/{TINY_PERSON_MOD} of person_ids end-to-end")
+    _sweep_stale_tmp(cache_dir)
     _summarize_cache_state(out_dir, cache_dir)
     _WORK.finish_unit("validate AoU CDR configuration", f"out_dir={out_dir} cache_dir={cache_dir}")
     client_instance: bigquery.Client | None = None

@@ -18,12 +18,22 @@ PAD_ATOM = 0
 
 @dataclass
 class AtomVocab:
-    """MEDS-style 'VOCAB/CODE' string -> atom index. Index 0 reserved for PAD."""
+    """MEDS-style 'VOCAB/CODE' string -> atom index. Index 0 reserved for PAD.
+
+    After vocabulary collapse, many distinct codes map to the same atom (an
+    ancestor concept covering its descendants). ``len(self)`` must return the
+    number of distinct *atoms* (i.e. ``max_atom_id + 1``), not the number of
+    codes — that's what the model's embedding/output tables are sized against.
+    Pre-fix the model was being allocated at ``len(code_to_atom) + 1`` slots,
+    ~4× the actual vocab and a giant chunk of wasted parameters/optimizer state.
+    """
 
     code_to_atom: dict[str, int]
 
     def __len__(self) -> int:
-        return len(self.code_to_atom) + 1
+        if not self.code_to_atom:
+            return 1  # PAD only
+        return max(self.code_to_atom.values()) + 1
 
     def encode(self, code: str) -> int:
         return self.code_to_atom.get(code, PAD_ATOM)
@@ -49,11 +59,20 @@ class CohortDataset(Dataset):
         events = pq.read_table(events_path, columns=["time_seconds", "atom", "value"], memory_map=True)
         logger.finish_unit("read events parquet", f"rows={events.num_rows:,}")
 
-        logger.start_unit("materialize event columns", "combining Arrow chunks into numpy columns")
-        self.event_times = events.column("time_seconds").combine_chunks().to_numpy(zero_copy_only=False)
-        self.event_atoms = events.column("atom").combine_chunks().to_numpy(zero_copy_only=True)
-        self.event_values = events.column("value").combine_chunks().to_numpy(zero_copy_only=False)
-        logger.finish_unit("materialize event columns", f"atoms={len(self.event_atoms):,} values={len(self.event_values):,}")
+        logger.start_unit(
+            "register event columns",
+            "keeping Arrow ChunkedArrays mmap-backed; per-subject slices land in numpy on demand",
+        )
+        # ``combine_chunks().to_numpy()`` allocates a single contiguous buffer per
+        # column — for 1B rows × 3 columns × ~8 bytes that's ~24GB of copy on
+        # top of the mmap, which OOMs the box. Keep the ChunkedArrays as-is:
+        # ``.slice(offset, length)`` is O(1) and ``.to_numpy()`` on the small
+        # per-subject slice (≈1.7K rows) materializes only what __getitem__
+        # actually needs.
+        self.event_times = events.column("time_seconds")
+        self.event_atoms = events.column("atom")
+        self.event_values = events.column("value")
+        logger.finish_unit("register event columns", f"rows={events.num_rows:,} chunks={self.event_atoms.num_chunks}")
 
         logger.start_unit("read subjects parquet", f"path={data_dir / 'subjects.parquet'}")
         subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
@@ -89,20 +108,32 @@ class CohortDataset(Dataset):
         return len(self.start)
 
     def atom_counts(self, n_atoms: int) -> np.ndarray:
-        counts = np.bincount(np.asarray(self.event_atoms), minlength=n_atoms)[:n_atoms].astype(np.float32, copy=False)
+        """Distinct atom counts over the materialized split, computed per-chunk.
+
+        Per-chunk ``bincount`` keeps peak memory bounded by one chunk's
+        ``uint32`` buffer rather than concatenating all 1B rows into a single
+        4GB numpy array up front. Result is the same.
+        """
+        counts = np.zeros(n_atoms, dtype=np.float64)
+        for chunk in self.event_atoms.chunks:
+            chunk_np = np.asarray(chunk)
+            counts += np.bincount(chunk_np, minlength=n_atoms)[:n_atoms]
         counts[PAD_ATOM] = 0.0
         if counts.sum() <= 0:
             raise ValueError("events.parquet has no non-PAD atoms")
-        return counts
+        return counts.astype(np.float32, copy=False)
 
     def __getitem__(self, idx: int) -> dict:
         s, e = int(self.start[idx]), int(self.end[idx])
-        stop = e + 1
+        length = e + 1 - s
         birth = float(self.birth_seconds[idx])
         max_events = self.max_events
 
-        atoms = np.asarray(self.event_atoms[s:stop])
-        times = np.asarray(self.event_times[s:stop])
+        # ChunkedArray.slice is O(1); .to_numpy() copies only the per-subject
+        # window (≈1.7K rows), well below any memory concern.
+        atoms = self.event_atoms.slice(s, length).to_numpy(zero_copy_only=False)
+        times = self.event_times.slice(s, length).to_numpy(zero_copy_only=False)
+        values = self.event_values.slice(s, length).to_numpy(zero_copy_only=False)
         delta_days = (times - birth) / 86400.0
         real_atom = atoms != PAD_ATOM
 
@@ -112,7 +143,7 @@ class CohortDataset(Dataset):
         static_atoms_arr = atoms[static_idx]
         event_atoms_arr = atoms[event_idx]
         event_ages_arr = delta_days[event_idx]
-        event_values_arr = np.asarray(self.event_values[s + event_idx])
+        event_values_arr = values[event_idx]
 
         censor_age_days = (float(self.censor_seconds[idx]) - birth) / 86400.0
         return {
