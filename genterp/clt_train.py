@@ -16,10 +16,15 @@ import torch
 from torch.utils.data import DataLoader
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
-from genterp.data import CohortDataset, collate
+from genterp.data import CohortDataset, EventStore, collate
 from genterp.progress import ProgressLogger, count_parameters
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
-from genterp.train import GenterpForCausalLM, atomic_write_json, final_model_path, tensor_core_padding_multiple
+from genterp.train import (
+    GenterpForCausalLM,
+    atomic_write_json,
+    final_model_path,
+    tensor_core_padding_multiple,
+)
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts, unwrap_genterp_model
 
 CLT_FINAL_POINTER_FILE = "final_clt.json"
@@ -41,6 +46,7 @@ class CLTTrainingConfig:
     subject_batch_size: int = 1
     eval_every: int = DEFAULT_EVAL_EVERY
     save_every: int = DEFAULT_SAVE_EVERY
+    log_every: int = 10
     eval_batches: int = 8
     max_events: int = 4096
     seed: int = 0
@@ -62,6 +68,8 @@ class CLTTrainingConfig:
             raise ValueError("eval_every must be > 0")
         if self.save_every <= 0:
             raise ValueError("save_every must be > 0")
+        if self.log_every <= 0:
+            raise ValueError("log_every must be > 0")
         if self.eval_batches <= 0:
             raise ValueError("eval_batches must be > 0")
         if self.max_events <= 0:
@@ -144,6 +152,32 @@ def build_clt_dataloader(
     if workers > 0:
         kwargs["prefetch_factor"] = runtime.dataloader_prefetch_factor
     return DataLoader(dataset, **kwargs)
+
+
+def _clt_optimizer_param_groups(
+    clt: CrossLayerTranscoder,
+    *,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for name, param in clt.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name == "log_threshold" or name.endswith("_bias") or param.ndim < 2:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def _grad_scaler(runtime: TorchRuntime) -> torch.amp.GradScaler | None:
+    if runtime.device.type == "cuda" and runtime.fp16:
+        return torch.amp.GradScaler("cuda")
+    return None
 
 
 @torch.no_grad()
@@ -276,10 +310,10 @@ def train_clt(
 
     clt.train()
     opt = torch.optim.AdamW(
-        clt.parameters(),
+        _clt_optimizer_param_groups(clt, weight_decay=training_cfg.weight_decay),
         lr=training_cfg.learning_rate,
-        weight_decay=training_cfg.weight_decay,
     )
+    scaler = _grad_scaler(runtime)
     generator = torch.Generator()
     generator.manual_seed(training_cfg.seed)
 
@@ -304,9 +338,17 @@ def train_clt(
                 opt.zero_grad(set_to_none=True)
                 with _autocast_context(runtime):
                     metrics = clt.loss(pre_chunk, target_chunk)
-                metrics["loss"].backward()
+                if scaler is None:
+                    metrics["loss"].backward()
+                else:
+                    scaler.scale(metrics["loss"]).backward()
+                    scaler.unscale_(opt)
                 grad_norm = torch.nn.utils.clip_grad_norm_(clt.parameters(), training_cfg.grad_clip_norm)
-                opt.step()
+                if scaler is None:
+                    opt.step()
+                else:
+                    scaler.step(opt)
+                    scaler.update()
 
                 last_metrics = {
                     "loss": float(metrics["loss"].detach().float().item()),
@@ -316,18 +358,19 @@ def train_clt(
                     "grad_norm": float(grad_norm.detach().float().item()),
                 }
                 logger.set_progress(step, training_cfg.steps)
-                logger.log(
-                    "CLT optimizer step",
-                    " ".join(
-                        [
-                            f"loss={last_metrics['loss']:.5g}",
-                            f"recon={last_metrics['recon']:.5g}",
-                            f"sparsity={last_metrics['sparsity']:.5g}",
-                            f"n_active={last_metrics['n_active']:.2f}",
-                            f"grad_norm={last_metrics['grad_norm']:.3g}",
-                        ]
-                    ),
-                )
+                if step == 1 or step % training_cfg.log_every == 0 or step == training_cfg.steps:
+                    logger.log(
+                        "CLT optimizer step",
+                        " ".join(
+                            [
+                                f"loss={last_metrics['loss']:.5g}",
+                                f"recon={last_metrics['recon']:.5g}",
+                                f"sparsity={last_metrics['sparsity']:.5g}",
+                                f"n_active={last_metrics['n_active']:.2f}",
+                                f"grad_norm={last_metrics['grad_norm']:.3g}",
+                            ]
+                        ),
+                    )
 
                 if eval_dataloader is not None and step % training_cfg.eval_every == 0:
                     eval_metrics = evaluate_clt(
@@ -430,8 +473,9 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     setup.start_unit("build CLT datasets", f"data_dir={data_dir}")
-    train_dataset = CohortDataset(data_dir, split="train")
-    eval_dataset = CohortDataset(data_dir, split="test")
+    event_store = EventStore.from_parquet(data_dir / "events.parquet")
+    train_dataset = CohortDataset(data_dir, split="train", events=event_store)
+    eval_dataset = CohortDataset(data_dir, split="test", events=event_store)
     setup.finish_unit("build CLT datasets", f"train={len(train_dataset):,} eval={len(eval_dataset):,}")
 
     subject_batch_size = runtime.per_device_train_batch_size

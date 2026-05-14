@@ -136,8 +136,13 @@ if len(ys):
 if evals:
     ex, ey = steps(evals, "eval_loss"), col(evals, "eval_loss")
     ax.plot(ex, ey, "o-", color="#d62728", lw=1.8, ms=7, mec="white", mew=1.2, label="eval")
-ax.set_title("Loss over time", loc="left")
+ax.set_title("Loss over time (symlog)", loc="left")
 ax.set_xlabel("step"); ax.set_ylabel("loss"); ax.legend(loc="best", ncol=2)
+# symlog: linear in [-1, 1], log outside. Total loss spans roughly [-15, +15]
+# with occasional spikes far above; pure log can't handle the negative values
+# that time_nll routinely produces.
+ax.set_yscale("symlog", linthresh=1.0)
+ax.axhline(0, color="#999", lw=0.5, ls="--", alpha=0.5)
 ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(8))
 
 ax = axes[0, 1]
@@ -148,8 +153,9 @@ for k, c in [("time_nll", "#1b9e77"), ("mark_nll", "#d95f02"),
         ax.plot(xk, yk, color=c, alpha=0.20, lw=0.8)
         ax.plot(xk, ema(yk), color=c, lw=1.8, label=k.replace("_nll", ""))
 ax.axhline(0, color="#999", lw=0.6, ls="--")
-ax.set_title("Component NLLs", loc="left")
+ax.set_title("Component NLLs (symlog)", loc="left")
 ax.set_xlabel("step"); ax.set_ylabel("nll"); ax.legend(loc="best", ncol=2)
+ax.set_yscale("symlog", linthresh=1.0)
 ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(6))
 
 ax = axes[1, 0]
@@ -188,6 +194,34 @@ try:
         atom_to_codes[int(aid)].append(code)
     for aid in atom_to_codes:
         atom_to_codes[aid].sort()
+    # Pick ONE canonical label per atom — that's exactly how the model sees it
+    # (one integer per token). If N source codes collapsed to the same atom we
+    # show one of them; we DO NOT pretend the event row "is" all of them.
+    # Preference: highest-own-count code (the most common variant); fallback
+    # to alphabetically smallest. Load own_counts from cache when present.
+    own_by_code: dict[str, int] = {}
+    cache_glob = list((ETL_DIR / "cache").glob("*"))
+    own_caches = [d for d in cache_glob if ("tiny" in d.name) == is_tiny
+                  and (d / "concept_codes.json").is_file()]
+    if own_caches:
+        _oc_dir = max(own_caches, key=lambda d: d.stat().st_mtime)
+        _cc_pairs = json.loads((_oc_dir / "concept_codes.json").read_text())
+        _cid_to_code = {int(cid): str(code) for cid, code in _cc_pairs}
+        _own_files = sorted(_oc_dir.glob("own_counts-*.json"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        if _own_files:
+            # own_counts cache is a list of [cid, count] pairs (aou_etl.py:_cached_own_counts).
+            for cid, n in json.loads(_own_files[0].read_text()):
+                code = _cid_to_code.get(int(cid))
+                if code:
+                    own_by_code[code] = int(n)
+    atom_canonical: dict[int, tuple[str, int]] = {}  # atom_id -> (canonical_code, n_codes_in_atom)
+    for aid, codes in atom_to_codes.items():
+        if len(codes) == 1:
+            atom_canonical[aid] = (codes[0], 1)
+        else:
+            best = max(codes, key=lambda c: (own_by_code.get(c, 0), -ord(c[0]) if c else 0))
+            atom_canonical[aid] = (best, len(codes))
 
     # Pick the subjects ONCE up front (single RNG draw). RNG_SEED=None pulls from
     # OS entropy so every cell run lands on a fresh subject.
@@ -228,7 +262,13 @@ try:
                     needed_atoms.update(int(a) for a in
                                         e_atom.slice(int(r["start"]),
                                                      int(r["end"]) - int(r["start"]) + 1).to_pylist())
-                needed_codes = {c for a in needed_atoms for c in atom_to_codes.get(a, [])}
+                # Only look up the canonical code per atom — we'll only display that one.
+                needed_codes = {atom_canonical[a][0] for a in needed_atoms if a in atom_canonical}
+                # Synthetic codes look like 'LOINC/45401-7=str:94110' — also resolve
+                # the question half so we can show "Postal code [Location]" in the label.
+                for c in list(needed_codes):
+                    if "=str:" in c:
+                        needed_codes.add(c.partition("=str:")[0])
                 needed_cids = [code_to_cid[c] for c in needed_codes if c in code_to_cid]
                 if needed_cids:
                     print(f"  resolving {len(needed_cids):,} concept names from BigQuery ({cdr})...")
@@ -247,9 +287,27 @@ try:
     except Exception as exc:
         print(f"  (concept-name lookup skipped: {type(exc).__name__}: {exc})")
 
-    def _format_concept(code: str) -> str:
-        name = code_to_name.get(code)
-        return f"{code} = {name}" if name else code
+    def _concept_for_atom(atom_id: int) -> str:
+        """One token = one atom. Returns a single human label for what the model sees.
+
+        Synthetic 'QUESTION_CODE=str:VALUE' codes (postal codes, free-text
+        survey answers — see scripts/aou_etl.py:_observation_string_value_events_sql)
+        are rendered as: 'QUESTION = QuestionName  ⟶ value="..."'.
+        """
+        if atom_id not in atom_canonical:
+            return f"atom={atom_id} (unknown — not in vocab)"
+        canon, n = atom_canonical[atom_id]
+        if "=str:" in canon:
+            question_code, _, value_string = canon.partition("=str:")
+            q_name = code_to_name.get(question_code)
+            head = f"{question_code} = {q_name}" if q_name else question_code
+            label = f'{head}  ⟶ value="{value_string}"'
+        else:
+            name = code_to_name.get(canon)
+            label = f"{canon} = {name}" if name else canon
+        if n > 1:
+            label += f"  (+{n - 1} rare codes collapsed into this atom)"
+        return label
 
     for row in picks:
         s, e = int(row["start"]), int(row["end"])
@@ -283,9 +341,7 @@ try:
             }
             if val is not None and not (isinstance(val, float) and np.isnan(val)):
                 attrs["value"] = f"{float(val):.6g}"
-            codes = atom_to_codes.get(atom_id, [])
-            if codes:
-                attrs["concept"] = " | ".join(_format_concept(c) for c in codes)
+            attrs["concept"] = _concept_for_atom(atom_id)
             ET.SubElement(subject_el, "event", attrs)
         ET.indent(subject_el, space="  ")
         print(ET.tostring(subject_el, encoding="unicode"))

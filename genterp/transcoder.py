@@ -46,8 +46,8 @@ rare-subtle features can survive on their own scale.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 import torch.nn as nn
@@ -62,9 +62,9 @@ class CLTConfig:
     dim: int
     n_features: int
     off_diagonal_rank: int | None = None
-    init_log_threshold: float = -4.6   # ≈ log(0.01)
+    init_log_threshold: float = -2.3   # approx log(0.1)
     jumprelu_bandwidth_frac: float = 0.1
-    sparsity_coef: float = 1e-3
+    sparsity_coef: float = 1e-2
     sparsity_tanh_contribution_scale: float = 1.0
     activation_std_momentum: float = 0.99
     activation_std_eps: float = 1e-6
@@ -123,7 +123,7 @@ def _strict_upper_pairs(n_layers: int) -> tuple[torch.Tensor, torch.Tensor]:
     pairs = [(s, t) for s in range(n_layers) for t in range(s + 1, n_layers)]
     if not pairs:
         return (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
-    s_list, t_list = zip(*pairs)
+    s_list, t_list = zip(*pairs, strict=True)
     return torch.tensor(s_list, dtype=torch.long), torch.tensor(t_list, dtype=torch.long)
 
 
@@ -320,12 +320,12 @@ def top_activating_examples(
         flat = rearrange(masked, "b t l f -> l f (b t)")
         top_values, top_indices = torch.topk(flat, min(k, flat.shape[-1]), dim=-1)
         layer_feature_indices = [
-            (l, f, top_values[l, f], top_indices[l, f])
-            for l in range(clt.cfg.n_layers)
-            for f in range(clt.cfg.n_features)
+            (layer_index, feature_index, top_values[layer_index, feature_index], top_indices[layer_index, feature_index])
+            for layer_index in range(clt.cfg.n_layers)
+            for feature_index in range(clt.cfg.n_features)
         ]
 
-    for l, f, values, indices in layer_feature_indices:
+    for layer_index, feature_index, values, indices in layer_feature_indices:
         for value, flat_index in zip(values.detach().cpu(), indices.detach().cpu(), strict=True):
             activation = float(value.item())
             if not math.isfinite(activation):
@@ -335,8 +335,8 @@ def top_activating_examples(
             start, stop = _event_window(batch, batch_index, token_index, window_radius)
             windows.append(
                 FeatureActivationWindow(
-                    layer=int(l),
-                    feature=int(f),
+                    layer=int(layer_index),
+                    feature=int(feature_index),
                     activation=activation,
                     batch_index=batch_index,
                     token_index=token_index,
