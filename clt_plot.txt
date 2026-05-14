@@ -15,15 +15,34 @@ import sys
 import time
 import importlib.util
 import platform
+import site
 import subprocess
 from pathlib import Path
 
+REPO = Path.home() / "genterp"
+if REPO.is_dir() and str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+def refresh_import_paths():
+    for path in {site.getusersitepackages(), *(site.getsitepackages() if hasattr(site, "getsitepackages") else [])}:
+        if path and path not in sys.path:
+            site.addsitedir(path)
+    importlib.invalidate_caches()
+
 
 def ensure_import(import_name, pip_spec, *pip_args):
+    refresh_import_paths()
     if importlib.util.find_spec(import_name) is not None:
         return
     print(f"installing missing notebook dependency: {pip_spec}")
     subprocess.check_call([sys.executable, "-m", "pip", "install", pip_spec, *pip_args])
+    refresh_import_paths()
+    if importlib.util.find_spec(import_name) is None:
+        raise ModuleNotFoundError(
+            f"installed {pip_spec}, but this running kernel still cannot import {import_name!r}; "
+            "restart the notebook kernel once so Python reloads site-packages"
+        )
 
 
 if importlib.util.find_spec("torch") is None:
@@ -39,7 +58,7 @@ for import_name, pip_spec in [
     ("umap", "umap-learn>=0.5"),
     ("pyarrow", "pyarrow>=15"),
     ("polars", "polars>=1.0"),
-    ("transformers", "transformers>=4.46"),
+    ("transformers", "transformers>=4.46,<5"),
     ("accelerate", "accelerate>=1.0"),
 ]:
     ensure_import(import_name, pip_spec)
@@ -56,10 +75,6 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Subset
 from umap import UMAP
-
-REPO = Path.home() / "genterp"
-if REPO.is_dir() and str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
 
 from genterp.clt_train import load_clt_artifact  # noqa: E402
 from genterp.data import CohortDataset, EventStore, collate  # noqa: E402
