@@ -25,6 +25,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -32,6 +33,7 @@ import polars as pl
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, bigquery_storage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -144,6 +146,8 @@ def _install_crash_diagnostics() -> None:
 
 
 _BQ_JOB_CACHE_DIR: Path | None = None
+_BQ_DESTINATION_DATASET_ID = "genterp_etl_results"
+_BQ_DESTINATION_TABLE_TTL = timedelta(days=7)
 
 
 def _set_bq_job_cache_dir(p: Path) -> None:
@@ -170,12 +174,69 @@ def _bq_param_fingerprint(parameters: Sequence[bigquery.ArrayQueryParameter] | N
     return "\n".join(parts)
 
 
-def _bq_job_id_file(sql: str, parameters: Sequence[bigquery.ArrayQueryParameter] | None = None) -> Path | None:
+def _bq_job_id_file(
+    sql: str,
+    parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
+    result_scope: str = "anonymous",
+) -> Path | None:
     if _BQ_JOB_CACHE_DIR is None:
         return None
-    blob = sql + "\n--params--\n" + _bq_param_fingerprint(parameters)
+    blob = result_scope + "\n--sql--\n" + sql + "\n--params--\n" + _bq_param_fingerprint(parameters)
     key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
     return _BQ_JOB_CACHE_DIR / f"{key}.txt"
+
+
+def _bq_destination_table_ref(
+    client: bigquery.Client,
+    sql: str,
+    label: str,
+    parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
+) -> bigquery.TableReference:
+    safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label).strip("_") or "query"
+    safe_label = safe_label[:64]
+    blob = label + "\n--sql--\n" + sql + "\n--params--\n" + _bq_param_fingerprint(parameters)
+    key = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    dataset_ref = bigquery.DatasetReference(client.project, _BQ_DESTINATION_DATASET_ID)
+    return bigquery.TableReference(dataset_ref, f"{safe_label}_{key}")
+
+
+def _ensure_bq_destination_dataset(client: bigquery.Client, dataset_ref: bigquery.DatasetReference) -> None:
+    try:
+        client.get_dataset(dataset_ref)
+        return
+    except NotFound:
+        pass
+    dataset = bigquery.Dataset(dataset_ref)
+    dataset.location = "US"
+    dataset.default_table_expiration_ms = int(_BQ_DESTINATION_TABLE_TTL.total_seconds() * 1000)
+    client.create_dataset(dataset, exists_ok=True)
+    _log(f"  bq dataset: {dataset_ref.project}.{dataset_ref.dataset_id} ready for large query results")
+
+
+def _bq_table_exists(client: bigquery.Client, table_ref: bigquery.TableReference) -> bool:
+    try:
+        client.get_table(table_ref)
+        return True
+    except NotFound:
+        return False
+
+
+def _destination_job_is_reusable(
+    client: bigquery.Client,
+    job: bigquery.QueryJob,
+    destination: bigquery.TableReference,
+) -> bool:
+    if getattr(job, "destination", None) != destination:
+        return False
+    if job.state == "DONE":
+        return _bq_table_exists(client, destination)
+    return True
+
+
+def _set_bq_table_expiration(client: bigquery.Client, table_ref: bigquery.TableReference) -> None:
+    table = client.get_table(table_ref)
+    table.expires = datetime.now(UTC) + _BQ_DESTINATION_TABLE_TTL
+    client.update_table(table, ["expires"])
 
 
 def _submit_or_reuse_job(
@@ -183,21 +244,45 @@ def _submit_or_reuse_job(
     sql: str,
     label: str,
     parameters: Sequence[bigquery.ArrayQueryParameter] | None = None,
+    destination: bigquery.TableReference | None = None,
 ) -> bigquery.QueryJob:
     """Resume a prior server-side BQ job for this exact SQL+params if still available."""
-    job_id_file = _bq_job_id_file(sql, parameters)
+    result_scope = "anonymous"
+    if destination is not None:
+        result_scope = f"destination:{destination.project}.{destination.dataset_id}.{destination.table_id}"
+    job_id_file = _bq_job_id_file(sql, parameters, result_scope)
     if job_id_file is not None and job_id_file.exists():
         prev_id = job_id_file.read_text().strip()
         try:
             job = client.get_job(prev_id)
-            if job.state == "DONE" and job.error_result is None:
-                _log(f"  bq reuse:   {label} job_id={prev_id} (server-cached result)")
+            reusable = destination is None or _destination_job_is_reusable(client, job, destination)
+            if job.error_result is None and reusable:
+                if destination is None:
+                    _log(f"  bq reuse:   {label} job_id={prev_id} (server-cached result)")
+                else:
+                    _log(
+                        f"  bq reuse:   {label} job_id={prev_id} "
+                        f"destination={destination.project}.{destination.dataset_id}.{destination.table_id}"
+                    )
                 return job
             _log(f"  bq prior:   {label} state={job.state}; resubmitting")
         except Exception as exc:
             _log(f"  bq prior:   {label} lookup failed ({exc.__class__.__name__}); resubmitting")
     _log(f"  bq submit:  {label}")
-    job_config = bigquery.QueryJobConfig(query_parameters=list(parameters or [])) if parameters else None
+    job_config = None
+    if parameters or destination is not None:
+        if destination is not None:
+            _ensure_bq_destination_dataset(
+                client,
+                bigquery.DatasetReference(destination.project, destination.dataset_id),
+            )
+            job_config = bigquery.QueryJobConfig(
+                destination=destination,
+                query_parameters=list(parameters or []),
+                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            )
+        else:
+            job_config = bigquery.QueryJobConfig(query_parameters=list(parameters or []))
     job = client.query(sql, job_config=job_config) if job_config is not None else client.query(sql)
     if job_id_file is not None:
         job_id_file.write_text(job.job_id or "")
@@ -325,11 +410,14 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
         tmp.unlink()
 
     t0 = time.monotonic()
-    job = _submit_or_reuse_job(client, sql, label)
+    destination = _bq_destination_table_ref(client, sql, label)
+    job = _submit_or_reuse_job(client, sql, label, destination=destination)
+    _wait_with_progress(job, label)
+    _set_bq_table_expiration(client, destination)
 
     bqs_client = bigquery_storage.BigQueryReadClient()
     try:
-        iterable = job.result().to_arrow_iterable(bqstorage_client=bqs_client)
+        iterable = client.list_rows(destination).to_arrow_iterable(bqstorage_client=bqs_client)
         writer: pq.ParquetWriter | None = None
         rows = 0
         batches = 0
