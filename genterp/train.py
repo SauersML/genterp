@@ -135,6 +135,39 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         ld = self.model.loss(**batch)
         return transformers.modeling_outputs.CausalLMOutput(loss=ld["loss"], logits=ld["loss"].detach().reshape(1))
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Drop shape-mismatched keys so vocab/dim changes don't crash resume.
+
+        When the ETL vocab grows (e.g. survey answers added => n_atoms jumps
+        from 11k to 27k), the vocab-shaped params can't be copied. HF Trainer
+        passes strict=False but that only ignores MISSING keys, not size
+        mismatches. We filter those out here, log what got dropped, and let
+        the affected tensors keep their fresh-init values. Everything that
+        still fits (attention, MLP, RMSNorm, ...) loads normally so we keep
+        as much trained signal as possible.
+        """
+        own = super().state_dict()
+        dropped: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+        filtered: dict[str, torch.Tensor] = {}
+        for k, v in state_dict.items():
+            if k in own and tuple(own[k].shape) != tuple(v.shape):
+                dropped.append((k, tuple(v.shape), tuple(own[k].shape)))
+                continue
+            filtered[k] = v
+        if dropped:
+            preview = ", ".join(f"{k} ckpt{c}→cur{o}" for k, c, o in dropped[:5])
+            if len(dropped) > 5:
+                preview += f", +{len(dropped) - 5} more"
+            print(
+                f"[warm-start] dropping {len(dropped)} shape-mismatched param(s); "
+                f"they will reinitialize: {preview}"
+            )
+        return super().load_state_dict(
+            filtered,
+            strict=False if dropped else strict,
+            assign=assign,
+        )
+
 
 class RuntimeStateCallback(transformers.TrainerCallback):
     def __init__(self, runtime: TorchRuntime):
@@ -557,6 +590,26 @@ def checkpoint_matches_runtime(path: str | Path, runtime: TorchRuntime) -> bool:
     return checkpoint_runtime_state(path) == runtime_state(runtime)
 
 
+def checkpoint_n_atoms(path: str | Path) -> int | None:
+    """Read n_atoms from a saved checkpoint's config.json. None if unreadable.
+
+    Used to detect when the ETL vocab has grown/shrunk between runs; a mismatch
+    forces optimizer-state reset (the optimizer's per-parameter moments are
+    sized to the old vocab and would be garbage for the new one) even though
+    the partial state-dict load itself succeeds via the warm-start filter in
+    GenterpForCausalLM.load_state_dict.
+    """
+    cfg_path = Path(path) / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        n = cfg.get("genterp_cfg", {}).get("n_atoms")
+        return int(n) if n is not None else None
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
 def atomic_write_json(path: str | Path, data: dict[str, object]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,23 +835,34 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("inspect checkpoints", f"output_dir={output_dir}")
     resume_checkpoint = latest_checkpoint(output_dir)
-    reset_training_state = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
+    hardware_changed = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
+    ckpt_n_atoms = checkpoint_n_atoms(resume_checkpoint) if resume_checkpoint else None
+    vocab_changed = ckpt_n_atoms is not None and ckpt_n_atoms != cfg.n_atoms
+    # Any shape-axis change in the model invalidates the optimizer state (Adam
+    # moments are per-parameter and per-shape). Force a state reset so we
+    # rebuild fresh moments around the partially-loaded weights.
+    reset_training_state = bool(resume_checkpoint and (hardware_changed or vocab_changed))
     warm_start_path = final_model_path(output_dir) if resume_checkpoint is None else None
     setup.finish_unit(
         "inspect checkpoints",
         f"resume_checkpoint={resume_checkpoint} warm_start_path={warm_start_path} "
-        f"reset_training_state={reset_training_state}",
+        f"reset_training_state={reset_training_state} hardware_changed={hardware_changed} "
+        f"vocab_changed={vocab_changed} (ckpt_n_atoms={ckpt_n_atoms} cur_n_atoms={cfg.n_atoms})",
     )
 
     setup.start_unit("load or initialize model", "preferring resume checkpoint, then previous final model, then fresh init")
     if warm_start_path is not None:
-        model = GenterpForCausalLM.from_pretrained(warm_start_path)
+        # ignore_mismatched_sizes lets transformers fall through vocab-shaped
+        # tensors (embedding / mark_out / value_mod buffers) that don't match;
+        # they keep their fresh init while everything else loads.
+        model = GenterpForCausalLM.from_pretrained(warm_start_path, ignore_mismatched_sizes=True)
         model_source = f"warm_start={warm_start_path}"
     else:
         model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))
         model_source = "fresh_init" if resume_checkpoint is None else f"resume_weights_from={resume_checkpoint}"
     if reset_training_state:
-        print("genterp train hardware profile changed; resuming model weights and rebuilding optimizer state")
+        reason = "hardware profile changed" if hardware_changed else f"vocab changed ({ckpt_n_atoms} → {cfg.n_atoms} atoms)"
+        print(f"genterp train {reason}; resuming model weights (partial) and rebuilding optimizer state")
     setup.finish_unit("load or initialize model", f"{model_source} params={count_parameters(model):,}")
 
     setup.start_unit("configure mark negative sampler", "frequency-weighted atom negatives from training events")

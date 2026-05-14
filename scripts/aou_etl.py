@@ -403,7 +403,7 @@ NON_DRUG_TABLES = [
 def _cache_key(cdr: str) -> str:
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
     suffix = f"_tiny{TINY_PERSON_MOD}x" if TINY else ""
-    return f"{key}_threshold-{THRESHOLD}_values-v3{suffix}"
+    return f"{key}_threshold-{THRESHOLD}_values-v4{suffix}"
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -525,6 +525,7 @@ def _summarize_cache_state(out_dir: Path, cache_dir: Path) -> None:
     # Match keyed paths by stable prefix — keys aren't known until later steps run.
     keyed_prefixes = [
         "own_counts-",
+        "string_value_counts-",
         "coverage_and_ancestors-",
         "collapsed_vocab-",
         "value_stats-",
@@ -656,6 +657,61 @@ def _measurement_events_sql(cdr: str) -> str:
     """
 
 
+def _observation_string_value_events_sql(cdr: str) -> str:
+    """Emit synthetic events for observations whose answer is a value_as_string.
+
+    AoU stores Zip3 / postal-region answers, free-text/other-specify responses,
+    and similar string-valued observations in `value_as_string` — they have no
+    value_as_concept_id, no value_as_number, and the question's own concept_id
+    captures only "this field was filled in", not what was filled in.
+
+    Each such observation contributes a synthesized code of the form
+
+        VOCAB/CODE=str:<value_as_string>
+
+    where VOCAB/CODE is the question concept. The cid column is NULL because
+    there is no OMOP concept for the (question, answer) pair. Downstream vocab
+    collapse cannot find ancestors for these synthetic codes (they're not in
+    `concept_ancestor`), so they only survive collapse if their own subject
+    count clears the threshold — at AoU scale, Zip3 buckets and frequently-
+    chosen "other" responses do. Rare strings get dropped.
+    """
+    return f"""
+    SELECT
+      CAST(o.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(o.observation_datetime) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', o.value_as_string) AS code,
+      CAST(NULL AS INT64) AS cid,
+      CAST(NULL AS FLOAT64) AS value
+    FROM `{cdr}.observation` o
+    JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
+    WHERE o.observation_concept_id > 0
+      AND o.observation_datetime IS NOT NULL
+      AND o.value_as_string IS NOT NULL
+      AND o.value_as_string != ''{_tiny_predicate("o.person_id")}
+    """
+
+
+def _observation_string_value_counts_sql(cdr: str) -> str:
+    """Distinct-subject counts for each synthetic (question, value_as_string) code.
+
+    Mirrors `_own_counts_sql` for cid-based concepts but operates on the
+    synthesized code strings. Used to feed `collapse_vocabulary` so the
+    threshold cut is applied consistently with the rest of the vocab.
+    """
+    return f"""
+    SELECT
+      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', o.value_as_string) AS code,
+      COUNT(DISTINCT o.person_id) AS n
+    FROM `{cdr}.observation` o
+    JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
+    WHERE o.observation_concept_id > 0
+      AND o.value_as_string IS NOT NULL
+      AND o.value_as_string != ''{_tiny_predicate("o.person_id")}
+    GROUP BY code
+    """
+
+
 def _observation_events_sql(cdr: str) -> str:
     """Emit one row per observation token actually present in OMOP:
 
@@ -711,6 +767,7 @@ def _all_events_sql(cdr: str) -> str:
       UNION ALL ({_drug_events_sql(cdr)})
       UNION ALL ({_measurement_events_sql(cdr)})
       UNION ALL ({_observation_events_sql(cdr)})
+      UNION ALL ({_observation_string_value_events_sql(cdr)})
     )
     SELECT subject_id, time_seconds, code, cid, value
     FROM events
@@ -916,6 +973,30 @@ def _cached_own_counts(
 
     payload = _cache_json(cache_dir / f"own_counts-{source_key}.json", build)
     return {int(cid): int(n) for cid, n in payload}
+
+
+def _cached_string_value_counts(
+    client: bigquery.Client,
+    cdr: str,
+    cache_dir: Path,
+    source_key: str,
+) -> dict[str, int]:
+    """Distinct-subject counts for synthetic `VOCAB/CODE=str:VALUE` codes.
+
+    Cached alongside own_counts (keyed by source_key so it busts whenever the
+    upstream BQ pull changes). Returns a {code_string: n_subjects} map merged
+    into own_by_code before vocab collapse.
+    """
+    def build() -> list[list[object]]:
+        table = _run_aggregation(
+            client, _observation_string_value_counts_sql(cdr), "observation_string_value_counts"
+        )
+        codes = table.column("code").to_pylist()
+        ns = table.column("n").to_pylist()
+        return [[str(code), int(n)] for code, n in zip(codes, ns, strict=True) if code]
+
+    payload = _cache_json(cache_dir / f"string_value_counts-{source_key}.json", build)
+    return {str(code): int(n) for code, n in payload}
 
 
 def _duckdb_connection(cache_dir: Path, label: str) -> duckdb.DuckDBPyConnection:
@@ -1198,7 +1279,14 @@ def main(argv: list[str] | None = None) -> None:
         "COUNT(DISTINCT person_id) GROUP BY cid at BigQuery — local polars n_unique on 1B rows OOM'd",
     )
     own_by_cid = _cached_own_counts(client(), cdr, cache_dir, source_key)
-    _WORK.finish_unit("count distinct subjects per source concept", f"unique concept_ids={len(own_by_cid):,}")
+    # Synthetic codes built from (question_concept, value_as_string) — no cid,
+    # so they need their own subject count and live alongside own_by_cid in the
+    # code-string keyed view used by collapse_vocabulary below.
+    string_value_counts = _cached_string_value_counts(client(), cdr, cache_dir, source_key)
+    _WORK.finish_unit(
+        "count distinct subjects per source concept",
+        f"unique concept_ids={len(own_by_cid):,} string_value_codes={len(string_value_counts):,}",
+    )
 
     _WORK.start_unit("collapse vocabulary", f"threshold={THRESHOLD:,}; resolving ancestors and concept codes if cache is cold")
     vocab_cache = cache_dir / f"collapsed_vocab-{source_key}.json"
@@ -1214,6 +1302,11 @@ def main(argv: list[str] | None = None) -> None:
         _log(f"resolving OMOP concept codes: own={len(own_by_cid):,} coverage={len(cov):,} ancestor_ids={len(all_ids):,}")
         code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
         own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
+        # Synthetic string-value codes get added with no coverage/ancestors —
+        # collapse_vocabulary treats them as standalone (ancestors.get(c, {})
+        # returns empty, so they survive iff own_count >= threshold).
+        for code, n in string_value_counts.items():
+            own_by_code[code] = own_by_code.get(code, 0) + int(n)
         cov_by_code = {code_of[c]: n for c, n in cov.items() if c in code_of}
         anc_by_code = {
             code_of[d]: {code_of[a]: h for a, h in ancs.items() if a in code_of}
