@@ -57,7 +57,6 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
 ROOT = Path.home() / "genterp"
 CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
-MAX_LABELS = 28
 EDGE_MIN_ALPHA = 0.08
 EDGE_ALPHA_GAMMA = 2.5
 RNG_SEED = 7
@@ -269,8 +268,6 @@ enc_norm = np.linalg.norm(enc, axis=-1)
 dec_norm = np.linalg.norm(diag_w, axis=-1)
 alignment = np.sum(enc * diag_w, axis=-1) / np.maximum(enc_norm * dec_norm, EPS)
 theta_inv = 1.0 / np.sqrt(np.maximum(theta, EPS))
-node_score = dec_norm * np.log1p(enc_norm) * theta_inv
-flat_score = node_score.reshape(-1)
 
 if enc_bias is not None:
     enc_bias_np = enc_bias.float().cpu().numpy()
@@ -285,7 +282,6 @@ node_features = np.column_stack(
         alignment.reshape(-1),
         enc_bias_np.reshape(-1),
         layer_id / max(layers - 1, 1),
-        flat_score,
     ]
 )
 node_pca, pca_var = pca2(node_features)
@@ -330,15 +326,14 @@ for key in ["loss", "recon", "sparsity", "n_active", "grad_norm", "eval_loss", "
         print(f"{key:14s} {latest[key]:>12.6g}")
 print("=" * 96)
 
-print("\ntop CLT nodes")
-print(f"{'rank':>4s} {'node':>8s} {'score':>11s} {'dec_norm':>10s} {'enc_norm':>10s} {'theta':>10s} {'cos':>8s}")
-top_nodes = top_indices(flat_score, min(24, flat_score.size))
-for rank, flat in enumerate(top_nodes, start=1):
+print("\nCLT nodes with largest decoder norm")
+print(f"{'rank':>4s} {'node':>8s} {'dec_norm':>10s} {'enc_norm':>10s} {'theta':>10s} {'cos':>8s}")
+top_decoder_nodes = top_indices(dec_norm.reshape(-1), min(24, dec_norm.size))
+for rank, flat in enumerate(top_decoder_nodes, start=1):
     layer = int(flat // n_features)
     feature = int(flat % n_features)
     print(
-        f"{rank:4d} {node_label(flat, n_features):>8s} "
-        f"{flat_score[flat]:11.4g} {dec_norm[layer, feature]:10.4g} "
+        f"{rank:4d} {node_label(flat, n_features):>8s} {dec_norm[layer, feature]:10.4g} "
         f"{enc_norm[layer, feature]:10.4g} {theta[layer, feature]:10.4g} "
         f"{alignment[layer, feature]:8.3f}"
     )
@@ -373,10 +368,8 @@ plt.show()
 
 
 # 2. Node geometry.
-node_size = 10 + 115 * (flat_score / max(float(flat_score.max()), EPS)) ** 0.65
+node_size = np.full(layers * n_features, 34.0)
 layer_colors = LAYER_COLORS[layer_id % len(LAYER_COLORS)]
-top_halo_size = node_size[top_nodes[:MAX_LABELS]] + 75
-top_halo_color = layer_colors[top_nodes[:MAX_LABELS]]
 fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
 fig.suptitle("CLT node geometry", fontsize=14, fontweight="bold")
 
@@ -389,15 +382,6 @@ ax.scatter(
     alpha=0.58,
     edgecolors="white",
     linewidths=0.35,
-)
-ax.scatter(
-    node_pca[top_nodes[:MAX_LABELS], 0],
-    node_pca[top_nodes[:MAX_LABELS], 1],
-    s=top_halo_size,
-    facecolors="none",
-    edgecolors=top_halo_color,
-    linewidths=1.5,
-    alpha=0.95,
 )
 ax.set_title(f"PCA of node weights ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
 ax.set_xlabel("PC1")
@@ -415,15 +399,6 @@ sc = ax.scatter(
     alpha=0.72,
     edgecolors="white",
     linewidths=0.25,
-)
-ax.scatter(
-    node_umap[top_nodes[:MAX_LABELS], 0],
-    node_umap[top_nodes[:MAX_LABELS], 1],
-    s=top_halo_size,
-    facecolors="none",
-    edgecolors="#111111",
-    linewidths=1.2,
-    alpha=0.8,
 )
 ax.set_title("UMAP of node weights, colored by decoder norm", loc="left")
 ax.set_xlabel("UMAP1")
@@ -477,15 +452,6 @@ if edges:
             },
             zorder=1,
         )
-ax.scatter(
-    node_umap[top_nodes[:MAX_LABELS], 0],
-    node_umap[top_nodes[:MAX_LABELS], 1],
-    s=top_halo_size,
-    facecolors="none",
-    edgecolors="#111111",
-    linewidths=1.2,
-    alpha=0.85,
-)
 fig.colorbar(graph_sc, ax=ax, label="log10 decoder norm")
 ax.set_title(f"Decoder-mediated CLT feature graph ({len(edges):,} visible directional edges)", loc="left")
 ax.set_xlabel("node UMAP1")
@@ -543,19 +509,6 @@ for source_layer in range(layers):
 fig.colorbar(im, ax=ax, label="Frobenius norm")
 plt.show()
 
-
-# 5. Top-node bars.
-bar_nodes = top_nodes[: min(20, len(top_nodes))]
-bar_labels = [node_label(flat, n_features) for flat in bar_nodes]
-fig, ax = plt.subplots(figsize=(13, 6), constrained_layout=True)
-y = np.arange(len(bar_nodes))[::-1]
-colors = plt.cm.tab10(layer_id[bar_nodes] % 10)
-ax.barh(y, flat_score[bar_nodes][::-1], color=colors[::-1], alpha=0.82)
-ax.set_yticks(y)
-ax.set_yticklabels(bar_labels[::-1])
-ax.set_xlabel("node score = decoder_norm * log1p(encoder_norm) / sqrt(theta)")
-ax.set_title("Highest-scoring CLT nodes", loc="left")
-plt.show()
 
 if len(metrics) < 2:
     print("\nNo dense clt_metrics.jsonl time series yet; the trend plot uses saved artifacts only.")
