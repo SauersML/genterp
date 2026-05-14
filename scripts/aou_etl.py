@@ -831,6 +831,11 @@ def _duckdb_connection(cache_dir: Path, label: str) -> duckdb.DuckDBPyConnection
     the process. DuckDB respects ``PRAGMA memory_limit`` honestly: when the working
     set exceeds the cap it writes hash-table partitions / sort runs to ``temp_directory``
     on disk. The same applies to the GROUP BY in value_stats.
+
+    ``preserve_insertion_order=false`` is essential here: with it on, DuckDB keeps
+    extra row-order bookkeeping that roughly doubles sort working memory. We do
+    *not* care about insertion order — every output of these passes is either
+    ungrouped (value_stats) or has its own ORDER BY that defines the output order.
     """
     spill_dir = cache_dir / "duckdb_spill"
     spill_dir.mkdir(parents=True, exist_ok=True)
@@ -840,6 +845,7 @@ def _duckdb_connection(cache_dir: Path, label: str) -> duckdb.DuckDBPyConnection
     cap_gb = max(4, int(available * 0.5 / 1e9))
     con.execute(f"PRAGMA memory_limit='{cap_gb}GB'")
     con.execute(f"PRAGMA temp_directory='{spill_dir.as_posix()}'")
+    con.execute("PRAGMA preserve_insertion_order=false")
     con.execute(f"PRAGMA threads={os.cpu_count() or 4}")
     _log(
         f"duckdb[{label}] opened memory_limit={cap_gb}GB threads={os.cpu_count() or 4} "
@@ -886,37 +892,72 @@ def _cached_value_stats(
     return {str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])} for code, stats in payload.items()}
 
 
+FINAL_EVENTS_SHARDS = 128
+
+
 def _build_final_events_with_duckdb(
     all_events_path: Path,
     atom_idx: dict[str, int],
     final_path: Path,
     cache_dir: Path,
 ) -> None:
-    """Filter + atom-encode + sort to final parquet using DuckDB's external sort.
+    """Filter + atom-encode + sort to final parquet via DuckDB *chunked* external sort.
 
-    Polars' streaming sort silently failed at 1B rows. DuckDB's sort spills sort
-    runs to ``temp_directory`` and merges them back — the canonical out-of-core
-    sort algorithm — so it actually completes regardless of how big the input is
-    relative to RAM. The JOIN against the atom_map (a ~127K-row pyarrow table
-    registered into the DuckDB session) handles filter + code→atom encoding in
-    a single pass.
+    A single global ORDER BY on the full 1B-row input asked DuckDB to spill ~30GB
+    of sort runs to a 24GB temp dir → OutOfMemoryException at "failed to offload
+    data block (24.1GiB/24.1GiB used)". The workspace disk is the limit, not RAM.
+
+    Chunked plan, three passes, each bounded by ``1/FINAL_EVENTS_SHARDS`` of the
+    working set:
+
+      1. ONE scan over ``all_events.parquet`` joining ``atom_map`` and writing
+         a hive-partitioned dataset to disk, partitioned by
+         ``CAST(subject_id % K AS INTEGER)``. No ORDER BY — single linear pass,
+         minimal spill. Output is K parquet directories.
+
+      2. For each shard k = 0..K-1, run an ORDER BY (subject_id, time_seconds)
+         over that shard alone. Each shard holds ~1/K of the data, so sort
+         working set is ~30GB / K — fits in memory at K=128.
+
+      3. Append each sorted shard to the final parquet via a pyarrow
+         ``ParquetWriter``. No sort, no JOIN — streaming row-batch copy.
+
+    Subjects with ``id % K == k`` are *atomically* assigned to shard k, so
+    every subject's events live in exactly one shard. The concatenation order
+    is shard-by-shard (subjects bucketed by ``id % K``, then by id within
+    bucket). Downstream offsets in ``subjects.parquet`` only care that each
+    subject's events are *contiguous* in the file, which this guarantees.
+
+    Cleanup is per-shard: each raw shard is deleted as soon as its sorted
+    counterpart lands; each sorted shard is deleted as soon as it's been
+    appended to the final file. Peak disk is bounded by the raw partition
+    output (Pass 1) plus one shard's worth of sort spill.
     """
     if final_path.exists():
         _log(f"cache hit:  {final_path.name} ({final_path.stat().st_size/1e9:.2f}GB)")
         return
+
+    import shutil
+
+    K = FINAL_EVENTS_SHARDS
+    work_dir = cache_dir / "duckdb_final_work"
+    raw_dir = work_dir / "raw_shards"
+    sorted_dir = work_dir / "sorted_shards"
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    sorted_dir.mkdir(parents=True, exist_ok=True)
+
     con = _duckdb_connection(cache_dir, "final_events")
     try:
         codes = pa.array(list(atom_idx.keys()), type=pa.string())
         atoms = pa.array(list(atom_idx.values()), type=pa.uint32())
         atom_map = pa.table({"code": codes, "atom": atoms})
         con.register("atom_map", atom_map)
-        _log(
-            f"duckdb[final_events] atom_map registered: {len(atom_idx):,} codes; "
-            f"starting filter+encode+sort+sink"
-        )
-        tmp = final_path.with_suffix(final_path.suffix + ".tmp")
-        if tmp.exists():
-            tmp.unlink()
+        _log(f"duckdb[final_events] atom_map registered: {len(atom_idx):,} codes; chunks={K}")
+
+        # Pass 1: single scan + JOIN + partition_by (no sort).
+        _log(f"duckdb[final_events] Pass 1/3: scan + atom-encode + partition into {K} shards")
         t0 = time.monotonic()
         con.execute(
             f"""
@@ -924,17 +965,66 @@ def _build_final_events_with_duckdb(
                 SELECT e.subject_id,
                        e.time_seconds,
                        am.atom AS atom,
-                       e.value
+                       e.value,
+                       CAST(e.subject_id % {K} AS INTEGER) AS shard
                 FROM read_parquet('{all_events_path.as_posix()}') e
                 JOIN atom_map am USING (code)
-                ORDER BY e.subject_id, e.time_seconds
-            ) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            ) TO '{raw_dir.as_posix()}'
+            (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD)
             """
         )
+        _log(f"duckdb[final_events] Pass 1 done in {time.monotonic()-t0:.1f}s")
+
+        # Pass 2 + Pass 3 fused: sort each shard, append to final, drop intermediates.
+        tmp = final_path.with_suffix(final_path.suffix + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        writer: pq.ParquetWriter | None = None
+        total_rows = 0
+        t_phase = time.monotonic()
+        for k in range(K):
+            shard_subdir = raw_dir / f"shard={k}"
+            if not shard_subdir.exists():
+                continue
+            shard_files = sorted(shard_subdir.glob("*.parquet"))
+            if not shard_files:
+                continue
+            sorted_path = sorted_dir / f"sorted_{k:04d}.parquet"
+            shard_list_sql = "[" + ", ".join(f"'{p.as_posix()}'" for p in shard_files) + "]"
+            t_sort = time.monotonic()
+            con.execute(
+                f"""
+                COPY (
+                    SELECT subject_id, time_seconds, atom, value
+                    FROM read_parquet({shard_list_sql})
+                    ORDER BY subject_id, time_seconds
+                ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """
+            )
+            # Append sorted shard rows to the final file.
+            pf = pq.ParquetFile(sorted_path)
+            rows_this_shard = 0
+            for batch in pf.iter_batches(batch_size=1_000_000):
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, batch.schema, compression="zstd")
+                writer.write_batch(batch)
+                rows_this_shard += batch.num_rows
+            total_rows += rows_this_shard
+            shutil.rmtree(shard_subdir, ignore_errors=True)
+            sorted_path.unlink()
+            if (k + 1) % max(1, K // 16) == 0 or k == K - 1:
+                _log(
+                    f"duckdb[final_events] Pass 2-3: shard {k+1}/{K} sorted+appended "
+                    f"(+{rows_this_shard:,} rows, total={total_rows:,}) in {time.monotonic()-t_sort:.1f}s"
+                )
+        if writer is not None:
+            writer.close()
         tmp.replace(final_path)
+        shutil.rmtree(work_dir, ignore_errors=True)
         _log(
-            f"duckdb[final_events] wrote {final_path.name} "
-            f"({final_path.stat().st_size/1e9:.2f}GB) in {time.monotonic()-t0:.1f}s"
+            f"duckdb[final_events] done: {final_path.name} "
+            f"({final_path.stat().st_size/1e9:.2f}GB) rows={total_rows:,} "
+            f"in {time.monotonic()-t_phase:.1f}s (Pass 2-3)"
         )
     finally:
         con.close()
