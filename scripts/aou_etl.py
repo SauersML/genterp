@@ -388,10 +388,13 @@ def split_for_subject(subject_id: int) -> str:
     bucket = int.from_bytes(digest[:8], "big") % 100
     return "test" if bucket < TEST_SPLIT_PERCENT else "train"
 
+# Tables whose only cid-bearing column is the *_concept_id and whose events
+# carry no associated value. Observation is handled separately so we can emit
+# both the question concept (observation_concept_id) AND the answer concept
+# (value_as_concept_id) — see _observation_events_sql below.
 NON_DRUG_TABLES = [
     ("condition_occurrence", "condition_concept_id", "condition_start_datetime"),
     ("procedure_occurrence", "procedure_concept_id", "procedure_datetime"),
-    ("observation", "observation_concept_id", "observation_datetime"),
     ("visit_occurrence", "visit_concept_id", "visit_start_datetime"),
     ("device_exposure", "device_concept_id", "device_exposure_start_datetime"),
 ]
@@ -400,7 +403,7 @@ NON_DRUG_TABLES = [
 def _cache_key(cdr: str) -> str:
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
     suffix = f"_tiny{TINY_PERSON_MOD}x" if TINY else ""
-    return f"{key}_threshold-{THRESHOLD}_values-v2{suffix}"
+    return f"{key}_threshold-{THRESHOLD}_values-v3{suffix}"
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -653,6 +656,44 @@ def _measurement_events_sql(cdr: str) -> str:
     """
 
 
+def _observation_events_sql(cdr: str) -> str:
+    """Emit one row per observation token actually present in OMOP:
+
+      1. The question concept (observation_concept_id) at the encounter time.
+         For numeric surveys we carry value_as_number on this row so the value
+         head sees it like any measurement.
+      2. The categorical answer concept (value_as_concept_id) at the same time,
+         if present. Without this branch the model can see "patient was asked
+         about X" but never "they answered Y" — half the survey signal is lost.
+
+    Both rows go through the same vocab collapse and atom encoding downstream;
+    a row with the same (subject, time, atom) twice — e.g. an observation that
+    coincidentally has answer == question — is deduped by the final-events SQL.
+    """
+    return f"""
+    SELECT
+      CAST(o.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(o.observation_datetime) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
+      o.observation_concept_id AS cid,
+      CAST(o.value_as_number AS FLOAT64) AS value
+    FROM `{cdr}.observation` o
+    JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
+    WHERE o.observation_concept_id > 0 AND o.observation_datetime IS NOT NULL{_tiny_predicate("o.person_id")}
+    UNION ALL
+    SELECT
+      CAST(o.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(o.observation_datetime) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
+      o.value_as_concept_id AS cid,
+      CAST(NULL AS FLOAT64) AS value
+    FROM `{cdr}.observation` o
+    JOIN `{cdr}.concept` c ON c.concept_id = o.value_as_concept_id
+    WHERE o.value_as_concept_id IS NOT NULL AND o.value_as_concept_id > 0
+      AND o.observation_datetime IS NOT NULL{_tiny_predicate("o.person_id")}
+    """
+
+
 def _all_events_sql(cdr: str) -> str:
     """One combined event stream, unsorted.
 
@@ -669,6 +710,7 @@ def _all_events_sql(cdr: str) -> str:
       ({_non_drug_events_sql(cdr)})
       UNION ALL ({_drug_events_sql(cdr)})
       UNION ALL ({_measurement_events_sql(cdr)})
+      UNION ALL ({_observation_events_sql(cdr)})
     )
     SELECT subject_id, time_seconds, code, cid, value
     FROM events
@@ -701,6 +743,8 @@ def _coverage_sql(cdr: str) -> str:
       {_non_drug_events_cte(cdr, with_time=False)}
       UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
+      UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
+      UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
     ),
     cid_sketches AS (
       SELECT cid, HLL_COUNT.INIT(person_id, 12) AS sketch
@@ -849,6 +893,8 @@ def _own_counts_sql(cdr: str) -> str:
       {_non_drug_events_cte(cdr, with_time=False)}
       UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
+      UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
+      UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
     )
     SELECT cid, COUNT(DISTINCT person_id) AS n
     FROM events
@@ -1041,11 +1087,18 @@ def _build_final_events_with_duckdb(
             sorted_path = sorted_dir / f"sorted_{k:04d}.parquet"
             shard_list_sql = "[" + ", ".join(f"'{p.as_posix()}'" for p in shard_files) + "]"
             t_sort = time.monotonic()
+            # Collapse exact duplicates: OMOP routinely re-asserts the same
+            # condition/observation across visits, and the drug_exposure ->
+            # ingredient fan-out can hit the same ingredient twice for a single
+            # combo drug row. After atom encoding those all share
+            # (subject_id, time_seconds, atom). MAX(value) keeps the numeric
+            # value if any row carried one (NULLs are ignored).
             con.execute(
                 f"""
                 COPY (
-                    SELECT subject_id, time_seconds, atom, value
+                    SELECT subject_id, time_seconds, atom, MAX(value) AS value
                     FROM read_parquet({shard_list_sql})
+                    GROUP BY subject_id, time_seconds, atom
                     ORDER BY subject_id, time_seconds
                 ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """
