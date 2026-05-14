@@ -52,6 +52,7 @@ except ModuleNotFoundError:
 
 from matplotlib.collections import LineCollection
 from matplotlib.colors import TwoSlopeNorm
+import matplotlib.patheffects as pe
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 
@@ -62,6 +63,18 @@ MAX_LABELS = 28
 MAX_GRAPH_EDGES = 100
 RNG_SEED = 7
 EPS = 1e-12
+LAYER_COLORS = np.asarray(
+    [
+        "#2f6fbb",
+        "#c2413b",
+        "#2f8f5b",
+        "#8a5fbf",
+        "#c47a1f",
+        "#1f8a9b",
+        "#b23a7f",
+        "#6f6f2f",
+    ]
+)
 
 
 def step_fmt(x, _pos=None):
@@ -207,6 +220,31 @@ def node_label(flat, n_features):
     return f"L{int(flat) // n_features}F{int(flat) % n_features}"
 
 
+def label_points(ax, coords, nodes, *, fontsize=8):
+    for flat in nodes:
+        text = ax.text(coords[flat, 0], coords[flat, 1], node_label(flat, n_features), fontsize=fontsize)
+        text.set_path_effects([pe.withStroke(linewidth=3.0, foreground="white", alpha=0.9)])
+
+
+def layer_legend(ax, layers_present):
+    handles = []
+    for layer in sorted(set(int(x) for x in layers_present)):
+        handles.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="",
+                markersize=7,
+                markerfacecolor=LAYER_COLORS[layer % len(LAYER_COLORS)],
+                markeredgecolor="white",
+                markeredgewidth=0.7,
+                label=f"layer {layer}",
+            )
+        )
+    ax.legend(handles=handles, title="CLT layer", loc="best")
+
+
 def choose_run():
     candidates = [(path, artifact_rows(path)) for path in CLT_DIRS]
     candidates = [(path, rows) for path, rows in candidates if rows]
@@ -342,27 +380,64 @@ plt.show()
 
 
 # 2. Node geometry.
-node_size = 8 + 120 * (flat_score / max(float(flat_score.max()), EPS)) ** 0.65
+node_size = 10 + 115 * (flat_score / max(float(flat_score.max()), EPS)) ** 0.65
+layer_colors = LAYER_COLORS[layer_id % len(LAYER_COLORS)]
+top_halo_size = node_size[top_nodes[:MAX_LABELS]] + 75
+top_halo_color = layer_colors[top_nodes[:MAX_LABELS]]
 fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
 fig.suptitle("CLT node geometry", fontsize=14, fontweight="bold")
 
 ax = axes[0]
-sc = ax.scatter(node_pca[:, 0], node_pca[:, 1], c=layer_id, s=node_size, cmap="tab10", alpha=0.62, linewidths=0)
-for flat in top_nodes[:MAX_LABELS]:
-    ax.text(node_pca[flat, 0], node_pca[flat, 1], node_label(flat, n_features), fontsize=8)
+ax.scatter(
+    node_pca[:, 0],
+    node_pca[:, 1],
+    c=layer_colors,
+    s=node_size,
+    alpha=0.58,
+    edgecolors="white",
+    linewidths=0.35,
+)
+ax.scatter(
+    node_pca[top_nodes[:MAX_LABELS], 0],
+    node_pca[top_nodes[:MAX_LABELS], 1],
+    s=top_halo_size,
+    facecolors="none",
+    edgecolors=top_halo_color,
+    linewidths=1.5,
+    alpha=0.95,
+)
+label_points(ax, node_pca, top_nodes[:MAX_LABELS])
 ax.set_title(f"PCA of node weights ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
 ax.set_xlabel("PC1")
 ax.set_ylabel("PC2")
-fig.colorbar(sc, ax=ax, label="layer")
+layer_legend(ax, layer_id)
 
 ax = axes[1]
-sc = ax.scatter(node_umap[:, 0], node_umap[:, 1], c=np.log10(flat_score + EPS), s=node_size, cmap="magma", alpha=0.68, linewidths=0)
-for flat in top_nodes[:MAX_LABELS]:
-    ax.text(node_umap[flat, 0], node_umap[flat, 1], node_label(flat, n_features), fontsize=8)
-ax.set_title("UMAP of node weights", loc="left")
+decoder_color = np.log10(dec_norm.reshape(-1) + EPS)
+sc = ax.scatter(
+    node_umap[:, 0],
+    node_umap[:, 1],
+    c=decoder_color,
+    s=node_size,
+    cmap="viridis",
+    alpha=0.72,
+    edgecolors="white",
+    linewidths=0.25,
+)
+ax.scatter(
+    node_umap[top_nodes[:MAX_LABELS], 0],
+    node_umap[top_nodes[:MAX_LABELS], 1],
+    s=top_halo_size,
+    facecolors="none",
+    edgecolors="#111111",
+    linewidths=1.2,
+    alpha=0.8,
+)
+label_points(ax, node_umap, top_nodes[:MAX_LABELS])
+ax.set_title("UMAP of node weights, colored by decoder norm", loc="left")
 ax.set_xlabel("UMAP1")
 ax.set_ylabel("UMAP2")
-fig.colorbar(sc, ax=ax, label="log10 node score")
+fig.colorbar(sc, ax=ax, label="log10 decoder norm")
 plt.show()
 
 
@@ -388,7 +463,16 @@ for source_layer, target_layer in pairs:
 edges = sorted(edges, key=lambda e: abs(e[2]), reverse=True)[:MAX_GRAPH_EDGES]
 
 fig, ax = plt.subplots(figsize=(12, 9), constrained_layout=True)
-ax.scatter(node_umap[:, 0], node_umap[:, 1], c=layer_id, s=node_size, cmap="tab10", alpha=0.36, linewidths=0)
+ax.scatter(
+    node_umap[:, 0],
+    node_umap[:, 1],
+    c=decoder_color,
+    s=node_size,
+    cmap="viridis",
+    alpha=0.46,
+    edgecolors="white",
+    linewidths=0.25,
+)
 if edges:
     max_edge = max(abs(edge[2]) for edge in edges)
     segments, colors, widths = [], [], []
@@ -397,8 +481,16 @@ if edges:
         colors.append("#c62828" if weight > 0 else "#1565c0")
         widths.append(0.35 + 3.2 * abs(weight) / max_edge)
     ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=0.32))
-for flat in top_nodes[:MAX_LABELS]:
-    ax.text(node_umap[flat, 0], node_umap[flat, 1], node_label(flat, n_features), fontsize=8)
+ax.scatter(
+    node_umap[top_nodes[:MAX_LABELS], 0],
+    node_umap[top_nodes[:MAX_LABELS], 1],
+    s=top_halo_size,
+    facecolors="none",
+    edgecolors="#111111",
+    linewidths=1.2,
+    alpha=0.85,
+)
+label_points(ax, node_umap, top_nodes[:MAX_LABELS])
 ax.set_title("Decoder-mediated CLT feature graph", loc="left")
 ax.set_xlabel("node UMAP1")
 ax.set_ylabel("node UMAP2")
