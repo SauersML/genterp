@@ -129,7 +129,9 @@ class CausalRoPEAttention(nn.Module):
         if valid_events.max().item() == 0:
             return out
 
-        flash_fn = _flash_attn_varlen_func() if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) else None
+        flash_fn = None
+        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            flash_fn = _flash_attn_varlen_func()
         if flash_fn is not None:
             event_keep = ~event_pad
             kv_keep = torch.ones(B, S, dtype=torch.bool, device=q.device)
