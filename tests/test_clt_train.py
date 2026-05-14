@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 import torch
 
-from genterp.clt_train import CLTTrainingConfig, iter_activation_chunks, load_clt_artifact, train_clt
+from genterp.clt_train import (
+    CLTTrainingConfig,
+    iter_activation_chunks,
+    latest_clt_artifact,
+    load_clt_artifact,
+    train_clt,
+    warm_start_clt_from_latest,
+)
 from genterp.modeling import Genterp
 from genterp.runtime import TorchRuntime
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder
@@ -79,6 +86,49 @@ def test_train_clt_end_to_end_saves_loadable_artifact(tmp_path: Path):
     assert loaded.cfg == clt.cfg
     assert metrics["loss"] > 0
     assert "eval_loss" in metrics
+
+
+def test_clt_cli_warm_start_helpers_continue_with_new_steps(tmp_path: Path):
+    torch.manual_seed(0)
+    cfg = tiny_config(dim=16, n_heads=4, n_layers=2)
+    base = Genterp(cfg).eval()
+    clt_cfg = CLTConfig(n_layers=cfg.n_layers, dim=cfg.dim, n_features=16, off_diagonal_rank=2)
+    batch = make_batch(B=2, T=10, n_atoms=cfg.n_atoms)
+    training_cfg = CLTTrainingConfig(
+        steps=2,
+        learning_rate=1e-2,
+        activation_batch_tokens=8,
+        subject_batch_size=2,
+        eval_every=2,
+        save_every=10,
+        eval_batches=1,
+        max_events=10,
+    )
+    runtime = _cpu_runtime()
+
+    first = train_clt(base, CrossLayerTranscoder(clt_cfg), [batch], [batch], runtime=runtime, training_cfg=training_cfg, output_dir=tmp_path)
+    first_artifact = latest_clt_artifact(tmp_path)
+    assert first_artifact == Path(str(first["artifact_dir"]))
+    assert first_artifact is not None and first_artifact.name.startswith("final-2-")
+
+    clt = CrossLayerTranscoder(clt_cfg)
+    warm_artifact = warm_start_clt_from_latest(clt, tmp_path, runtime=runtime)
+    assert warm_artifact == first_artifact
+
+    second = train_clt(
+        base,
+        clt,
+        [batch],
+        [batch],
+        runtime=runtime,
+        training_cfg=training_cfg,
+        output_dir=tmp_path,
+        start_step=2,
+    )
+
+    second_artifact = Path(str(second["artifact_dir"]))
+    assert second_artifact.name.startswith("final-4-")
+    assert latest_clt_artifact(tmp_path) == second_artifact
 
 
 def test_clt_train_cli_rejects_unknown_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
