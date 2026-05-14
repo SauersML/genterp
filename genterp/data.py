@@ -72,22 +72,46 @@ class EventStore:
 
     @classmethod
     def from_parquet(cls, path: str | Path) -> EventStore:
+        """Load the shared event store, compacting dtypes column-by-column so
+        peak RAM stays bounded on the full-cohort (1.1B-row) pull.
+
+        The on-disk schema is int64 time / uint32 atom / float64 value (= 20
+        B/row). At 1.1B rows that's ~22 GB decompressed when read in one go,
+        and ``pq.read_table`` with all three columns at once OOM-killed the
+        process before training could start. We instead:
+
+          1. Read each column independently via ParquetFile.read().
+          2. Immediately cast to a compact dtype (int32 / uint16 / float32 =
+             10 B/row total, ~11 GB resident).
+          3. Drop the original wide-typed table reference so peak transient
+             is bounded by the single biggest column (~9 GB) rather than the
+             sum of all three (~22 GB).
+
+        Dtype safety:
+          * int32 seconds spans ±68 y around 1970 — fine for AoU dates.
+          * uint16 atom holds 65k ids; current vocab is ≤42k.
+          * float32 value preserves ~7 sig figs; clinical labs only need ~3.
+        """
         path = Path(path)
         logger = ProgressLogger("event_store", total_units=2)
         logger.start_unit("read events parquet (shared)", f"path={path}")
-        events = pq.read_table(
-            path, columns=["time_seconds", "atom", "value"], memory_map=True
-        )
-        logger.finish_unit("read events parquet (shared)", f"rows={events.num_rows:,}")
+        pf = pq.ParquetFile(str(path), memory_map=True)
+        time_table = pf.read(columns=["time_seconds"])
+        time_seconds = time_table.column("time_seconds").cast(pa.int32())
+        del time_table
+        atom_table = pf.read(columns=["atom"])
+        atom = atom_table.column("atom").cast(pa.uint16())
+        del atom_table
+        value_table = pf.read(columns=["value"])
+        value = value_table.column("value").cast(pa.float32())
+        del value_table
+        n_rows = int(atom.length())
+        logger.finish_unit("read events parquet (shared)", f"rows={n_rows:,}")
         logger.start_unit(
             "register event columns (shared)",
-            "kept as Arrow ChunkedArrays; per-subject slices land in numpy on demand",
+            "compact dtypes (i32/u16/f32) — per-subject slices land in numpy on demand",
         )
-        store = cls(
-            time_seconds=events.column("time_seconds"),
-            atom=events.column("atom"),
-            value=events.column("value"),
-        )
+        store = cls(time_seconds=time_seconds, atom=atom, value=value)
         logger.finish_unit("register event columns (shared)", f"chunks={store.num_chunks}")
         return store
 
