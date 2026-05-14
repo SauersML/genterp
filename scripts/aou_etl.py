@@ -988,20 +988,34 @@ def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[
     return cov, anc
 
 
+_CONCEPT_CODES_CHUNK = 100_000  # BQ jobs.insert POST body cap is ~10 MB; ~100k INT64 ids fits safely.
+
+
 def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int, str]:
+    """Resolve concept_id → 'VOCAB/CODE' via BQ. Chunks large id sets because
+    BigQuery's jobs.insert endpoint rejects POST bodies > ~10 MB (HTTP 413).
+    At AoU full-cohort scale we routinely see ≥460k cids in one batch; pre-
+    chunking turns that into a few quick 100k-id queries.
+    """
     if not ids:
         return {}
     sql = f"SELECT concept_id, vocabulary_id, concept_code FROM `{cdr}.concept` WHERE concept_id IN UNNEST(@ids)"
-    table = _run_aggregation(
-        client,
-        sql,
-        f"concept_codes (n={len(ids):,})",
-        parameters=[bigquery.ArrayQueryParameter("ids", "INT64", list(ids))],
-    )
-    cids = table.column("concept_id").to_pylist()
-    vocabs = table.column("vocabulary_id").to_pylist()
-    codes = table.column("concept_code").to_pylist()
-    return {int(c): f"{v}/{k}" for c, v, k in zip(cids, vocabs, codes, strict=True)}
+    id_list = list(ids)
+    result: dict[int, str] = {}
+    n_chunks = (len(id_list) + _CONCEPT_CODES_CHUNK - 1) // _CONCEPT_CODES_CHUNK
+    for chunk_idx in range(n_chunks):
+        chunk = id_list[chunk_idx * _CONCEPT_CODES_CHUNK : (chunk_idx + 1) * _CONCEPT_CODES_CHUNK]
+        label = f"concept_codes (chunk {chunk_idx + 1}/{n_chunks}, n={len(chunk):,})"
+        table = _run_aggregation(
+            client, sql, label,
+            parameters=[bigquery.ArrayQueryParameter("ids", "INT64", chunk)],
+        )
+        cids = table.column("concept_id").to_pylist()
+        vocabs = table.column("vocabulary_id").to_pylist()
+        codes = table.column("concept_code").to_pylist()
+        for c, v, k in zip(cids, vocabs, codes, strict=True):
+            result[int(c)] = f"{v}/{k}"
+    return result
 
 
 def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: str, cohort_ids: list[int], cache_dir: Path):
