@@ -50,6 +50,7 @@ except ModuleNotFoundError:
     require("umap", "umap-learn")
     from umap import UMAP
 
+from matplotlib.patches import FancyArrowPatch
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
@@ -438,34 +439,24 @@ graph_sc = ax.scatter(
     linewidths=0.25,
 )
 if edges:
-    starts = np.asarray([node_umap[s_flat] for s_flat, _t_flat, _weight, _alpha in edges])
-    stops = np.asarray([node_umap[t_flat] for _s_flat, t_flat, _weight, _alpha in edges])
-    weights = np.asarray([weight for _s_flat, _t_flat, weight, _alpha in edges])
-    alphas = np.asarray([alpha for _s_flat, _t_flat, _weight, alpha in edges])
-    alphas = EDGE_MIN_ALPHA + (EDGE_MAX_ALPHA - EDGE_MIN_ALPHA) * alphas
-    widths = 0.0013 + 0.0042 * np.asarray([alpha for _s_flat, _t_flat, _weight, alpha in edges])
-    colors = np.zeros((len(edges), 4), dtype=float)
-    colors[weights >= 0] = np.array([198 / 255, 40 / 255, 40 / 255, 1.0])
-    colors[weights < 0] = np.array([21 / 255, 101 / 255, 192 / 255, 1.0])
-    colors[:, 3] = np.clip(alphas, EDGE_MIN_ALPHA, EDGE_MAX_ALPHA)
-    deltas = stops - starts
-    ax.quiver(
-        starts[:, 0],
-        starts[:, 1],
-        deltas[:, 0],
-        deltas[:, 1],
-        angles="xy",
-        scale_units="xy",
-        scale=1,
-        color=colors,
-        width=widths,
-        headwidth=5.2,
-        headlength=7.2,
-        headaxislength=5.8,
-        minlength=0.0,
-        pivot="tail",
-        zorder=1,
-    )
+    for s_flat, t_flat, weight, importance in sorted(edges, key=lambda e: e[3]):
+        alpha = EDGE_MIN_ALPHA + (EDGE_MAX_ALPHA - EDGE_MIN_ALPHA) * importance
+        width = 0.45 + 3.2 * importance
+        mutation_scale = 11.0 + 17.0 * importance
+        color = "#c62828" if weight >= 0 else "#1565c0"
+        arrow = FancyArrowPatch(
+            posA=tuple(node_umap[s_flat]),
+            posB=tuple(node_umap[t_flat]),
+            arrowstyle="-|>",
+            mutation_scale=mutation_scale,
+            linewidth=width,
+            color=color,
+            alpha=alpha,
+            shrinkA=7.0,
+            shrinkB=7.0,
+            zorder=1,
+        )
+        ax.add_patch(arrow)
 fig.colorbar(graph_sc, ax=ax, label="log10 decoder norm")
 ax.set_title("Directed Edges", loc="left")
 ax.set_xlabel("node UMAP1")
@@ -522,8 +513,3 @@ for source_layer in range(layers):
         ax.text(target_layer, source_layer, f"{layer_interaction[source_layer, target_layer]:.2g}", ha="center", va="center", fontsize=9)
 fig.colorbar(im, ax=ax, label="Frobenius norm")
 plt.show()
-
-
-if len(metrics) < 2:
-    print("\nNo dense clt_metrics.jsonl time series yet; the trend plot uses saved artifacts only.")
-    print("The CLT trainer now writes clt_metrics.jsonl on new runs, so rerun CLT to get real curves.")
