@@ -52,6 +52,32 @@ def _log(msg: str) -> None:
     _WORK.log(f"{msg} [{_mem_str()}]")
 
 
+def _log_version_banner() -> None:
+    """Loud, unambiguous statement of *which on-disk source* this process is running.
+
+    The "OLD code keeps showing up after I pushed" mystery happens when run.sh's
+    git reset succeeds but, for whatever reason (network FS lag, an open file
+    handle from a parent process, manual GENTERP_REEXEC=1 invocation that
+    skipped self-update), the .py we actually execute is from a different
+    commit. This banner makes that impossible to miss: every run logs the
+    source path, its mtime, byte size, and SHA-256 of the actual file contents.
+    Grep the log for VERSION_TAG to confirm what's running.
+    """
+    src_path = Path(__file__).resolve()
+    try:
+        data = src_path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()[:16]
+        size = len(data)
+        mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(src_path.stat().st_mtime))
+    except OSError as exc:
+        _log(f"VERSION_TAG: source-readable-failed path={src_path} exc={exc.__class__.__name__}")
+        return
+    _log(f"VERSION_TAG: path={src_path} size={size} mtime={mtime} sha256_16={sha}")
+    # If the chunked-sort marker is missing, the source on disk is stale.
+    if b"FINAL_EVENTS_SHARDS" not in data:
+        _log("VERSION_TAG: WARNING: FINAL_EVENTS_SHARDS marker absent — running pre-chunked-sort code")
+
+
 def _install_crash_diagnostics() -> None:
     """Make non-OOM crashes loud and OOM crashes diagnosable after the fact.
 
@@ -1046,6 +1072,7 @@ def main(argv: list[str] | None = None) -> None:
     TINY = args.tiny
 
     _install_crash_diagnostics()
+    _log_version_banner()
     _WORK.start_unit("validate AoU CDR configuration", "reading WORKSPACE_CDR and preparing output paths")
     cdr = os.environ.get("WORKSPACE_CDR")
     if not cdr:

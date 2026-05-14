@@ -87,6 +87,15 @@ else
 fi
 finish_run_unit "self-update check complete"
 
+# Loud confirmation of what the running source actually is, post-reset. If the
+# "VERSION_TAG" line from aou_etl.main() ever shows a different commit/sha
+# than what's printed here, the workspace is running stale code.
+HEAD_NOW="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ETL_COMMIT="$(git -C "$SCRIPT_DIR" log -1 --format=%h --abbrev=10 -- scripts/aou_etl.py 2>/dev/null || echo unknown)"
+TRAIN_COMMIT="$(git -C "$SCRIPT_DIR" log -1 --format=%h --abbrev=10 -- genterp/train.py 2>/dev/null || echo unknown)"
+RUN_COMMIT="$(git -C "$SCRIPT_DIR" log -1 --format=%h --abbrev=10 -- run.sh 2>/dev/null || echo unknown)"
+echo "[run.sh] commit summary: HEAD=$HEAD_NOW aou_etl.py=$ETL_COMMIT train.py=$TRAIN_COMMIT run.sh=$RUN_COMMIT" >&2
+
 # Bootstrap uv if missing.
 log_run "START ensure uv is installed"
 if ! command -v uv >/dev/null 2>&1; then
