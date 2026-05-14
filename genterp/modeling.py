@@ -15,10 +15,16 @@ ROPE_BASE = 10000.0
 
 @lru_cache(maxsize=1)
 def _flash_attn_varlen_func():
+    """Return flash_attn_varlen_func if importable, else None.
+
+    V100 (sm_70) is below flash-attn 2.x's sm_75 minimum, so packaging it as a
+    hard dep would break on Workbench. Callers must handle None by falling back
+    to the SDPA path.
+    """
     try:
         from flash_attn import flash_attn_varlen_func
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("flash-attn is required for packed CUDA attention") from exc
+    except ModuleNotFoundError:
+        return None
     return flash_attn_varlen_func
 
 
@@ -123,7 +129,8 @@ class CausalRoPEAttention(nn.Module):
         if valid_events.max().item() == 0:
             return out
 
-        if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+        flash_fn = _flash_attn_varlen_func() if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16) else None
+        if flash_fn is not None:
             event_keep = ~event_pad
             kv_keep = torch.ones(B, S, dtype=torch.bool, device=q.device)
             kv_keep[:, static_len:] = event_keep
@@ -134,7 +141,7 @@ class CausalRoPEAttention(nn.Module):
             v_packed = v[kv_keep].contiguous()
             cu_q = F.pad(q_lens.cumsum(0), (1, 0))
             cu_kv = F.pad(kv_lens.cumsum(0), (1, 0))
-            event_out = _flash_attn_varlen_func()(
+            event_out = flash_fn(
                 q_packed,
                 k_packed,
                 v_packed,
