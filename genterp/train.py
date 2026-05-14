@@ -16,7 +16,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from genterp.eval_cindex import CindexCohort
 
 import numpy as np
 import psutil
@@ -313,6 +316,8 @@ class GenterpTrainer(transformers.Trainer):
         *args,
         runtime: TorchRuntime | None = None,
         reset_training_state_on_resume: bool = False,
+        cindex_cohort: "CindexCohort | None" = None,
+        cindex_every_n_evals: int = 1,
         **kwargs,
     ):
         self.runtime = runtime
@@ -324,6 +329,12 @@ class GenterpTrainer(transformers.Trainer):
         # full eval pass) reports the mean component NLL over its tokens.
         self._loss_accum_train: dict[str, list[torch.Tensor]] = {}
         self._loss_accum_eval: dict[str, list[torch.Tensor]] = {}
+        # Lazy-imported cohort artifact for periodic C-index scoring; mixed into
+        # eval metrics every `cindex_every_n_evals` calls to evaluation_loop so
+        # the C-index curves end up in trainer_state.json alongside eval_loss.
+        self._cindex_cohort = cindex_cohort
+        self._cindex_every_n_evals = max(1, int(cindex_every_n_evals))
+        self._cindex_eval_count = 0
         super().__init__(*args, **kwargs)
         if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
             self.args._n_gpu = 1
@@ -509,6 +520,52 @@ class GenterpTrainer(transformers.Trainer):
         if self.runtime is not None:
             device = self.runtime.device
         super()._move_model_to_device(model, device)
+
+    def evaluation_loop(self, *args, **kwargs):
+        """Augment HF's eval metrics with C-index per disease so the survival
+        head's external utility shows up alongside loss in trainer_state.json.
+
+        Runs once per N evaluation_loop calls (configurable via
+        `cindex_every_n_evals`). On the tiny cohort the extra cost is ~6s; on
+        full it's ~40s. Per-disease C-index and incidence rate are logged with
+        the `eval_` prefix so HF's log() routes them to log_history alongside
+        eval_loss and friends.
+        """
+        output = super().evaluation_loop(*args, **kwargs)
+        if self._cindex_cohort is None:
+            return output
+        self._cindex_eval_count += 1
+        if self._cindex_eval_count % self._cindex_every_n_evals != 0:
+            return output
+        try:
+            # Local import to avoid the import cycle: eval_cindex imports from train.
+            from genterp.eval_cindex import run_cindex
+            autocast_dtype = (
+                torch.bfloat16 if (self.runtime and self.runtime.bf16)
+                else torch.float16 if (self.runtime and self.runtime.fp16)
+                else None
+            )
+            device = self.runtime.device if self.runtime is not None else next(self.model.parameters()).device
+            cindex_results = run_cindex(
+                self.model, self._cindex_cohort,
+                device=device, autocast_dtype=autocast_dtype,
+            )
+            c_values: list[float] = []
+            for name, m in cindex_results.items():
+                key_safe = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
+                c = m["c_index"]
+                if c is None:
+                    continue
+                output.metrics[f"eval_cindex_{key_safe}"] = float(c)
+                c_values.append(float(c))
+            if c_values:
+                # Weighted by event count would be cleaner but float-mean is fine
+                # as a single-number summary for early stopping / dashboards.
+                output.metrics["eval_cindex_mean"] = float(np.mean(c_values))
+                output.metrics["eval_cindex_n_diseases"] = len(c_values)
+        except Exception as exc:  # noqa: BLE001 — never break training on eval failure
+            print(f"[cindex] in-loop eval skipped: {type(exc).__name__}: {exc}")
+        return output
 
     def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
         if checkpoint is not None and self.reset_training_state_on_resume:
@@ -895,6 +952,26 @@ def main(argv: list[str] | None = None) -> None:
         f"lr_scheduler={training_args['lr_scheduler_type']} gradient_checkpointing={training_args['gradient_checkpointing']}",
     )
 
+    setup.start_unit(
+        "prepare C-index cohort",
+        "SNOMED-descendant phenotypes + outcome table for periodic in-loop scoring",
+    )
+    cindex_cohort = None
+    try:
+        from genterp.eval_cindex import prepare_cindex_cohort
+        cindex_cohort = prepare_cindex_cohort(
+            etl, vocab,
+            events=event_store,
+            pin_memory=runtime.dataloader_pin_memory,
+        )
+        setup.finish_unit(
+            "prepare C-index cohort",
+            f"subjects={len(cindex_cohort.subjects):,}  diseases={len(cindex_cohort.disease_names)}",
+        )
+    except Exception as exc:  # noqa: BLE001 — survival eval is optional; never block training
+        print(f"[cindex] cohort prep skipped: {type(exc).__name__}: {exc}")
+        setup.finish_unit("prepare C-index cohort", f"skipped ({type(exc).__name__})")
+
     setup.start_unit("instantiate Trainer", "attaching runtime-state and verbose progress callbacks")
     data_collator = partial(collate, pad_to_multiple_of=tensor_core_padding_multiple(runtime))
     trainer = GenterpTrainer(
@@ -905,6 +982,8 @@ def main(argv: list[str] | None = None) -> None:
         data_collator=data_collator,
         runtime=runtime,
         reset_training_state_on_resume=reset_training_state,
+        cindex_cohort=cindex_cohort,
+        cindex_every_n_evals=1,
         callbacks=[RuntimeStateCallback(runtime), VerboseTrainerProgressCallback()],
     )
     setup.finish_unit("instantiate Trainer", "trainer ready")
