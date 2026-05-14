@@ -17,7 +17,9 @@ import importlib.util
 import platform
 import site
 import subprocess
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from packaging.version import Version
 
 REPO = Path.home() / "genterp"
 if REPO.is_dir() and str(REPO) not in sys.path:
@@ -25,10 +27,30 @@ if REPO.is_dir() and str(REPO) not in sys.path:
 
 
 def refresh_import_paths():
-    for path in {site.getusersitepackages(), *(site.getsitepackages() if hasattr(site, "getsitepackages") else [])}:
+    # AoU kernels put /opt/conda ahead of ~/.local. Pip --user installs then
+    # succeed but imports still resolve stale conda packages. Put user-site
+    # first so the packages this cell installs are the packages this cell uses.
+    user_site = site.getusersitepackages()
+    if user_site:
+        if user_site in sys.path:
+            sys.path.remove(user_site)
+        sys.path.insert(1 if str(REPO) in sys.path else 0, user_site)
+    for path in site.getsitepackages() if hasattr(site, "getsitepackages") else []:
         if path and path not in sys.path:
             site.addsitedir(path)
     importlib.invalidate_caches()
+
+
+def dist_version(dist_name):
+    try:
+        return version(dist_name)
+    except PackageNotFoundError:
+        return None
+
+
+def pip_install(*args):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *args])
+    refresh_import_paths()
 
 
 def ensure_import(import_name, pip_spec, *pip_args):
@@ -36,8 +58,7 @@ def ensure_import(import_name, pip_spec, *pip_args):
     if importlib.util.find_spec(import_name) is not None:
         return
     print(f"installing missing notebook dependency: {pip_spec}")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pip_spec, *pip_args])
-    refresh_import_paths()
+    pip_install(pip_spec, *pip_args)
     if importlib.util.find_spec(import_name) is None:
         raise ModuleNotFoundError(
             f"installed {pip_spec}, but this running kernel still cannot import {import_name!r}; "
@@ -58,10 +79,19 @@ for import_name, pip_spec in [
     ("umap", "umap-learn>=0.5"),
     ("pyarrow", "pyarrow>=15"),
     ("polars", "polars>=1.0"),
-    ("transformers", "transformers>=4.46,<5"),
     ("accelerate", "accelerate>=1.0"),
 ]:
     ensure_import(import_name, pip_spec)
+if not (dist_version("transformers") or "").startswith("4."):
+    print("installing compatible notebook dependency: transformers>=4.46,<5")
+    pip_install("transformers>=4.46,<5")
+if Version(dist_version("regex") or "0") < Version("2025.10.22"):
+    print("installing compatible notebook dependency: regex>=2025.10.22")
+    pip_install("regex>=2025.10.22")
+for module_name in list(sys.modules):
+    if module_name == "regex" or module_name == "transformers" or module_name.startswith("transformers."):
+        del sys.modules[module_name]
+refresh_import_paths()
 
 import matplotlib.pyplot as plt
 import numpy as np
