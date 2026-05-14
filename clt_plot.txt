@@ -57,7 +57,8 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
 ROOT = Path.home() / "genterp"
 CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
-EDGE_MIN_ALPHA = 0.08
+EDGE_MIN_ALPHA = 0.012
+EDGE_MAX_ALPHA = 0.65
 EDGE_ALPHA_GAMMA = 2.5
 RNG_SEED = 7
 EPS = 1e-12
@@ -341,8 +342,7 @@ for rank, flat in enumerate(top_decoder_nodes, start=1):
 
 # 1. Training / artifact trend. This always plots the best available history.
 fig, axes = plt.subplots(2, 2, figsize=(15, 9), constrained_layout=True)
-fig.suptitle("CLT training/artifact trend", fontsize=14, fontweight="bold")
-trend_title = "dense clt_metrics.jsonl" if len(metrics) >= 2 else "saved artifacts only"
+fig.suptitle("CLT Training", fontsize=14, fontweight="bold")
 
 for ax, keys, title, yscale in [
     (axes[0, 0], ["recon", "loss", "eval_recon", "eval_loss"], "objective", "log"),
@@ -357,7 +357,7 @@ for ax, keys, title, yscale in [
         ax.plot(x, y, marker="o", lw=1.5, alpha=0.45, label=key)
         if len(y) >= 8:
             ax.plot(x, ema(y), lw=2.5)
-    ax.set_title(f"{title} ({trend_title})", loc="left")
+    ax.set_title(title.title(), loc="left")
     ax.set_xlabel("CLT cumulative step")
     ax.xaxis.set_major_formatter(FuncFormatter(step_fmt))
     ax.xaxis.set_major_locator(MaxNLocator(6))
@@ -371,7 +371,7 @@ plt.show()
 node_size = np.full(layers * n_features, 34.0)
 layer_colors = LAYER_COLORS[layer_id % len(LAYER_COLORS)]
 fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
-fig.suptitle("CLT node geometry", fontsize=14, fontweight="bold")
+fig.suptitle("CLT Nodes", fontsize=14, fontweight="bold")
 
 ax = axes[0]
 ax.scatter(
@@ -383,7 +383,7 @@ ax.scatter(
     edgecolors="white",
     linewidths=0.35,
 )
-ax.set_title(f"PCA of node weights ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
+ax.set_title(f"PCA ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
 ax.set_xlabel("PC1")
 ax.set_ylabel("PC2")
 layer_legend(ax, layer_id)
@@ -400,7 +400,7 @@ sc = ax.scatter(
     edgecolors="white",
     linewidths=0.25,
 )
-ax.set_title("UMAP of node weights, colored by decoder norm", loc="left")
+ax.set_title("UMAP", loc="left")
 ax.set_xlabel("UMAP1")
 ax.set_ylabel("UMAP2")
 fig.colorbar(sc, ax=ax, label="log10 decoder norm")
@@ -417,8 +417,8 @@ for source_layer, target_layer in pairs:
     if max_strength <= EPS:
         continue
     opacity = (strength / max_strength) ** EDGE_ALPHA_GAMMA
-    source_features, target_features = np.where(opacity >= EDGE_MIN_ALPHA)
-    for s_feat, t_feat in zip(source_features, target_features, strict=True):
+    source_features, target_features = np.indices(scores.shape)
+    for s_feat, t_feat in zip(source_features.reshape(-1), target_features.reshape(-1), strict=True):
         s_flat = source_layer * n_features + s_feat
         t_flat = target_layer * n_features + t_feat
         edges.append((s_flat, t_flat, float(scores[s_feat, t_feat]), float(opacity[s_feat, t_feat])))
@@ -435,25 +435,35 @@ graph_sc = ax.scatter(
     linewidths=0.25,
 )
 if edges:
-    for s_flat, t_flat, weight, alpha in sorted(edges, key=lambda e: e[3]):
-        color = "#c62828" if weight > 0 else "#1565c0"
-        ax.annotate(
-            "",
-            xy=node_umap[t_flat],
-            xytext=node_umap[s_flat],
-            arrowprops={
-                "arrowstyle": "-|>",
-                "color": color,
-                "alpha": max(EDGE_MIN_ALPHA, min(0.82, alpha)),
-                "lw": 0.25 + 2.4 * alpha,
-                "mutation_scale": 5.0 + 9.0 * alpha,
-                "shrinkA": 5.5,
-                "shrinkB": 5.5,
-            },
-            zorder=1,
-        )
+    starts = np.asarray([node_umap[s_flat] for s_flat, _t_flat, _weight, _alpha in edges])
+    stops = np.asarray([node_umap[t_flat] for _s_flat, t_flat, _weight, _alpha in edges])
+    weights = np.asarray([weight for _s_flat, _t_flat, weight, _alpha in edges])
+    alphas = np.asarray([alpha for _s_flat, _t_flat, _weight, alpha in edges])
+    alphas = EDGE_MIN_ALPHA + (EDGE_MAX_ALPHA - EDGE_MIN_ALPHA) * alphas
+    colors = np.zeros((len(edges), 4), dtype=float)
+    colors[weights >= 0] = np.array([198 / 255, 40 / 255, 40 / 255, 1.0])
+    colors[weights < 0] = np.array([21 / 255, 101 / 255, 192 / 255, 1.0])
+    colors[:, 3] = np.clip(alphas, EDGE_MIN_ALPHA, EDGE_MAX_ALPHA)
+    deltas = stops - starts
+    ax.quiver(
+        starts[:, 0],
+        starts[:, 1],
+        deltas[:, 0],
+        deltas[:, 1],
+        angles="xy",
+        scale_units="xy",
+        scale=1,
+        color=colors,
+        width=0.0012,
+        headwidth=3.2,
+        headlength=4.0,
+        headaxislength=3.6,
+        minlength=0.0,
+        pivot="tail",
+        zorder=1,
+    )
 fig.colorbar(graph_sc, ax=ax, label="log10 decoder norm")
-ax.set_title(f"Decoder-mediated CLT feature graph ({len(edges):,} visible directional edges)", loc="left")
+ax.set_title("Directed Edges", loc="left")
 ax.set_xlabel("node UMAP1")
 ax.set_ylabel("node UMAP2")
 plt.show()
@@ -469,11 +479,11 @@ for source_layer in range(layers):
         layer_interaction[source_layer, target_layer] = np.linalg.norm(block)
 
 fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
-fig.suptitle("CLT weight diagnostics", fontsize=14, fontweight="bold")
+fig.suptitle("CLT Weights", fontsize=14, fontweight="bold")
 
 ax = axes[0, 0]
 im = ax.imshow(np.log10(dec_norm + EPS), aspect="auto", interpolation="nearest", cmap="magma")
-ax.set_title("Decoder norm per node", loc="left")
+ax.set_title("Decoder Norm", loc="left")
 ax.set_xlabel("feature")
 ax.set_ylabel("layer")
 ax.set_yticks(np.arange(layers))
@@ -481,7 +491,7 @@ fig.colorbar(im, ax=ax, label="log10 ||decoder||")
 
 ax = axes[0, 1]
 im = ax.imshow(np.log10(theta + EPS), aspect="auto", interpolation="nearest", cmap="viridis")
-ax.set_title("JumpReLU threshold per node", loc="left")
+ax.set_title("Threshold", loc="left")
 ax.set_xlabel("feature")
 ax.set_ylabel("layer")
 ax.set_yticks(np.arange(layers))
@@ -490,7 +500,7 @@ fig.colorbar(im, ax=ax, label="log10 theta")
 ax = axes[1, 0]
 norm = TwoSlopeNorm(vcenter=0, vmin=-1, vmax=1)
 im = ax.imshow(alignment, aspect="auto", interpolation="nearest", cmap="coolwarm", norm=norm)
-ax.set_title("Encoder/decoder cosine alignment", loc="left")
+ax.set_title("Encoder-Decoder Alignment", loc="left")
 ax.set_xlabel("feature")
 ax.set_ylabel("layer")
 ax.set_yticks(np.arange(layers))
@@ -498,7 +508,7 @@ fig.colorbar(im, ax=ax, label="cosine")
 
 ax = axes[1, 1]
 im = ax.imshow(layer_interaction, aspect="equal", interpolation="nearest", cmap="Blues")
-ax.set_title("Decoder block strength by layer pair", loc="left")
+ax.set_title("Layer Pair Strength", loc="left")
 ax.set_xlabel("target layer")
 ax.set_ylabel("source layer")
 ax.set_xticks(np.arange(layers))
