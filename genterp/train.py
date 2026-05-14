@@ -659,7 +659,7 @@ def main(argv: list[str] | None = None) -> None:
     # the cap and evaluate on the full test set.
     eval_cap = int(os.environ.get("GENTERP_EVAL_SUBJECTS", "1024"))
     if eval_cap > 0 and len(eval_full) > eval_cap:
-        order = np.argsort(-eval_full.lengths)[:eval_cap]
+        order = np.argsort(-np.asarray(eval_full.lengths, dtype=np.int64))[:eval_cap]
         eval_dataset: Dataset = _LengthAwareSubset(eval_full, order.tolist())
         setup.finish_unit(
             "build evaluation dataset",
