@@ -552,12 +552,17 @@ class GenterpTrainer(transformers.Trainer):
             )
             c_values: list[float] = []
             for name, m in cindex_results.items():
+                # run_cindex tucks a "__summary__" entry into the results dict
+                # with a different schema (no "c_index" key) — skip it.
+                if name.startswith("_"):
+                    continue
                 key_safe = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
-                c = m["c_index"]
+                c = m.get("c_index")
                 if c is None:
                     continue
-                output.metrics[f"eval_cindex_{key_safe}"] = float(c)
-                c_values.append(float(c))
+                c_f = float(c)  # type: ignore[arg-type]
+                output.metrics[f"eval_cindex_{key_safe}"] = c_f
+                c_values.append(c_f)
             if c_values:
                 # Weighted by event count would be cleaner but float-mean is fine
                 # as a single-number summary for early stopping / dashboards.
