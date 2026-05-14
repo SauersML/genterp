@@ -55,19 +55,35 @@ find "$SCRIPT_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/nul
 find "$SCRIPT_DIR" -type f -name '*.pyc' -delete 2>/dev/null || true
 finish_run_unit "wipe stale bytecode caches"
 
-# Self-update: pull latest main, then re-exec the refreshed script so changes
-# to run.sh / pyproject.toml / source files are picked up on every invocation.
-# The GENTERP_REEXEC guard prevents an infinite re-exec loop after one update.
-log_run "START self-update from git if this is the first run.sh invocation"
+# Self-update: hard-reset to origin/main, then re-exec the refreshed script so
+# every invocation runs the latest committed code. We use ``git reset --hard``
+# rather than ``git pull --ff-only`` because the workspace is a deployment
+# target, not a development checkout — local uncommitted edits or a
+# diverged branch should never silently shadow what's on origin. The
+# GENTERP_REEXEC guard prevents an infinite re-exec loop after one update.
+log_run "START self-update from git origin/main"
 if [ -z "${GENTERP_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "[run.sh] git pull --ff-only in $SCRIPT_DIR" >&2
-  if git -C "$SCRIPT_DIR" pull --ff-only; then
-    finish_run_unit "self-update succeeded; re-executing refreshed run.sh"
+  CURRENT_HEAD="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "[run.sh] current HEAD before update: $CURRENT_HEAD" >&2
+  if ! git -C "$SCRIPT_DIR" fetch --quiet origin main; then
+    echo "[run.sh] FATAL: git fetch origin main failed — refusing to continue with stale code" >&2
+    exit 1
+  fi
+  TARGET="$(git -C "$SCRIPT_DIR" rev-parse --short origin/main 2>/dev/null || echo unknown)"
+  if [ "$CURRENT_HEAD" = "$TARGET" ]; then
+    echo "[run.sh] already at origin/main ($TARGET); no re-exec needed" >&2
+  else
+    echo "[run.sh] resetting $CURRENT_HEAD -> $TARGET (origin/main)" >&2
+    if ! git -C "$SCRIPT_DIR" reset --hard origin/main; then
+      echo "[run.sh] FATAL: git reset --hard origin/main failed — refusing to continue" >&2
+      exit 1
+    fi
+    finish_run_unit "self-update succeeded; re-executing refreshed run.sh at $TARGET"
     export GENTERP_REEXEC=1
     exec bash "$0" "$@"
-  else
-    echo "[run.sh] git pull failed; continuing with on-disk code" >&2
   fi
+else
+  echo "[run.sh] $(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown) (re-exec or non-git)" >&2
 fi
 finish_run_unit "self-update check complete"
 
