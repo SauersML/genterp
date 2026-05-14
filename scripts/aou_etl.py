@@ -27,6 +27,7 @@ import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import duckdb
 import polars as pl
 import psutil
 import pyarrow as pa
@@ -822,33 +823,121 @@ def _cached_own_counts(
     return {int(cid): int(n) for cid, n in payload}
 
 
+def _duckdb_connection(cache_dir: Path, label: str) -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with bounded RAM and a real disk spill directory.
+
+    Polars' streaming engine silently failed to spill on the 1B-row sort and the
+    100K-group mean/std aggregation, sending RSS to 10GB+ before kernel OOM-killed
+    the process. DuckDB respects ``PRAGMA memory_limit`` honestly: when the working
+    set exceeds the cap it writes hash-table partitions / sort runs to ``temp_directory``
+    on disk. The same applies to the GROUP BY in value_stats.
+    """
+    spill_dir = cache_dir / "duckdb_spill"
+    spill_dir.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(":memory:")
+    available = psutil.virtual_memory().available
+    # Reserve headroom so other processes (BQ client, parquet writers) don't get squeezed.
+    cap_gb = max(4, int(available * 0.5 / 1e9))
+    con.execute(f"PRAGMA memory_limit='{cap_gb}GB'")
+    con.execute(f"PRAGMA temp_directory='{spill_dir.as_posix()}'")
+    con.execute(f"PRAGMA threads={os.cpu_count() or 4}")
+    _log(
+        f"duckdb[{label}] opened memory_limit={cap_gb}GB threads={os.cpu_count() or 4} "
+        f"spill_dir={spill_dir.name}"
+    )
+    return con
+
+
 def _cached_value_stats(
-    events_lf: pl.LazyFrame,
+    all_events_path: Path,
     atom_idx: dict[str, int],
     cache_dir: Path,
     source_key: str,
     vocab_key: str,
 ) -> dict[str, dict[str, float]]:
     def build() -> dict[str, dict[str, float]]:
-        stats_df = (
-            events_lf.filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
-            .group_by("code")
-            .agg(
-                pl.col("value").mean().alias("mu"),
-                pl.col("value").std().alias("sigma"),
-                pl.len().alias("n"),
-            )
-            .filter(pl.col("n") >= THRESHOLD)
-            .collect(engine="streaming")
-        )
+        con = _duckdb_connection(cache_dir, "value_stats")
+        try:
+            t0 = time.monotonic()
+            rows = con.execute(
+                f"""
+                SELECT code,
+                       AVG(value)         AS mu,
+                       STDDEV_SAMP(value) AS sigma,
+                       COUNT(*)           AS n
+                FROM read_parquet('{all_events_path.as_posix()}')
+                WHERE value IS NOT NULL
+                  AND value = value                 -- NaN check (NaN != NaN)
+                  AND ABS(value) < 1e308            -- ±inf check
+                GROUP BY code
+                HAVING COUNT(*) >= {THRESHOLD}
+                """
+            ).fetchall()
+            _log(f"duckdb[value_stats] aggregated rows={len(rows):,} in {time.monotonic()-t0:.1f}s")
+        finally:
+            con.close()
         return {
-            r["code"]: {"mu": float(r["mu"]), "sigma": float(r["sigma"] or 1.0)}
-            for r in stats_df.iter_rows(named=True)
-            if r["code"] in atom_idx
+            row[0]: {"mu": float(row[1]), "sigma": float(row[2] or 1.0)}
+            for row in rows
+            if row[0] in atom_idx
         }
 
     payload = _cache_json(cache_dir / f"value_stats-{source_key}-{vocab_key}.json", build)
     return {str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])} for code, stats in payload.items()}
+
+
+def _build_final_events_with_duckdb(
+    all_events_path: Path,
+    atom_idx: dict[str, int],
+    final_path: Path,
+    cache_dir: Path,
+) -> None:
+    """Filter + atom-encode + sort to final parquet using DuckDB's external sort.
+
+    Polars' streaming sort silently failed at 1B rows. DuckDB's sort spills sort
+    runs to ``temp_directory`` and merges them back — the canonical out-of-core
+    sort algorithm — so it actually completes regardless of how big the input is
+    relative to RAM. The JOIN against the atom_map (a ~127K-row pyarrow table
+    registered into the DuckDB session) handles filter + code→atom encoding in
+    a single pass.
+    """
+    if final_path.exists():
+        _log(f"cache hit:  {final_path.name} ({final_path.stat().st_size/1e9:.2f}GB)")
+        return
+    con = _duckdb_connection(cache_dir, "final_events")
+    try:
+        codes = pa.array(list(atom_idx.keys()), type=pa.string())
+        atoms = pa.array(list(atom_idx.values()), type=pa.uint32())
+        atom_map = pa.table({"code": codes, "atom": atoms})
+        con.register("atom_map", atom_map)
+        _log(
+            f"duckdb[final_events] atom_map registered: {len(atom_idx):,} codes; "
+            f"starting filter+encode+sort+sink"
+        )
+        tmp = final_path.with_suffix(final_path.suffix + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        t0 = time.monotonic()
+        con.execute(
+            f"""
+            COPY (
+                SELECT e.subject_id,
+                       e.time_seconds,
+                       am.atom AS atom,
+                       e.value
+                FROM read_parquet('{all_events_path.as_posix()}') e
+                JOIN atom_map am USING (code)
+                ORDER BY e.subject_id, e.time_seconds
+            ) TO '{tmp.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        tmp.replace(final_path)
+        _log(
+            f"duckdb[final_events] wrote {final_path.name} "
+            f"({final_path.stat().st_size/1e9:.2f}GB) in {time.monotonic()-t0:.1f}s"
+        )
+    finally:
+        con.close()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -943,26 +1032,28 @@ def main(argv: list[str] | None = None) -> None:
     _write_json(out_dir / "vocab.json", atom_idx)
     _WORK.finish_unit("collapse vocabulary", f"atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
 
-    _WORK.start_unit("compute per-atom value stats", "lazy mean/stddev over finite numeric measurements")
+    _WORK.start_unit(
+        "compute per-atom value stats",
+        "DuckDB mean/stddev/count GROUP BY code with HAVING n>=THRESHOLD; spills to disk under PRAGMA memory_limit",
+    )
     vocab_key = _stable_json_fingerprint(atom_idx)
-    stats = _cached_value_stats(events_lf, atom_idx, cache_dir, source_key, vocab_key)
+    stats = _cached_value_stats(all_events_path, atom_idx, cache_dir, source_key, vocab_key)
     _write_json(out_dir / "value_stats.json", stats)
     _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
+    # Free polars LazyFrame state before the big DuckDB op so we don't carry
+    # polars working memory through the sort. The downstream offsets step opens
+    # a fresh scan on the final parquet anyway.
+    del events_lf
+    import gc
+    gc.collect()
+
     _WORK.start_unit(
         "filter and sort final events",
-        "streaming filter + atom-encode + (subject_id, time_seconds) sort to final parquet (polars spills to disk)",
+        "DuckDB: JOIN atom_map for code→atom encode + ORDER BY (subject_id, time_seconds) with on-disk external sort",
     )
     final_events_path = cache_dir / f"events-{source_key}-{vocab_key}-atom-v1.parquet"
-    keep_codes = pl.Series("code", list(atom_idx.keys()))
-    atom_expr = pl.col("code").replace_strict(atom_idx, return_dtype=pl.UInt32).alias("atom")
-    final_lf = (
-        events_lf.select(["subject_id", "time_seconds", "code", "value"])
-        .filter(pl.col("code").is_in(keep_codes.implode()))
-        .select(["subject_id", "time_seconds", atom_expr, "value"])
-        .sort(["subject_id", "time_seconds"])
-    )
-    _sink_parquet(final_lf, final_events_path, "final_events")
+    _build_final_events_with_duckdb(all_events_path, atom_idx, final_events_path, cache_dir)
     _publish(final_events_path, out_dir / "events.parquet")
     final_events_lf = pl.scan_parquet(str(final_events_path))
     final_rows = final_events_lf.select(pl.len()).collect(engine="streaming").item()
