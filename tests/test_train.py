@@ -10,6 +10,8 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 from genterp.runtime import TorchRuntime
 from genterp.train import (
     EVAL_STEPS,
+    GenterpForCausalLM,
+    GenterpHFConfig,
     GenterpTrainer,
     LOGGING_STEPS,
     SAVE_STEPS,
@@ -18,6 +20,7 @@ from genterp.train import (
     build_training_args,
     checkpoint_is_complete,
     checkpoint_matches_runtime,
+    checkpoint_n_atoms,
     checkpoint_runtime_state,
     final_model_path,
     gradient_checkpointing_enabled,
@@ -206,6 +209,82 @@ def test_trainer_skips_incompatible_optimizer_and_scaler_state(tmp_path: Path, m
 
     trainer._load_optimizer_and_scheduler(str(tmp_path))
     trainer._load_scaler(str(tmp_path))
+
+
+def _tiny_genterp_model(n_atoms: int) -> GenterpForCausalLM:
+    cfg_dict = {
+        "n_atoms": n_atoms,
+        "dim": 16,
+        "n_heads": 2,
+        "n_layers": 2,
+        "n_static_blocks": 1,
+        "k_static_summary": 2,
+        "n_time_mix": 2,
+        "time_phi_dim": 4,
+    }
+    return GenterpForCausalLM(GenterpHFConfig(genterp_cfg=cfg_dict))
+
+
+def test_load_state_dict_drops_shape_mismatched_params(capsys):
+    """Vocab-grown checkpoint loads into a larger model without raising; the
+    shape-mismatched (vocab-sized) params keep their fresh init and the rest
+    of the weights copy in cleanly."""
+    old = _tiny_genterp_model(n_atoms=4)
+    new = _tiny_genterp_model(n_atoms=10)
+
+    # Snapshot a shape-compatible param so we can confirm it actually loaded.
+    norm_key = "model.norm.weight"
+    assert norm_key in new.state_dict(), "test depends on this param existing"
+    with torch.no_grad():
+        old.state_dict()[norm_key].fill_(0.42)
+    snapshot_new_emb = new.state_dict()["model.embed.embedding.weight"].clone()
+
+    result = new.load_state_dict(old.state_dict(), strict=True)
+
+    # Embedding (vocab-sized) keeps its fresh init.
+    assert torch.equal(
+        new.state_dict()["model.embed.embedding.weight"], snapshot_new_emb
+    ), "embedding must keep fresh init when vocab grew"
+    # Shape-compatible param did load.
+    assert torch.allclose(
+        new.state_dict()[norm_key], torch.full_like(new.state_dict()[norm_key], 0.42)
+    ), "shape-compatible param must be copied from checkpoint"
+    # Missing keys reported include at least the vocab-shaped params.
+    missing = set(result.missing_keys)
+    assert "model.embed.embedding.weight" in missing
+    captured = capsys.readouterr().out
+    assert "[warm-start] dropping" in captured
+
+
+def test_load_state_dict_preserves_strict_when_shapes_match(tmp_path: Path):
+    """Normal resume (same vocab) is a no-op for the filter — strict semantics
+    pass through unchanged, so missing/unexpected keys still raise as before."""
+    a = _tiny_genterp_model(n_atoms=4)
+    b = _tiny_genterp_model(n_atoms=4)
+
+    # Same shapes everywhere — load_state_dict with strict=True must succeed.
+    result = b.load_state_dict(a.state_dict(), strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+
+def test_checkpoint_n_atoms_reads_config(tmp_path: Path):
+    """checkpoint_n_atoms parses the saved HF config.json correctly so the
+    resume path can detect vocab growth without loading the full state dict."""
+    import json
+    ckpt = tmp_path / "checkpoint-1"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(json.dumps({"genterp_cfg": {"n_atoms": 12345}}))
+    assert checkpoint_n_atoms(ckpt) == 12345
+
+    bad = tmp_path / "checkpoint-2"
+    bad.mkdir()
+    (bad / "config.json").write_text("not-json")
+    assert checkpoint_n_atoms(bad) is None
+
+    missing = tmp_path / "checkpoint-3"
+    missing.mkdir()
+    assert checkpoint_n_atoms(missing) is None
 
 
 def test_trainer_keeps_lengths_on_host_for_attention_control_flow(tmp_path: Path):
