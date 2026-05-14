@@ -1,0 +1,241 @@
+"""Paste into a notebook cell. Runs `genterp.eval_cindex` if results don't
+already exist on disk, then plots a forest plot of Harrell's C-index per
+disease with bootstrap 95% confidence intervals.
+
+Auto-detects tiny vs full: if `runs-tiny/cindex_arrays.npz` exists it uses
+that; if `runs/cindex_arrays.npz` exists it uses that. If neither, runs the
+eval on whichever model has a `final_checkpoint.json` (preferring tiny).
+"""
+
+import json
+import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+CANDIDATE_DIRS = [Path.home() / "genterp" / "runs-tiny", Path.home() / "genterp" / "runs"]
+N_BOOTSTRAP = 500     # bootstrap resamples per disease
+RNG_SEED = 0
+
+
+def _run_eval_if_needed():
+    """If no cindex_arrays.npz exists, find a trained model and run the eval."""
+    for d in CANDIDATE_DIRS:
+        if (d / "cindex_arrays.npz").is_file():
+            return
+    # Pick which run to evaluate. Prefer tiny since that's the cheaper smoke run.
+    runs_tiny = Path.home() / "genterp" / "runs-tiny"
+    runs_full = Path.home() / "genterp" / "runs"
+    if (runs_tiny / "final_checkpoint.json").is_file():
+        flag = ["--tiny"]
+        target = "tiny"
+    elif (runs_full / "final_checkpoint.json").is_file():
+        flag = []
+        target = "full"
+    else:
+        raise SystemExit(
+            "no trained final-model under runs-tiny/ or runs/ — "
+            "run `~/genterp/run.sh [--tiny]` to train first."
+        )
+    # The notebook kernel is usually the system Python (no torch). The project
+    # lives in ~/genterp with its own uv-managed .venv that has torch + the
+    # rest. Invoke through `uv run` so the eval picks up that venv. First
+    # pull the latest code from origin/main so we don't run a stale tree —
+    # the notebook bypasses run.sh's self-update, so without this you'd hit
+    # SyntaxErrors and similar bit-rot when main has moved.
+    repo = str(Path.home() / "genterp")
+    print("  refreshing repo to origin/main before eval...")
+    subprocess.run(["git", "fetch", "--quiet", "origin", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "reset", "--quiet", "--hard", "origin/main"], cwd=repo, check=True)
+    subprocess.run(["uv", "sync", "--quiet"], cwd=repo, check=True)
+    cmd = ["uv", "run", "python", "-m", "genterp.eval_cindex", *flag]
+    print(f"  no eval results on disk — running `{' '.join(cmd)}` ({target})")
+    print("  this can take several minutes; output streams below ↓\n")
+    rc = subprocess.run(cmd, cwd=repo).returncode
+    if rc != 0:
+        raise SystemExit(f"eval_cindex exited with status {rc}")
+
+
+def latest_eval_dir(dirs):
+    candidates = []
+    for d in dirs:
+        f = d / "cindex_arrays.npz"
+        if f.is_file():
+            candidates.append((f.stat().st_mtime, d))
+    if not candidates:
+        raise SystemExit(
+            "still no cindex_arrays.npz after eval attempt — check error output above."
+        )
+    return max(candidates)[1]
+
+
+_run_eval_if_needed()
+
+
+def harrell_c(risks, time_to_event, observed):
+    """Right-censored Harrell's C. Vectorized via event-anchor iteration."""
+    if len(risks) < 2:
+        return float("nan")
+    risks = np.asarray(risks, dtype=np.float64)
+    t = np.asarray(time_to_event, dtype=np.float64)
+    e = np.asarray(observed, dtype=bool)
+    event_idx = np.flatnonzero(e)
+    if event_idx.size == 0:
+        return float("nan")
+    concordant = 0.0
+    permissible = 0
+    for i in event_idx:
+        partners = t > t[i]
+        if not partners.any():
+            continue
+        rj = risks[partners]
+        ri = risks[i]
+        permissible += int(partners.sum())
+        concordant += float(np.sum(ri > rj)) + 0.5 * float(np.sum(ri == rj))
+    return concordant / permissible if permissible else float("nan")
+
+
+def bootstrap_ci(risks, time_to_event, observed, n_boot, rng):
+    """Bootstrap 2.5/50/97.5 percentile band for Harrell's C."""
+    n = len(risks)
+    if n < 2:
+        return float("nan"), float("nan"), float("nan")
+    samples = np.empty(n_boot, dtype=np.float64)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        c = harrell_c(risks[idx], time_to_event[idx], observed[idx])
+        samples[b] = c
+    samples = samples[~np.isnan(samples)]
+    if samples.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    lo, mid, hi = np.percentile(samples, [2.5, 50, 97.5])
+    return float(lo), float(mid), float(hi)
+
+
+run_dir = latest_eval_dir(CANDIDATE_DIRS)
+mtime_min = (time.time() - (run_dir / "cindex_arrays.npz").stat().st_mtime) / 60
+is_tiny = run_dir.name == "runs-tiny"
+
+meta = json.loads((run_dir / "cindex_results.json").read_text())
+arrays = np.load(run_dir / "cindex_arrays.npz", allow_pickle=False)
+disease_names = [str(s) for s in arrays["disease_names"].tolist()]
+risks = arrays["risks"]                  # (n_subjects, n_diseases)
+time_to_event = arrays["time_to_event"]  # (n_subjects, n_diseases)
+observed = arrays["observed"]            # (n_subjects, n_diseases)
+prior_case = arrays["prior_case"]        # (n_subjects, n_diseases)
+
+# ───────── header dump ─────────
+bar = "═" * 86
+sep = "─" * 86
+print(bar)
+print(f"  source:        {run_dir}/cindex_arrays.npz   ({mtime_min:.1f} min ago)")
+print(f"  run mode:      {'TINY' if is_tiny else 'FULL'}")
+print(f"  final model:   {meta['final_model']}")
+print(f"  landmark age:  {meta['landmark_age_years']:.1f} y")
+print(f"  horizon:       {meta['horizon_years']:.1f} y")
+print(f"  max gap:       {meta['max_gap_years']:.1f} y")
+print(f"  n_eligible:    {meta['n_subjects_eligible']:,}")
+print(f"  n_diseases:    {len(disease_names)}")
+print(f"  bootstrap:     {N_BOOTSTRAP} resamples per disease")
+print(bar)
+
+# ───────── point estimates + bootstrap CIs ─────────
+rng = np.random.default_rng(RNG_SEED)
+rows = []
+for d_idx, name in enumerate(disease_names):
+    eligible_mask = ~prior_case[:, d_idx]
+    r = risks[eligible_mask, d_idx]
+    t = time_to_event[eligible_mask, d_idx]
+    o = observed[eligible_mask, d_idx]
+    c_point = harrell_c(r, t, o)
+    c_lo, c_med, c_hi = bootstrap_ci(r, t, o, N_BOOTSTRAP, rng)
+    r_info = meta["results"].get(name, {})
+    rows.append({
+        "name": name,
+        "atom": r_info.get("atom"),
+        "class_size": r_info.get("class_size"),
+        "n_eligible": int(eligible_mask.sum()),
+        "n_events": int((o & True).sum()),
+        "incidence_pct": r_info.get("incidence_pct", 0.0),
+        "c_point": c_point,
+        "c_lo": c_lo,
+        "c_med": c_med,
+        "c_hi": c_hi,
+    })
+
+# Print summary
+name_w = max(len(r["name"]) for r in rows)
+print(f"  {'disease':<{name_w}}   {'n_elig':>7}  {'events':>6}  {'inc%':>5}   {'C (95% CI)':<22}")
+print(sep)
+for r in sorted(rows, key=lambda x: (-(x['c_point'] if not np.isnan(x['c_point']) else 0))):
+    if np.isnan(r["c_point"]):
+        c_str = "  nan"
+    else:
+        c_str = f"{r['c_point']:.3f}  [{r['c_lo']:.3f}, {r['c_hi']:.3f}]"
+    print(f"  {r['name']:<{name_w}}   {r['n_eligible']:>7,}  {r['n_events']:>6,}  {r['incidence_pct']:>4.1f}   {c_str}")
+print(bar + "\n")
+
+# ───────── forest plot ─────────
+plt.rcParams.update({
+    "figure.facecolor": "white", "axes.facecolor": "#fafafa",
+    "axes.edgecolor": "#cccccc", "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.color": "#e6e6e6", "grid.linewidth": 0.7,
+    "axes.titleweight": "semibold", "axes.titlepad": 14,
+    "legend.frameon": False, "font.family": "DejaVu Sans",
+})
+
+# Sort rows by C-index descending for visual ordering
+plot_rows = sorted(rows, key=lambda x: (x["c_point"] if not np.isnan(x["c_point"]) else -np.inf))
+n = len(plot_rows)
+y = np.arange(n)
+c_points = np.array([r["c_point"] for r in plot_rows])
+c_los = np.array([r["c_lo"] for r in plot_rows])
+c_his = np.array([r["c_hi"] for r in plot_rows])
+n_events = np.array([r["n_events"] for r in plot_rows])
+
+fig, (ax_forest, ax_inc) = plt.subplots(
+    1, 2, figsize=(14, max(4, 0.55 * n + 2)),
+    gridspec_kw={"width_ratios": [3, 1]}, constrained_layout=True,
+)
+
+# Color by n_events on a perceptually-uniform palette
+norm = plt.Normalize(vmin=max(n_events.min(), 1), vmax=max(n_events.max(), 2))
+cmap = plt.get_cmap("viridis")
+colors = [cmap(norm(ne)) for ne in n_events]
+
+# Reference line (chance / 0.5)
+ax_forest.axvline(0.5, color="#888", lw=0.9, ls="--", alpha=0.7, label="chance (0.5)")
+for i, r in enumerate(plot_rows):
+    if np.isnan(r["c_point"]):
+        ax_forest.text(0.5, i, "  insufficient events", va="center", ha="left", color="#aa6666", fontsize=9)
+        continue
+    ax_forest.plot([r["c_lo"], r["c_hi"]], [i, i], lw=2.0, color=colors[i], solid_capstyle="round")
+    ax_forest.plot(r["c_point"], i, "o", color=colors[i], ms=10, mec="white", mew=1.5, zorder=3)
+ax_forest.set_yticks(y)
+ax_forest.set_yticklabels([f"{r['name']}  (n={r['n_eligible']:,}, k={r['n_events']:,})" for r in plot_rows], fontsize=10)
+ax_forest.set_xlabel("Harrell's C-index  (right-censored, 10-year horizon)")
+ax_forest.set_xlim(0.30, 1.0)
+ax_forest.set_title(f"Forest plot — {N_BOOTSTRAP} bootstrap resamples", loc="left")
+ax_forest.legend(loc="lower right")
+
+# Incidence panel
+inc = np.array([r["incidence_pct"] for r in plot_rows])
+bars = ax_inc.barh(y, inc, color=colors, edgecolor="white", linewidth=0.6)
+for i, v in enumerate(inc):
+    ax_inc.text(v + 0.2, i, f"{v:.1f}%", va="center", fontsize=9, color="#444")
+ax_inc.set_yticks(y); ax_inc.set_yticklabels([])
+ax_inc.set_xlabel("10-year incidence in eligible cohort (%)")
+ax_inc.set_title("Outcome rate", loc="left")
+ax_inc.xaxis.set_major_locator(MaxNLocator(5))
+
+mode_tag = "TINY" if is_tiny else "FULL"
+fig.suptitle(
+    f"Genterp 10-year incident-disease C-index — {mode_tag}\n"
+    f"landmark={meta['landmark_age_years']:.0f}y, horizon={meta['horizon_years']:.0f}y, "
+    f"eligible cohort N={meta['n_subjects_eligible']:,}",
+    fontsize=13, fontweight="bold",
+)
+plt.show()
