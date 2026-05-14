@@ -32,7 +32,7 @@ import polars as pl
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
-from google.cloud import bigquery, bigquery_storage
+from google.cloud import bigquery, bigquery_storage, storage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.progress import ProgressLogger
@@ -189,6 +189,32 @@ def _query_job_result_table_ref(job: bigquery.QueryJob) -> bigquery.TableReferen
     return bigquery.TableReference.from_api_repr(resource)
 
 
+def _parse_gs_uri(uri: str) -> tuple[str, str]:
+    if not uri.startswith("gs://"):
+        raise ValueError(f"expected gs:// URI, got {uri!r}")
+    bucket, _, prefix = uri[5:].partition("/")
+    if not bucket:
+        raise ValueError(f"expected bucket in gs:// URI, got {uri!r}")
+    return bucket, prefix.rstrip("/")
+
+
+def _gcs_export_target(sql: str, label: str) -> tuple[str, str, str]:
+    workspace_bucket = os.environ.get("WORKSPACE_BUCKET")
+    if not workspace_bucket:
+        raise RuntimeError("WORKSPACE_BUCKET is not set; cannot export oversized BigQuery result to GCS")
+    bucket, base_prefix = _parse_gs_uri(workspace_bucket)
+    safe_label = re.sub(r"[^A-Za-z0-9_]+", "_", label).strip("_") or "query"
+    key = hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16]
+    run_id = f"{time.time_ns():x}"
+    prefix_parts = [p for p in (base_prefix, "genterp", "etl", "bq_exports", f"{safe_label}-{key}-{run_id}") if p]
+    prefix = "/".join(prefix_parts)
+    return bucket, prefix, f"gs://{bucket}/{prefix}/part-*.parquet"
+
+
+def _bq_string_literal(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 def _submit_or_reuse_job(
     client: bigquery.Client,
     sql: str,
@@ -309,10 +335,9 @@ def _run_aggregation(
         # tries to fetch results inline via REST first, which 403s with
         # "Response too large to return" once the result set exceeds the
         # REST cap — bypass it.
-        destination = job.destination
-        if destination is None:
-            raise RuntimeError(f"BQ job {job.job_id} has no destination — cannot stream results")
-        batches = list(client.list_rows(destination).to_arrow_iterable(bqstorage_client=bqs_client))
+        destination = _query_job_result_table_ref(job)
+        row_iter = client.list_rows(destination, selected_fields=job.schema or [])
+        batches = list(row_iter.to_arrow_iterable(bqstorage_client=bqs_client))
         table = pa.Table.from_batches(batches) if batches else pa.table({})
     finally:
         try:
@@ -326,81 +351,107 @@ def _run_aggregation(
     return table
 
 
-def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_path: Path) -> None:
-    """Submit/reuse a BQ job and stream its Arrow batches directly to a Parquet file.
+def _export_query_to_gcs_parquet(client: bigquery.Client, sql: str, label: str) -> tuple[str, str]:
+    """Run a large query through BigQuery EXPORT DATA into the workspace bucket."""
+    bucket, prefix, export_uri = _gcs_export_target(sql, label)
+    export_sql = f"""
+EXPORT DATA OPTIONS (
+  uri = {_bq_string_literal(export_uri)},
+  format = 'PARQUET',
+  overwrite = true
+) AS
+{sql.rstrip().rstrip(";")}
+"""
+    _log(f"  bq export:  {label} uri={export_uri}")
+    job = client.query(export_sql)
+    _log(f"  bq job_id:  {label}_export {job.job_id}")
+    _wait_with_progress(job, f"{label}_export")
+    return bucket, prefix
 
-    Uses the BigQuery Storage API (gRPC + parallel streams) — typically 20–50×
-    faster than REST pagination for large results. Never materializes the full
-    Arrow table in process memory.
 
-    We use BigQuery's *anonymous* temp destination (auto-created per job) rather
-    than an explicit destination table for two reasons:
+def _compose_gcs_parquet_export(bucket_name: str, prefix: str, label: str, out_path: Path, tmp: Path) -> None:
+    """Download exported GCS parquet shards and rewrite them as one local parquet."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blobs = sorted(
+        (blob for blob in storage_client.list_blobs(bucket, prefix=f"{prefix}/") if blob.name.endswith(".parquet")),
+        key=lambda blob: blob.name,
+    )
+    if not blobs:
+        raise RuntimeError(f"BigQuery export for {label} produced no parquet shards under gs://{bucket_name}/{prefix}/")
 
-      1. AoU workspace service accounts don't have ``bigquery.datasets.create``
-         on the workspace project, so creating a scratch dataset fails 403.
-      2. The "Response too large" error that motivated trying explicit
-         destinations only fires on the REST result-pagination path
-         (``job.result()`` polling). Reading the anonymous temp table via
-         the Storage API has no such size cap.
-
-    Polling waits via ``job.done() + job.reload()`` (no inline result fetch),
-    then we read the ``statistics.query.destinationTable`` anonymous temp
-    through Storage API. Anonymous temps live ~24h, so the job-id cache reuses
-    them on resume.
-    """
-    if out_path.exists():
-        _log(f"cache hit:  {out_path.name} ({out_path.stat().st_size/1e9:.2f}GB)")
-        return
-    _log(f"streaming:  {out_path.name} (BQ Storage API, parallel streams)")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-
+    writer: pq.ParquetWriter | None = None
+    rows = 0
+    batches = 0
     t0 = time.monotonic()
-    job = _submit_or_reuse_job(client, sql, label)
-    _wait_with_progress(job, label)
-    result_table = _query_job_result_table_ref(job)
-    selected_fields = job.schema or []
-
-    bqs_client = bigquery_storage.BigQueryReadClient()
+    t_last_log = t0
+    shard_path = tmp.with_suffix(tmp.suffix + ".shard")
     try:
-        row_iter = client.list_rows(result_table, selected_fields=selected_fields)
-        iterable = row_iter.to_arrow_iterable(bqstorage_client=bqs_client)
-        writer: pq.ParquetWriter | None = None
-        rows = 0
-        batches = 0
-        t_first: float | None = None
-        t_last_log = time.monotonic()
-        try:
-            for batch in iterable:
+        for i, blob in enumerate(blobs, start=1):
+            size = (blob.size or 0) / 1e9
+            _log(f"  gcs shard: {label} {i}/{len(blobs)} {blob.name} ({size:.2f}GB)")
+            blob.download_to_filename(shard_path)
+            parquet_file = pq.ParquetFile(shard_path)
+            for batch in parquet_file.iter_batches(batch_size=262_144):
                 if writer is None:
                     writer = pq.ParquetWriter(tmp, batch.schema, compression="zstd")
-                    t_first = time.monotonic()
-                    _log(f"  stream:    {label} first batch in {t_first - t0:.1f}s rows={batch.num_rows:,}")
-                assert writer is not None
+                    _log(f"  compose:   {label} first batch rows={batch.num_rows:,}")
                 writer.write_batch(batch)
                 rows += batch.num_rows
                 batches += 1
-                # Log every 2 seconds — fast enough to feel live, sparse enough for big runs.
                 now = time.monotonic()
                 if now - t_last_log >= 2.0:
-                    elapsed = now - (t_first or t0)
+                    elapsed = now - t0
                     rate = rows / max(elapsed, 1e-6)
-                    _log(f"  stream:    {label} rows={rows:,} batches={batches} rate={rate/1e6:.2f}M/s")
+                    _log(f"  compose:   {label} rows={rows:,} batches={batches} rate={rate/1e6:.2f}M/s")
                     t_last_log = now
-        finally:
-            if writer is not None:
-                writer.close()
+            try:
+                shard_path.unlink()
+            except FileNotFoundError:
+                pass
     finally:
+        if writer is not None:
+            writer.close()
         try:
-            bqs_client.transport.close()
-        except Exception:
+            shard_path.unlink()
+        except FileNotFoundError:
             pass
+
+    if writer is None:
+        raise RuntimeError(f"BigQuery export for {label} contained no rows")
     tmp.replace(out_path)
     elapsed = time.monotonic() - t0
     rate = rows / max(elapsed, 1e-6)
     _log(f"streamed:   {out_path.name} rows={rows:,} batches={batches} in {elapsed:.1f}s ({rate/1e6:.2f}M rows/s)")
+
+    deleted = 0
+    for blob in blobs:
+        try:
+            blob.delete()
+            deleted += 1
+        except Exception as exc:
+            _log(f"  gcs cleanup: {label} {blob.name} delete failed ({exc.__class__.__name__})")
+    _log(f"  gcs cleanup: {label} deleted {deleted}/{len(blobs)} export shards")
+
+
+def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_path: Path) -> None:
+    """Run a large BQ query and materialize it as one local Parquet file.
+
+    BigQuery rejects this result as an anonymous query result with
+    ``responseTooLarge``. AoU service accounts also cannot create scratch BQ
+    datasets, so the large pull uses ``EXPORT DATA`` to write Parquet shards to
+    ``WORKSPACE_BUCKET`` and then composes those shards locally.
+    """
+    if out_path.exists():
+        _log(f"cache hit:  {out_path.name} ({out_path.stat().st_size/1e9:.2f}GB)")
+        return
+    _log(f"streaming:  {out_path.name} (BQ EXPORT DATA to GCS parquet)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    bucket, prefix = _export_query_to_gcs_parquet(client, sql, label)
+    _compose_gcs_parquet_export(bucket, prefix, label, out_path, tmp)
 
 
 THRESHOLD = 500

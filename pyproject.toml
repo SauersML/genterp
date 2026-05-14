@@ -29,6 +29,7 @@ dependencies = [
   "accelerate>=1.0",
   "datasets>=3.0",
   "google-cloud-bigquery[bqstorage]>=3.25",
+  "google-cloud-storage>=2.18",
   "pytest>=8",
 ]
 

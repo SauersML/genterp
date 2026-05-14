@@ -51,12 +51,11 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from genterp.data import AtomVocab, EventStore, PAD_ATOM, collate
+from genterp.data import PAD_ATOM, AtomVocab, EventStore, collate
 from genterp.modeling import _log_ndtr
 from genterp.progress import ProgressLogger
-from genterp.runtime import configure_torch_runtime, accelerator_label
+from genterp.runtime import accelerator_label, configure_torch_runtime
 from genterp.train import GenterpForCausalLM, final_model_path
-
 
 # Disease phenotypes — each value is the SNOMED root concept code. The case
 # set is the union of all cohort concepts that are IS-A descendants of the
