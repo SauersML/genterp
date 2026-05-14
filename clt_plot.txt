@@ -57,7 +57,8 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
 ROOT = Path.home() / "genterp"
 CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
-EDGE_MIN_ALPHA = 0.012
+EDGE_QUANTILE = 0.995
+EDGE_MIN_ALPHA = 0.06
 EDGE_MAX_ALPHA = 0.65
 EDGE_ALPHA_GAMMA = 2.5
 RNG_SEED = 7
@@ -416,9 +417,10 @@ for source_layer, target_layer in pairs:
     max_strength = float(strength.max()) if strength.size else 0.0
     if max_strength <= EPS:
         continue
+    cutoff = float(np.quantile(strength.reshape(-1), EDGE_QUANTILE))
     opacity = (strength / max_strength) ** EDGE_ALPHA_GAMMA
-    source_features, target_features = np.indices(scores.shape)
-    for s_feat, t_feat in zip(source_features.reshape(-1), target_features.reshape(-1), strict=True):
+    source_features, target_features = np.where(strength >= cutoff)
+    for s_feat, t_feat in zip(source_features, target_features, strict=True):
         s_flat = source_layer * n_features + s_feat
         t_flat = target_layer * n_features + t_feat
         edges.append((s_flat, t_flat, float(scores[s_feat, t_feat]), float(opacity[s_feat, t_feat])))
