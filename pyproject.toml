@@ -9,12 +9,13 @@ requires-python = ">=3.11,<3.14"
 # pytorch wheel path viable on AoU's CUDA 12.2 driver.
 dependencies = [
   # AoU Workbench V100 boxes ship with NVIDIA driver CUDA 12.2 (12020). PyPI's
-  # default linux torch is built against CUDA 12.4+, which fails to initialize
-  # on that driver with "The NVIDIA driver on your system is too old (found
-  # version 12020)" and silently falls back to CPU. On Linux x86_64 we pin to
-  # 2.4–2.5 and route through the cu121 wheel index (see [tool.uv.sources]
-  # below); other platforms get whatever PyPI offers for local dev / CI.
-  "torch>=2.4,<2.6 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # default linux torch wheels are CUDA 12.4-compiled and refuse to initialize
+  # on that driver. We route through the cu118 wheel index (CUDA 11.8 runtime),
+  # which is forward-compatible with any driver >= 520 — including V100's 12.2.
+  # torch 2.6+ is required because transformers' safety gate now refuses to
+  # call torch.load (incl. optimizer/RNG state on resume) on older torches
+  # under CVE-2025-32434.
+  "torch>=2.6 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "torch>=2.6 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "einops>=0.8",
   "numpy>=1.26",
@@ -30,16 +31,19 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
 explicit = true
 
-# Only Linux x86_64 (the AoU Workbench target) goes through the cu121 wheel
-# index. On macOS / Windows / arm64 we fall back to whatever PyPI offers
+# Only Linux x86_64 (the AoU Workbench target) goes through the cu118 wheel
+# index. CUDA 11.8 runtime works on any NVIDIA driver >= 520 (CUDA forward
+# compatibility), including the workspace's 12.2 driver, while letting us
+# install torch 2.6+ — required for transformers' torch.load safety gate.
+# On macOS / Windows / arm64 we fall back to whatever PyPI offers
 # (CPU torch, or platform-native CUDA), so local dev / CI installs still work.
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu121", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 
 # Resolve independently per-environment so the cu121 pin (which only has

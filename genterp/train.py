@@ -521,26 +521,12 @@ class GenterpTrainer(transformers.Trainer):
         super()._load_scaler(checkpoint)
 
     def _load_rng_state(self, checkpoint: str | None) -> None:
-        # RNG state loading uses torch.load, which transformers refuses to call
-        # on torch < 2.6 (CVE-2025-32434). We're pinned to torch 2.5 by the V100
-        # cu121 wheel path — see pyproject.toml — so the safety gate is a hard
-        # block here. Two cases:
-        #   1. reset_training_state_on_resume: optimizer/scheduler are being
-        #      rebuilt; RNG continuity is already lost — skip.
-        #   2. Normal resume: skip with a one-time warning. We lose exact RNG
-        #      reproducibility on resume but training continues. The trade is
-        #      acceptable; the alternative is an unupgradable torch.
-        if checkpoint is None:
+        # When optimizer/scheduler are being rebuilt anyway (vocab grew or
+        # hardware changed), RNG continuity is already broken — skip the load
+        # entirely. Otherwise let the parent class handle it.
+        if checkpoint is None or self.reset_training_state_on_resume:
             return
-        if self.reset_training_state_on_resume:
-            return
-        if not getattr(self, "_warned_rng_skip", False):
-            print(
-                "[trainer] skipping RNG state load (transformers gates torch.load "
-                "on torch<2.6, CVE-2025-32434; V100 driver pins us to torch 2.5). "
-                "Resume is not bit-exact on the RNG axis but everything else loads."
-            )
-            self._warned_rng_skip = True
+        super()._load_rng_state(checkpoint)
 
 
 def latest_checkpoint(output_dir: str | Path) -> str | None:
