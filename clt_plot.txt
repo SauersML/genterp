@@ -1,150 +1,80 @@
-"""Paste into a notebook cell. CLT-only analysis for the latest artifact.
+"""Paste into one notebook cell. Simple CLT-only artifact plots.
 
-Includes:
-- CLT training curves from clt_metrics.jsonl
-- participant-level PCA and UMAP from real CLT activations
-- node-level PCA and UMAP from learned node statistics
-- decoder-mediated feature graph overlaid on the node UMAP
-- node strength / threshold diagnostics
+This cell deliberately does not import genterp, transformers, datasets, or the
+Genterp model. It reads CLT artifacts directly:
+  runs[-tiny]/clt/*/clt_config.json
+  runs[-tiny]/clt/*/clt_training_state.json
+  runs[-tiny]/clt/*/clt_state.pt
+
+It plots:
+  1. artifact / metrics trend
+  2. node PCA and UMAP from learned CLT weights
+  3. decoder-mediated node graph
+  4. layer interaction heatmaps
+  5. top-node table and bar chart
 """
 
 import json
-import math
 import re
-import sys
-import time
-import importlib.util
-import platform
-import site
 import subprocess
-from importlib.metadata import PackageNotFoundError, version
+import sys
 from pathlib import Path
-from packaging.version import Version
-
-REPO = Path.home() / "genterp"
-if REPO.is_dir() and str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
-
-
-def refresh_import_paths():
-    # AoU kernels put /opt/conda ahead of ~/.local. Pip --user installs then
-    # succeed but imports still resolve stale conda packages. Put user-site
-    # first so the packages this cell installs are the packages this cell uses.
-    user_site = site.getusersitepackages()
-    if user_site:
-        if user_site in sys.path:
-            sys.path.remove(user_site)
-        sys.path.insert(1 if str(REPO) in sys.path else 0, user_site)
-    for path in site.getsitepackages() if hasattr(site, "getsitepackages") else []:
-        if path and path not in sys.path:
-            site.addsitedir(path)
-    importlib.invalidate_caches()
-
-
-def dist_version(dist_name):
-    try:
-        return version(dist_name)
-    except PackageNotFoundError:
-        return None
-
-
-def pip_install(*args):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *args])
-    refresh_import_paths()
-
-
-def ensure_import(import_name, pip_spec, *pip_args):
-    refresh_import_paths()
-    if importlib.util.find_spec(import_name) is not None:
-        return
-    print(f"installing missing notebook dependency: {pip_spec}")
-    pip_install(pip_spec, *pip_args)
-    if importlib.util.find_spec(import_name) is None:
-        raise ModuleNotFoundError(
-            f"installed {pip_spec}, but this running kernel still cannot import {import_name!r}; "
-            "restart the notebook kernel once so Python reloads site-packages"
-        )
-
-
-if importlib.util.find_spec("torch") is None:
-    torch_args = []
-    if platform.system() == "Linux" and platform.machine() == "x86_64":
-        torch_args = ["--index-url", "https://download.pytorch.org/whl/cu118"]
-    ensure_import("torch", "torch>=2.6", *torch_args)
-for import_name, pip_spec in [
-    ("einops", "einops>=0.8"),
-    ("matplotlib", "matplotlib"),
-    ("numpy", "numpy>=1.26"),
-    ("sklearn", "scikit-learn>=1.5"),
-    ("umap", "umap-learn>=0.5"),
-    ("pyarrow", "pyarrow>=15"),
-    ("polars", "polars>=1.0"),
-    ("safetensors", "safetensors>=0.4"),
-    ("accelerate", "accelerate>=1.0"),
-]:
-    ensure_import(import_name, pip_spec)
-if not (dist_version("transformers") or "").startswith("4."):
-    print("installing compatible notebook dependency: transformers>=4.46,<5")
-    pip_install("transformers>=4.46,<5")
-if Version(dist_version("regex") or "0") < Version("2025.10.22"):
-    print("installing compatible notebook dependency: regex>=2025.10.22")
-    pip_install("regex>=2025.10.22")
-for module_name in list(sys.modules):
-    if module_name == "regex" or module_name == "transformers" or module_name.startswith("transformers."):
-        del sys.modules[module_name]
-refresh_import_paths()
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from einops import rearrange
+
+
+def require(import_name, pip_name=None):
+    try:
+        return __import__(import_name)
+    except ModuleNotFoundError:
+        if pip_name is None:
+            raise
+        print(f"installing missing plotting dependency: {pip_name}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+        return __import__(import_name)
+
+
+torch = require("torch", "torch")
+try:
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+except ModuleNotFoundError:
+    require("sklearn", "scikit-learn")
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+try:
+    from umap import UMAP
+except ModuleNotFoundError:
+    require("umap", "umap-learn")
+    from umap import UMAP
+
 from matplotlib.collections import LineCollection
+from matplotlib.colors import TwoSlopeNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
-from safetensors.torch import load_file as load_safetensors
-from sklearn.decomposition import PCA
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, Subset
-from umap import UMAP
 
-for module_name in list(sys.modules):
-    if module_name == "genterp" or module_name.startswith("genterp."):
-        del sys.modules[module_name]
-
-from genterp.clt_train import load_clt_artifact  # noqa: E402
-from genterp.data import CohortDataset, EventStore, collate  # noqa: E402
-from genterp.train import GenterpForCausalLM, GenterpHFConfig, final_model_path  # noqa: E402
 
 ARTIFACT_RE = re.compile(r"^(checkpoint|final)-(\d+)-[0-9a-f]+$")
-RUN_DIRS = [Path.home() / "genterp" / "runs" / "clt", Path.home() / "genterp" / "runs-tiny" / "clt"]
-ETL_DIR = Path.home() / "genterp" / "etl"
+ROOT = Path.home() / "genterp"
+CLT_DIRS = [ROOT / "runs-tiny" / "clt", ROOT / "runs" / "clt"]
+MAX_LABELS = 28
+MAX_GRAPH_EDGES = 100
 RNG_SEED = 7
-PARTICIPANT_SAMPLE = 192
-PARTICIPANT_BATCH_SIZE = 2
-NODE_UMAP_SAMPLE = 1600
-TOP_NODE_CANDIDATES = 192
-GRAPH_EDGES = 80
-LABEL_NODES = 36
 EPS = 1e-12
 
 
-def stepfmt(x, _):
-    if x >= 1e6:
-        return f"{x / 1e6:.1f}M"
-    if x >= 1e3:
-        return f"{x / 1e3:.0f}k"
-    return f"{int(x)}"
+def step_fmt(x, _pos=None):
+    x = float(x)
+    if abs(x) >= 1_000_000:
+        return f"{x / 1_000_000:.1f}M"
+    if abs(x) >= 1_000:
+        return f"{x / 1_000:.0f}k"
+    return f"{x:.0f}"
 
 
-def ema(y, a=0.12):
-    y = np.asarray(y, dtype=float)
-    if len(y) == 0:
-        return y
-    out = np.empty_like(y)
-    out[0] = y[0]
-    for i in range(1, len(y)):
-        out[i] = a * y[i] + (1 - a) * out[i - 1]
-    return out
+def read_json(path):
+    return json.loads(Path(path).read_text())
 
 
 def artifact_rows(clt_dir):
@@ -155,33 +85,35 @@ def artifact_rows(clt_dir):
         match = ARTIFACT_RE.match(path.name)
         if not match or not path.is_dir():
             continue
-        cfg_file = path / "clt_config.json"
-        state_file = path / "clt_training_state.json"
-        if not cfg_file.is_file() or not state_file.is_file():
+        cfg_path = path / "clt_config.json"
+        train_path = path / "clt_training_state.json"
+        state_path = path / "clt_state.pt"
+        if not (cfg_path.is_file() and train_path.is_file() and state_path.is_file()):
             continue
-        state = json.loads(state_file.read_text())
-        cfg = json.loads(cfg_file.read_text())
-        metrics = state.get("metrics") or {}
+        cfg = read_json(cfg_path)
+        train_state = read_json(train_path)
         row = {
             "kind": match.group(1),
-            "step": int(state.get("step", match.group(2))),
+            "step": int(train_state.get("step", match.group(2))),
             "mtime": path.stat().st_mtime,
             "path": path,
             "cfg": cfg,
-            "training_config": state.get("training_config") or {},
-            "runtime": state.get("runtime") or {},
+            "training_config": train_state.get("training_config") or {},
+            "runtime": train_state.get("runtime") or {},
         }
-        row.update({k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))})
+        for key, value in (train_state.get("metrics") or {}).items():
+            if isinstance(value, (int, float)):
+                row[key] = float(value)
         rows.append(row)
-    rows.sort(key=lambda r: (r["step"], r["mtime"]))
+    rows.sort(key=lambda r: (r["step"], r["mtime"], r["path"].name))
     return rows
 
 
 def metric_rows(clt_dir):
     path = clt_dir / "clt_metrics.jsonl"
-    if not path.is_file():
-        return []
     rows = []
+    if not path.is_file():
+        return rows
     for line_no, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
@@ -199,7 +131,7 @@ def metric_rows(clt_dir):
     return rows
 
 
-def series(rows, key):
+def numeric_series(rows, key):
     xs, ys = [], []
     for row in rows:
         if key in row:
@@ -208,38 +140,51 @@ def series(rows, key):
     return np.asarray(xs), np.asarray(ys)
 
 
+def ema(y, alpha=0.18):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 2:
+        return y
+    out = np.empty_like(y)
+    out[0] = y[0]
+    for i in range(1, len(y)):
+        out[i] = alpha * y[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
 def standardize(x):
     return StandardScaler().fit_transform(np.asarray(x, dtype=np.float32))
 
 
 def pca2(x):
+    x = np.asarray(x, dtype=np.float32)
     if len(x) < 2:
-        return np.zeros((len(x), 2), dtype=np.float32), np.array([0.0, 0.0])
-    pca = PCA(n_components=2, random_state=RNG_SEED)
-    coords = pca.fit_transform(standardize(x))
-    return coords, pca.explained_variance_ratio_
+        return np.zeros((len(x), 2), dtype=np.float32), np.zeros(2)
+    model = PCA(n_components=2, random_state=RNG_SEED)
+    coords = model.fit_transform(standardize(x))
+    return coords, model.explained_variance_ratio_
 
 
-def umap2(x, *, neighbors=20, min_dist=0.08):
-    if len(x) < 3:
+def umap2(x):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < 4:
         return np.zeros((len(x), 2), dtype=np.float32)
-    n_neighbors = min(neighbors, max(2, len(x) - 1))
+    neighbors = min(30, max(2, len(x) - 1))
     return UMAP(
         n_components=2,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
+        n_neighbors=neighbors,
+        min_dist=0.05,
         metric="euclidean",
         random_state=RNG_SEED,
     ).fit_transform(standardize(x))
 
 
 def top_indices(values, k):
-    flat = np.asarray(values).reshape(-1)
-    k = min(k, flat.size)
+    values = np.asarray(values).reshape(-1)
+    k = min(int(k), values.size)
     if k <= 0:
         return np.array([], dtype=int)
-    idx = np.argpartition(-flat, k - 1)[:k]
-    return idx[np.argsort(-flat[idx])]
+    idx = np.argpartition(-values, k - 1)[:k]
+    return idx[np.argsort(-values[idx])]
 
 
 def strict_upper_pairs(n_layers):
@@ -251,516 +196,279 @@ def decoder_block(state, pairs, diag_w, source_layer, target_layer):
         return diag_w[source_layer]
     pair_index = pairs.index((source_layer, target_layer))
     if "off_blocks" in state:
-        return state["off_blocks"][pair_index].detach().float().numpy()
+        return state["off_blocks"][pair_index].float().cpu().numpy()
     return (
-        state["off_U"][pair_index].detach().float().numpy()
-        @ state["off_V"][source_layer].detach().float().numpy()
+        state["off_U"][pair_index].float().cpu().numpy()
+        @ state["off_V"][source_layer].float().cpu().numpy()
     )
 
 
-def knn_segments(coords, k=5):
-    if len(coords) <= 2:
-        return []
-    nn = NearestNeighbors(n_neighbors=min(k + 1, len(coords))).fit(coords)
-    _, idx = nn.kneighbors(coords)
-    segments = []
-    seen = set()
-    for i, neigh in enumerate(idx):
-        for j in neigh[1:]:
-            a, b = sorted((int(i), int(j)))
-            if (a, b) not in seen:
-                seen.add((a, b))
-                segments.append([coords[a], coords[b]])
-    return segments
+def node_label(flat, n_features):
+    return f"L{int(flat) // n_features}F{int(flat) % n_features}"
 
 
-def move_batch(batch, device):
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+def choose_run():
+    candidates = [(path, artifact_rows(path)) for path in CLT_DIRS]
+    candidates = [(path, rows) for path, rows in candidates if rows]
+    if not candidates:
+        raise SystemExit(f"no CLT artifacts found under {[str(p) for p in CLT_DIRS]}")
+    return max(candidates, key=lambda item: item[1][-1]["mtime"])
 
 
-def load_genterp_local(model_dir, device):
-    model_dir = Path(model_dir)
-    cfg = GenterpHFConfig.from_pretrained(model_dir)
-    model = GenterpForCausalLM(cfg)
-    state = {}
-    safe_index = model_dir / "model.safetensors.index.json"
-    if safe_index.is_file():
-        weight_map = json.loads(safe_index.read_text())["weight_map"]
-        for shard_name in sorted(set(weight_map.values())):
-            state.update(load_safetensors(model_dir / shard_name, device="cpu"))
-    elif (model_dir / "model.safetensors").is_file():
-        state = load_safetensors(model_dir / "model.safetensors", device="cpu")
-    elif (model_dir / "pytorch_model.bin").is_file():
-        state = torch.load(model_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
-    else:
-        raise FileNotFoundError(f"no model weights found in {model_dir}")
-    model.load_state_dict(state, strict=False)
-    return model.to(device).eval()
-
-
-candidates = [(d, artifact_rows(d)) for d in RUN_DIRS]
-candidates = [(d, rows) for d, rows in candidates if rows]
-if not candidates:
-    raise SystemExit(f"no CLT artifacts under {[str(d) for d in RUN_DIRS]}")
-
-clt_dir, artifact_history = max(candidates, key=lambda item: item[1][-1]["mtime"])
-latest = artifact_history[-1]
-metric_history = metric_rows(clt_dir)
-plot_history = metric_history or artifact_history
-is_tiny = clt_dir.parent.name == "runs-tiny"
-runs_dir = clt_dir.parent
-fresh_min = (time.time() - latest["mtime"]) / 60
+clt_dir, artifacts = choose_run()
+metrics = metric_rows(clt_dir)
+history = metrics if len(metrics) >= 2 else artifacts
+latest = artifacts[-1]
 cfg = latest["cfg"]
 tcfg = latest["training_config"]
-rt = latest["runtime"]
+runtime = latest["runtime"]
 
 state = torch.load(latest["path"] / "clt_state.pt", map_location="cpu", weights_only=True)
-enc = state["enc_weight"].detach().float().numpy()
-diag_w = state["diag_W"].detach().float().numpy()
-theta = np.exp(state["log_threshold"].detach().float().numpy())
-dec_norm = np.linalg.norm(diag_w, axis=-1)
-enc_norm = np.linalg.norm(enc, axis=-1)
-alignment = np.sum(enc * diag_w, axis=-1) / np.maximum(enc_norm * dec_norm, EPS)
-layers, n_features = dec_norm.shape
+enc = state["enc_weight"].float().cpu().numpy()
+enc_bias = state.get("enc_bias")
+diag_w = state["diag_W"].float().cpu().numpy()
+dec_bias = state.get("dec_bias")
+theta = np.exp(state["log_threshold"].float().cpu().numpy())
+
+layers, n_features, dim = enc.shape
 pairs = strict_upper_pairs(layers)
-layer_ids = np.repeat(np.arange(layers), n_features)
+layer_id = np.repeat(np.arange(layers), n_features)
 
-summary = {}
-for row in plot_history:
-    for key, value in row.items():
-        if isinstance(value, (int, float)) and key not in {"step", "line_no"}:
-            summary[key] = float(value)
+enc_norm = np.linalg.norm(enc, axis=-1)
+dec_norm = np.linalg.norm(diag_w, axis=-1)
+alignment = np.sum(enc * diag_w, axis=-1) / np.maximum(enc_norm * dec_norm, EPS)
+theta_inv = 1.0 / np.sqrt(np.maximum(theta, EPS))
+node_score = dec_norm * np.log1p(enc_norm) * theta_inv
+flat_score = node_score.reshape(-1)
 
-print("=" * 100)
-print(f"mode:        {'TINY' if is_tiny else 'FULL'}    {'ACTIVE' if fresh_min < 10 else f'idle {fresh_min:.0f}min'}")
-print(f"clt dir:     {clt_dir}")
-print(
-    f"artifact:    {latest['path'].name}    step={latest['step']:,}    "
-    f"metric_points={len(metric_history):,}    artifacts={len(artifact_history):,}"
+if enc_bias is not None:
+    enc_bias_np = enc_bias.float().cpu().numpy()
+else:
+    enc_bias_np = np.zeros((layers, n_features), dtype=np.float32)
+
+node_features = np.column_stack(
+    [
+        np.log1p(enc_norm.reshape(-1)),
+        np.log1p(dec_norm.reshape(-1)),
+        np.log(np.maximum(theta.reshape(-1), EPS)),
+        alignment.reshape(-1),
+        enc_bias_np.reshape(-1),
+        layer_id / max(layers - 1, 1),
+        flat_score,
+    ]
 )
+node_pca, pca_var = pca2(node_features)
+node_umap = umap2(node_features)
+
+plt.rcParams.update(
+    {
+        "figure.facecolor": "white",
+        "axes.facecolor": "#fafafa",
+        "axes.edgecolor": "#cccccc",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.color": "#e6e6e6",
+        "grid.linewidth": 0.7,
+        "axes.titleweight": "semibold",
+        "axes.titlepad": 9,
+        "legend.frameon": False,
+        "font.family": "DejaVu Sans",
+    }
+)
+
+print("=" * 96)
+print(f"clt dir:   {clt_dir}")
+print(f"artifact:  {latest['path'].name}    step={latest['step']:,}    artifacts={len(artifacts):,}    metric_rows={len(metrics):,}")
 print(
-    "config:      "
-    f"layers={cfg.get('n_layers')} dim={cfg.get('dim')} features/layer={cfg.get('n_features'):,} "
-    f"rank={cfg.get('off_diagonal_rank')} sparsity_coef={cfg.get('sparsity_coef')} "
-    f"log_theta_init={cfg.get('init_log_threshold')}"
+    "config:    "
+    f"layers={layers} dim={dim} features/layer={n_features} "
+    f"rank={cfg.get('off_diagonal_rank')} sparsity_coef={cfg.get('sparsity_coef')}"
 )
 if tcfg:
     print(
-        "training:    "
-        f"new_steps/run={tcfg.get('steps'):,} lr={tcfg.get('learning_rate')} "
-        f"tokens/chunk={tcfg.get('activation_batch_tokens'):,} "
-        f"eval_every={tcfg.get('eval_every'):,} save_every={tcfg.get('save_every'):,}"
+        "training:  "
+        f"new_steps/run={tcfg.get('steps')} lr={tcfg.get('learning_rate')} "
+        f"tokens/chunk={tcfg.get('activation_batch_tokens')} eval_every={tcfg.get('eval_every')}"
     )
-if rt:
-    print(f"runtime:     {rt.get('device_type')}:{rt.get('device_index')}  precision={rt.get('precision')}")
-print("-" * 100)
+if runtime:
+    print(f"runtime:   {runtime.get('device_type')}:{runtime.get('device_index')} precision={runtime.get('precision')}")
+print("-" * 96)
 for key in ["loss", "recon", "sparsity", "n_active", "grad_norm", "eval_loss", "eval_recon", "eval_sparsity", "eval_n_active"]:
-    if key in summary:
-        print(f"{key:14s} {summary[key]:>12.6g}")
-print("=" * 100 + "\n")
+    if key in latest:
+        print(f"{key:14s} {latest[key]:>12.6g}")
+print("=" * 96)
 
-node_score = dec_norm * np.log1p(enc_norm) / np.sqrt(np.maximum(theta, EPS))
-top_node_flat = top_indices(node_score, min(24, node_score.size))
-
-print("top CLT nodes by decoder_norm * log1p(encoder_norm) / sqrt(theta)")
-print(f"{'rank':>4s} {'layer':>5s} {'feature':>8s} {'score':>12s} {'dec_norm':>12s} {'enc_norm':>12s} {'theta':>12s} {'cos':>9s}")
-for rank, flat in enumerate(top_node_flat, start=1):
+print("\ntop CLT nodes")
+print(f"{'rank':>4s} {'node':>8s} {'score':>11s} {'dec_norm':>10s} {'enc_norm':>10s} {'theta':>10s} {'cos':>8s}")
+top_nodes = top_indices(flat_score, min(24, flat_score.size))
+for rank, flat in enumerate(top_nodes, start=1):
     layer = int(flat // n_features)
     feature = int(flat % n_features)
     print(
-        f"{rank:4d} {layer:5d} {feature:8d} {node_score[layer, feature]:12.5g} "
-        f"{dec_norm[layer, feature]:12.5g} {enc_norm[layer, feature]:12.5g} "
-        f"{theta[layer, feature]:12.5g} {alignment[layer, feature]:9.4f}"
+        f"{rank:4d} {node_label(flat, n_features):>8s} "
+        f"{flat_score[flat]:11.4g} {dec_norm[layer, feature]:10.4g} "
+        f"{enc_norm[layer, feature]:10.4g} {theta[layer, feature]:10.4g} "
+        f"{alignment[layer, feature]:8.3f}"
     )
-print()
 
-plt.rcParams.update({
-    "figure.facecolor": "white",
-    "axes.facecolor": "#fafafa",
-    "axes.edgecolor": "#cccccc",
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "axes.grid": True,
-    "grid.color": "#e5e5e5",
-    "grid.linewidth": 0.7,
-    "axes.titleweight": "semibold",
-    "axes.titlepad": 10,
-    "legend.frameon": False,
-    "font.family": "DejaVu Sans",
-})
 
-# 1. Training dynamics only when there is an actual time series.
-if len(metric_history) >= 10:
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9), constrained_layout=True)
-    ax = axes[0, 0]
-    for key, color, label in [
-        ("recon", "#0a3d68", "train recon"),
-        ("loss", "#1f77b4", "train total"),
-        ("eval_recon", "#8b0000", "eval recon"),
-        ("eval_loss", "#d62728", "eval total"),
-    ]:
-        x, y = series(metric_history, key)
-        if len(y):
-            ax.plot(x, y, color=color, alpha=0.22, lw=0.8)
-            ax.plot(x, ema(y), color=color, lw=2.1, label=label)
-    ax.set_title("Objective curves", loc="left")
+# 1. Training / artifact trend. This always plots the best available history.
+fig, axes = plt.subplots(2, 2, figsize=(15, 9), constrained_layout=True)
+fig.suptitle("CLT training/artifact trend", fontsize=14, fontweight="bold")
+trend_title = "dense clt_metrics.jsonl" if len(metrics) >= 2 else "saved artifacts only"
+
+for ax, keys, title, yscale in [
+    (axes[0, 0], ["recon", "loss", "eval_recon", "eval_loss"], "objective", "log"),
+    (axes[0, 1], ["n_active", "eval_n_active"], "active nodes", "linear"),
+    (axes[1, 0], ["sparsity", "eval_sparsity"], "sparsity pressure", "linear"),
+    (axes[1, 1], ["grad_norm"], "gradient norm", "log"),
+]:
+    for key in keys:
+        x, y = numeric_series(history, key)
+        if len(y) == 0:
+            continue
+        ax.plot(x, y, marker="o", lw=1.5, alpha=0.45, label=key)
+        if len(y) >= 8:
+            ax.plot(x, ema(y), lw=2.5)
+    ax.set_title(f"{title} ({trend_title})", loc="left")
     ax.set_xlabel("CLT cumulative step")
-    ax.set_ylabel("loss")
-    ax.set_yscale("log")
-    ax.legend(loc="best", ncol=2)
-    ax.xaxis.set_major_formatter(FuncFormatter(stepfmt))
-    ax.xaxis.set_major_locator(MaxNLocator(7))
-    ax.grid(which="both", color="#e5e5e5", lw=0.6)
-
-    ax = axes[0, 1]
-    for key, color, label in [("n_active", "#2ca02c", "train"), ("eval_n_active", "#1b7f2a", "eval")]:
-        x, y = series(metric_history, key)
-        if len(y):
-            ax.plot(x, y, "-", color=color, lw=2.0, label=label)
-    ax.axhline(n_features, color="#999", lw=0.8, ls=":", label="all nodes")
-    ax.set_title("Active nodes per token/layer", loc="left")
-    ax.set_xlabel("CLT cumulative step")
-    ax.set_ylabel("active features")
+    ax.xaxis.set_major_formatter(FuncFormatter(step_fmt))
+    ax.xaxis.set_major_locator(MaxNLocator(6))
+    if yscale == "log":
+        ax.set_yscale("log")
     ax.legend(loc="best")
-    ax.xaxis.set_major_formatter(FuncFormatter(stepfmt))
-    ax.xaxis.set_major_locator(MaxNLocator(7))
-
-    ax = axes[1, 0]
-    x_s, y_s = series(metric_history, "sparsity")
-    x_a, y_a = series(metric_history, "n_active")
-    if len(y_s):
-        ax.plot(x_s, y_s, color="#9467bd", lw=2.0, label="sparsity")
-    ax2 = ax.twinx()
-    if len(y_a):
-        ax2.plot(x_a, y_a, color="#2ca02c", lw=1.6, alpha=0.65, label="n_active")
-    ax.set_title("Sparsity pressure vs node count", loc="left")
-    ax.set_xlabel("CLT cumulative step")
-    ax.set_ylabel("sparsity penalty")
-    ax2.set_ylabel("n_active")
-    lines, labels = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines + lines2, labels + labels2, loc="best")
-    ax.xaxis.set_major_formatter(FuncFormatter(stepfmt))
-    ax.xaxis.set_major_locator(MaxNLocator(7))
-
-    ax = axes[1, 1]
-    x, y = series(metric_history, "grad_norm")
-    if len(y):
-        ax.semilogy(x, np.clip(y, 1e-9, None), color="#8c564b", alpha=0.35, lw=0.9)
-        ax.semilogy(x, ema(np.clip(y, 1e-9, None)), color="#8c564b", lw=2.1)
-    ax.set_title("Gradient norm", loc="left")
-    ax.set_xlabel("CLT cumulative step")
-    ax.set_ylabel("||g||")
-    ax.xaxis.set_major_formatter(FuncFormatter(stepfmt))
-    ax.xaxis.set_major_locator(MaxNLocator(7))
-    ax.grid(which="both", color="#e5e5e5", lw=0.6)
-    fig.suptitle(f"CLT training dynamics - {latest['path'].name}", fontsize=14, fontweight="bold")
-    plt.show()
-else:
-    print("Skipping training-curve figure: no dense clt_metrics.jsonl time series for this artifact yet.")
-
-# 2. Participant-level activation embeddings.
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_dir = final_model_path(runs_dir)
-if model_dir is None:
-    raise SystemExit(f"no final Genterp model under {runs_dir}")
-print(f"loading model for participant embeddings: {model_dir}")
-model = load_genterp_local(model_dir, device)
-clt = load_clt_artifact(latest["path"], map_location=device).to(device).eval()
-event_store = EventStore.from_parquet(ETL_DIR / "events.parquet")
-dataset = CohortDataset(ETL_DIR, split="test", events=event_store)
-rng = np.random.default_rng(RNG_SEED)
-sample_n = min(PARTICIPANT_SAMPLE, len(dataset))
-sample_idx = rng.choice(len(dataset), size=sample_n, replace=False)
-loader = DataLoader(
-    Subset(dataset, sample_idx.tolist()),
-    batch_size=PARTICIPANT_BATCH_SIZE,
-    shuffle=False,
-    num_workers=0,
-    collate_fn=collate,
-)
-
-participant_vecs, participant_sex, participant_len, participant_age = [], [], [], []
-node_sum = np.zeros((layers, n_features), dtype=np.float64)
-node_seen_subject = np.zeros((layers, n_features), dtype=np.float64)
-token_total = 0.0
-with torch.no_grad():
-    for batch in loader:
-        batch = move_batch(batch, device)
-        out = model.model(**batch, return_transcoder_acts=True)
-        bsz, _, tokens, _ = out["pre_mlp"].shape
-        pre = rearrange(out["pre_mlp"], "b l t d -> (b t) l d")
-        feats = clt.encode(pre)
-        feats = rearrange(feats, "(b t) l f -> b t l f", b=bsz, t=tokens)
-        valid = (~batch["event_pad"]).float()
-        denom = valid.sum(dim=1).clamp_min(1.0)
-        subj_mean = (feats * valid[:, :, None, None]).sum(dim=1) / denom[:, None, None]
-        participant_vecs.append(torch.log1p(subj_mean).flatten(1).cpu().numpy())
-        participant_sex.append(batch["sex"].detach().cpu().numpy())
-        participant_len.append(batch["length"].detach().float().cpu().numpy())
-        participant_age.append((batch["censor_age"].detach().float().cpu().numpy() / 365.25))
-        node_sum += (feats * valid[:, :, None, None]).sum(dim=(0, 1)).detach().cpu().numpy()
-        node_seen_subject += (subj_mean > 0).sum(dim=0).detach().cpu().numpy()
-        token_total += float(valid.sum().item())
-
-participant_x = np.concatenate(participant_vecs, axis=0)
-participant_sex = np.concatenate(participant_sex)
-participant_len = np.concatenate(participant_len)
-participant_age = np.concatenate(participant_age)
-node_mean_activation = node_sum / max(token_total, 1.0)
-node_subject_prevalence = node_seen_subject / max(len(participant_x), 1)
-participant_node_mean = participant_x.mean(axis=0)
-participant_node_std = participant_x.std(axis=0)
-participant_node_score = participant_node_mean * participant_node_std
-top_participant_nodes = top_indices(participant_node_score, min(48, participant_x.shape[1]))
-
-part_pca, part_pca_var = pca2(participant_x)
-part_umap = umap2(participant_x, neighbors=24, min_dist=0.08)
-
-fig, axes = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=True)
-sex_colors = np.where(participant_sex == 1, "#1f77b4", "#d62728")
-sizes = 18 + 55 * np.sqrt(participant_len / max(float(participant_len.max()), 1.0))
-
-ax = axes[0, 0]
-sc = ax.scatter(part_pca[:, 0], part_pca[:, 1], c=participant_age, s=sizes, cmap="viridis", alpha=0.75, edgecolors="none")
-ax.set_title(f"Participant PCA ({part_pca_var[0]:.1%}, {part_pca_var[1]:.1%})", loc="left")
-ax.set_xlabel("PC1")
-ax.set_ylabel("PC2")
-fig.colorbar(sc, ax=ax, label="age at censor")
-
-ax = axes[0, 1]
-segments = knn_segments(part_umap, k=5)
-if segments:
-    ax.add_collection(LineCollection(segments, colors="#999999", linewidths=0.35, alpha=0.18))
-dominant = np.argmax(participant_x[:, top_participant_nodes], axis=1) if len(top_participant_nodes) else np.zeros(len(participant_x), dtype=int)
-ax.scatter(part_umap[:, 0], part_umap[:, 1], c=dominant, s=sizes, cmap="tab20", alpha=0.82, edgecolors="white", linewidths=0.3)
-ax.set_title("Participant UMAP with kNN graph", loc="left")
-ax.set_xlabel("UMAP1")
-ax.set_ylabel("UMAP2")
-
-ax = axes[1, 0]
-activation_color = participant_x[:, top_participant_nodes[0]] if len(top_participant_nodes) else participant_x.mean(axis=1)
-sc = ax.scatter(part_umap[:, 0], part_umap[:, 1], c=activation_color, s=sizes, cmap="magma", alpha=0.82, edgecolors="none")
-top_flat = int(top_participant_nodes[0]) if len(top_participant_nodes) else 0
-ax.set_title(f"Same UMAP colored by strongest variable node L{top_flat // n_features}F{top_flat % n_features}", loc="left")
-ax.set_xlabel("UMAP1")
-ax.set_ylabel("UMAP2")
-fig.colorbar(sc, ax=ax, label="log1p mean activation")
-
-ax = axes[1, 1]
-ordered_subjects = np.argsort(part_umap[:, 0])
-heat = participant_x[ordered_subjects][:, top_participant_nodes]
-heat = (heat - heat.mean(axis=0, keepdims=True)) / np.maximum(heat.std(axis=0, keepdims=True), EPS)
-im = ax.imshow(np.clip(heat, -2.5, 2.5), aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-2.5, vmax=2.5)
-labels = [f"L{int(i) // n_features}F{int(i) % n_features}" for i in top_participant_nodes]
-tick_idx = np.linspace(0, max(len(labels) - 1, 0), min(12, len(labels)), dtype=int)
-ax.set_xticks(tick_idx)
-ax.set_xticklabels([labels[i] for i in tick_idx], rotation=60, ha="right", fontsize=8)
-ax.set_yticks([])
-ax.set_title("Participant x top-node activation fingerprint", loc="left")
-ax.set_xlabel("high-variance CLT nodes")
-ax.set_ylabel("participants ordered by UMAP1")
-fig.colorbar(im, ax=ax, label="z-scored activation")
-fig.suptitle(f"Participant-level CLT activation geometry (n={len(participant_x)})", fontsize=14, fontweight="bold")
 plt.show()
 
-# 3. Node-level PCA/UMAP and feature graph.
-node_features = np.column_stack([
-    np.log1p(dec_norm.reshape(-1)),
-    np.log1p(enc_norm.reshape(-1)),
-    np.log(np.maximum(theta.reshape(-1), EPS)),
-    alignment.reshape(-1),
-    np.log1p(node_mean_activation.reshape(-1)),
-    node_subject_prevalence.reshape(-1),
-    layer_ids / max(layers - 1, 1),
-])
-node_score = dec_norm * np.log1p(enc_norm) * np.log1p(node_mean_activation) / np.sqrt(np.maximum(theta, EPS))
-sample_node_flat = top_indices(node_score, min(NODE_UMAP_SAMPLE, node_score.size))
-node_pca_all, node_pca_var = pca2(node_features)
-node_umap_sample = umap2(node_features[sample_node_flat], neighbors=30, min_dist=0.05)
-node_umap = np.full((node_features.shape[0], 2), np.nan, dtype=np.float32)
-node_umap[sample_node_flat] = node_umap_sample
 
+# 2. Node geometry.
+node_size = 8 + 120 * (flat_score / max(float(flat_score.max()), EPS)) ** 0.65
+fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
+fig.suptitle("CLT node geometry", fontsize=14, fontweight="bold")
+
+ax = axes[0]
+sc = ax.scatter(node_pca[:, 0], node_pca[:, 1], c=layer_id, s=node_size, cmap="tab10", alpha=0.62, linewidths=0)
+for flat in top_nodes[:MAX_LABELS]:
+    ax.text(node_pca[flat, 0], node_pca[flat, 1], node_label(flat, n_features), fontsize=8)
+ax.set_title(f"PCA of node weights ({pca_var[0]:.1%}, {pca_var[1]:.1%})", loc="left")
+ax.set_xlabel("PC1")
+ax.set_ylabel("PC2")
+fig.colorbar(sc, ax=ax, label="layer")
+
+ax = axes[1]
+sc = ax.scatter(node_umap[:, 0], node_umap[:, 1], c=np.log10(flat_score + EPS), s=node_size, cmap="magma", alpha=0.68, linewidths=0)
+for flat in top_nodes[:MAX_LABELS]:
+    ax.text(node_umap[flat, 0], node_umap[flat, 1], node_label(flat, n_features), fontsize=8)
+ax.set_title("UMAP of node weights", loc="left")
+ax.set_xlabel("UMAP1")
+ax.set_ylabel("UMAP2")
+fig.colorbar(sc, ax=ax, label="log10 node score")
+plt.show()
+
+
+# 3. Decoder-mediated graph on UMAP.
 edges = []
 for source_layer, target_layer in pairs:
     block = decoder_block(state, pairs, diag_w, source_layer, target_layer)
-    source_candidates = top_indices(np.linalg.norm(block, axis=-1) * np.log1p(node_mean_activation[source_layer]), TOP_NODE_CANDIDATES)
-    target_candidates = top_indices(enc_norm[target_layer] * np.log1p(node_mean_activation[target_layer]), TOP_NODE_CANDIDATES)
-    if len(source_candidates) == 0 or len(target_candidates) == 0:
-        continue
+    source_score = np.linalg.norm(block, axis=1) * np.log1p(enc_norm[source_layer])
+    target_score = enc_norm[target_layer] * theta_inv[target_layer]
+    source_candidates = top_indices(source_score, min(96, n_features))
+    target_candidates = top_indices(target_score, min(96, n_features))
     scores = block[source_candidates] @ enc[target_layer, target_candidates].T
-    take = min(GRAPH_EDGES, scores.size)
-    flat = np.argpartition(-np.abs(scores).reshape(-1), take - 1)[:take]
-    for item in flat:
+    take = min(MAX_GRAPH_EDGES, scores.size)
+    chosen = np.argpartition(-np.abs(scores).reshape(-1), take - 1)[:take]
+    for item in chosen:
         i = int(item // scores.shape[1])
         j = int(item % scores.shape[1])
         s_feat = int(source_candidates[i])
         t_feat = int(target_candidates[j])
         s_flat = source_layer * n_features + s_feat
         t_flat = target_layer * n_features + t_feat
-        if np.isfinite(node_umap[s_flat]).all() and np.isfinite(node_umap[t_flat]).all():
-            edges.append((s_flat, t_flat, float(scores[i, j])))
-edges = sorted(edges, key=lambda e: abs(e[2]), reverse=True)[:GRAPH_EDGES]
+        edges.append((s_flat, t_flat, float(scores[i, j])))
+edges = sorted(edges, key=lambda e: abs(e[2]), reverse=True)[:MAX_GRAPH_EDGES]
 
-fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
-
-ax = axes[0]
-node_size = 5 + 80 * (node_score.reshape(-1) / max(float(node_score.max()), EPS)) ** 0.6
-sc = ax.scatter(
-    node_pca_all[:, 0],
-    node_pca_all[:, 1],
-    c=layer_ids,
-    s=node_size,
-    cmap="tab10",
-    alpha=0.55,
-    linewidths=0,
-)
-for flat in top_indices(node_score, min(14, node_score.size)):
-    layer = int(flat // n_features)
-    feature = int(flat % n_features)
-    ax.text(node_pca_all[flat, 0], node_pca_all[flat, 1], f"L{layer}F{feature}", fontsize=8)
-ax.set_title(f"Node PCA ({node_pca_var[0]:.1%}, {node_pca_var[1]:.1%})", loc="left")
-ax.set_xlabel("PC1")
-ax.set_ylabel("PC2")
-fig.colorbar(sc, ax=ax, label="layer")
-
-ax = axes[1]
-sample_layers = layer_ids[sample_node_flat]
-sample_sizes = node_size[sample_node_flat]
-ax.scatter(
-    node_umap_sample[:, 0],
-    node_umap_sample[:, 1],
-    c=sample_layers,
-    s=sample_sizes,
-    cmap="tab10",
-    alpha=0.62,
-    linewidths=0,
-)
+fig, ax = plt.subplots(figsize=(12, 9), constrained_layout=True)
+ax.scatter(node_umap[:, 0], node_umap[:, 1], c=layer_id, s=node_size, cmap="tab10", alpha=0.36, linewidths=0)
 if edges:
-    max_edge = max(abs(e[2]) for e in edges)
+    max_edge = max(abs(edge[2]) for edge in edges)
     segments, colors, widths = [], [], []
     for s_flat, t_flat, weight in edges:
         segments.append([node_umap[s_flat], node_umap[t_flat]])
-        colors.append("#d62728" if weight > 0 else "#1f77b4")
-        widths.append(0.4 + 3.5 * abs(weight) / max_edge)
-    ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=0.35))
-for flat in top_indices(node_score, min(LABEL_NODES, node_score.size)):
-    if np.isfinite(node_umap[flat]).all():
-        layer = int(flat // n_features)
-        feature = int(flat % n_features)
-        ax.text(node_umap[flat, 0], node_umap[flat, 1], f"L{layer}F{feature}", fontsize=8)
-ax.set_title("Node UMAP with decoder-mediated edges", loc="left")
-ax.set_xlabel("UMAP1")
-ax.set_ylabel("UMAP2")
-fig.suptitle("Node-level CLT geometry and graph", fontsize=14, fontweight="bold")
+        colors.append("#c62828" if weight > 0 else "#1565c0")
+        widths.append(0.35 + 3.2 * abs(weight) / max_edge)
+    ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=0.32))
+for flat in top_nodes[:MAX_LABELS]:
+    ax.text(node_umap[flat, 0], node_umap[flat, 1], node_label(flat, n_features), fontsize=8)
+ax.set_title("Decoder-mediated CLT feature graph", loc="left")
+ax.set_xlabel("node UMAP1")
+ax.set_ylabel("node UMAP2")
 plt.show()
 
-# 4. Participant-driven node coactivation graph.
-co_nodes = top_participant_nodes[: min(72, len(top_participant_nodes))]
-if len(co_nodes) >= 4:
-    x_top = participant_x[:, co_nodes]
-    corr = np.corrcoef(x_top, rowvar=False)
-    corr = np.nan_to_num(corr)
-    tri = np.triu_indices_from(corr, k=1)
-    edge_scores = np.abs(corr[tri])
-    take = min(160, edge_scores.size)
-    chosen = np.argpartition(-edge_scores, take - 1)[:take]
-    co_edges = [(int(tri[0][i]), int(tri[1][i]), float(corr[tri[0][i], tri[1][i]])) for i in chosen]
-    co_edges = sorted(co_edges, key=lambda e: abs(e[2]), reverse=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
-    ax = axes[0]
-    labels = [f"L{int(i) // n_features}F{int(i) % n_features}" for i in co_nodes]
-    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
-    tick_idx = np.linspace(0, len(labels) - 1, min(18, len(labels)), dtype=int)
-    ax.set_xticks(tick_idx)
-    ax.set_yticks(tick_idx)
-    ax.set_xticklabels([labels[i] for i in tick_idx], rotation=70, ha="right", fontsize=7)
-    ax.set_yticklabels([labels[i] for i in tick_idx], fontsize=7)
-    ax.set_title("Top-node participant coactivation matrix", loc="left")
-    fig.colorbar(im, ax=ax, label="corr across participants")
+# 4. Layer interactions and node diagnostics.
+layer_interaction = np.zeros((layers, layers), dtype=np.float64)
+for source_layer in range(layers):
+    for target_layer in range(layers):
+        if target_layer < source_layer:
+            continue
+        block = decoder_block(state, pairs, diag_w, source_layer, target_layer)
+        layer_interaction[source_layer, target_layer] = np.linalg.norm(block)
 
-    ax = axes[1]
-    coords = node_umap[co_nodes]
-    finite = np.isfinite(coords).all(axis=1)
-    if finite.sum() >= 4:
-        max_corr = max(abs(e[2]) for e in co_edges) if co_edges else 1.0
-        segments, colors, widths = [], [], []
-        for a, b, corr_value in co_edges:
-            if finite[a] and finite[b]:
-                segments.append([coords[a], coords[b]])
-                colors.append("#d62728" if corr_value > 0 else "#1f77b4")
-                widths.append(0.25 + 3.0 * abs(corr_value) / max_corr)
-        if segments:
-            ax.add_collection(LineCollection(segments, colors=colors, linewidths=widths, alpha=0.22))
-        node_colors = [int(i) // n_features for i in co_nodes]
-        ax.scatter(
-            coords[finite, 0],
-            coords[finite, 1],
-            c=np.asarray(node_colors)[finite],
-            s=30 + 160 * node_subject_prevalence.reshape(-1)[co_nodes][finite],
-            cmap="tab10",
-            alpha=0.8,
-            edgecolors="white",
-            linewidths=0.4,
-        )
-        for rank, idx in enumerate(np.where(finite)[0][:LABEL_NODES]):
-            flat = int(co_nodes[idx])
-            ax.text(coords[idx, 0], coords[idx, 1], f"L{flat // n_features}F{flat % n_features}", fontsize=8)
-    ax.set_title("Coactivation graph on node UMAP", loc="left")
-    ax.set_xlabel("node UMAP1")
-    ax.set_ylabel("node UMAP2")
-    fig.suptitle("Participant-driven CLT node communities", fontsize=14, fontweight="bold")
-    plt.show()
+fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+fig.suptitle("CLT weight diagnostics", fontsize=14, fontweight="bold")
 
-# 5. Weight/activation diagnostics.
-fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
 ax = axes[0, 0]
 im = ax.imshow(np.log10(dec_norm + EPS), aspect="auto", interpolation="nearest", cmap="magma")
-ax.set_title("Decoder strength per node", loc="left")
-ax.set_xlabel("feature id")
+ax.set_title("Decoder norm per node", loc="left")
+ax.set_xlabel("feature")
 ax.set_ylabel("layer")
 ax.set_yticks(np.arange(layers))
-fig.colorbar(im, ax=ax, label="log10(||diag decoder||)")
+fig.colorbar(im, ax=ax, label="log10 ||decoder||")
 
 ax = axes[0, 1]
-heat = np.log10(node_mean_activation + EPS)
-im = ax.imshow(heat, aspect="auto", interpolation="nearest", cmap="viridis")
-ax.set_title("Mean activation per node on sampled participants", loc="left")
-ax.set_xlabel("feature id")
+im = ax.imshow(np.log10(theta + EPS), aspect="auto", interpolation="nearest", cmap="viridis")
+ax.set_title("JumpReLU threshold per node", loc="left")
+ax.set_xlabel("feature")
 ax.set_ylabel("layer")
 ax.set_yticks(np.arange(layers))
-fig.colorbar(im, ax=ax, label="log10(mean activation)")
+fig.colorbar(im, ax=ax, label="log10 theta")
 
 ax = axes[1, 0]
-scatter = ax.scatter(
-    theta.reshape(-1),
-    dec_norm.reshape(-1),
-    c=node_subject_prevalence.reshape(-1),
-    s=node_size,
-    cmap="plasma",
-    alpha=0.58,
-    linewidths=0,
-)
-ax.set_xscale("log")
-ax.set_yscale("log")
-ax.set_title("Threshold vs decoder strength", loc="left")
-ax.set_xlabel("JumpReLU theta")
-ax.set_ylabel("||diag decoder||")
-fig.colorbar(scatter, ax=ax, label="participant prevalence")
-ax.grid(which="both", color="#e5e5e5", lw=0.6)
+norm = TwoSlopeNorm(vcenter=0, vmin=-1, vmax=1)
+im = ax.imshow(alignment, aspect="auto", interpolation="nearest", cmap="coolwarm", norm=norm)
+ax.set_title("Encoder/decoder cosine alignment", loc="left")
+ax.set_xlabel("feature")
+ax.set_ylabel("layer")
+ax.set_yticks(np.arange(layers))
+fig.colorbar(im, ax=ax, label="cosine")
 
 ax = axes[1, 1]
-for layer in range(layers):
-    vals = alignment[layer]
-    ax.hist(vals[np.isfinite(vals)], bins=50, alpha=0.45, label=f"layer {layer}")
-ax.axvline(0, color="#777", lw=0.8)
-ax.set_title("Encoder/decoder cosine alignment", loc="left")
-ax.set_xlabel("cosine(enc_weight, diag_decoder)")
-ax.set_ylabel("nodes")
-ax.legend(loc="best", ncol=2)
-fig.suptitle(f"CLT node diagnostics - {latest['path'].name}", fontsize=14, fontweight="bold")
+im = ax.imshow(layer_interaction, aspect="equal", interpolation="nearest", cmap="Blues")
+ax.set_title("Decoder block strength by layer pair", loc="left")
+ax.set_xlabel("target layer")
+ax.set_ylabel("source layer")
+ax.set_xticks(np.arange(layers))
+ax.set_yticks(np.arange(layers))
+for source_layer in range(layers):
+    for target_layer in range(layers):
+        ax.text(target_layer, source_layer, f"{layer_interaction[source_layer, target_layer]:.2g}", ha="center", va="center", fontsize=9)
+fig.colorbar(im, ax=ax, label="Frobenius norm")
 plt.show()
 
-if not metric_history:
-    print("No clt_metrics.jsonl yet. Rerun CLT with the updated trainer for dense training curves.")
+
+# 5. Top-node bars.
+bar_nodes = top_nodes[: min(20, len(top_nodes))]
+bar_labels = [node_label(flat, n_features) for flat in bar_nodes]
+fig, ax = plt.subplots(figsize=(13, 6), constrained_layout=True)
+y = np.arange(len(bar_nodes))[::-1]
+colors = plt.cm.tab10(layer_id[bar_nodes] % 10)
+ax.barh(y, flat_score[bar_nodes][::-1], color=colors[::-1], alpha=0.82)
+ax.set_yticks(y)
+ax.set_yticklabels(bar_labels[::-1])
+ax.set_xlabel("node score = decoder_norm * log1p(encoder_norm) / sqrt(theta)")
+ax.set_title("Highest-scoring CLT nodes", loc="left")
+plt.show()
+
+if len(metrics) < 2:
+    print("\nNo dense clt_metrics.jsonl time series yet; the trend plot uses saved artifacts only.")
+    print("The CLT trainer now writes clt_metrics.jsonl on new runs, so rerun CLT to get real curves.")
