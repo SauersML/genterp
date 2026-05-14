@@ -143,3 +143,33 @@ def test_cohort_dataset_reads_materialized_atoms(tmp_path):
 
     assert item["static_atoms"] == [5]
     assert item["event_atoms"] == [6]
+
+
+def test_atom_counts_only_use_materialized_split(tmp_path):
+    pl.DataFrame(
+        {
+            "subject_id": [1, 1, 2, 2],
+            "time_seconds": [0, 86400, 0, 86400],
+            "atom": [5, 6, 7, 8],
+            "value": [None, None, None, None],
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2],
+            "start": [0, 2],
+            "end": [1, 3],
+            "sex": [0, 1],
+            "birth_seconds": [0, 0],
+            "censor_seconds": [86400 * 10, 86400 * 10],
+            "split": ["train", "test"],
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+
+    train = CohortDataset(tmp_path, split="train")
+    counts = train.atom_counts(16)
+
+    assert counts[5] == 0
+    assert counts[6] == 1
+    assert counts[7] == 0
+    assert counts[8] == 0

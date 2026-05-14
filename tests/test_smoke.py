@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from genterp import Genterp
-from genterp.modeling import marked_tpp_value_loss
+from genterp.modeling import MarkedTPPHead, marked_tpp_value_loss
 from tests._factories import make_batch, tiny_config
 
 
@@ -45,6 +45,91 @@ def test_mark_output_uses_atom_embedding_weight():
     model = Genterp(tiny_config())
 
     assert model.tpp.mark_out.weight is model.embed.embedding.weight
+
+
+def test_forward_uses_sex_context():
+    cfg = tiny_config()
+    torch.manual_seed(0)
+    model = Genterp(cfg).eval()
+    batch = make_batch(B=2, n_atoms=cfg.n_atoms)
+    same_inputs = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+    same_inputs["sex"] = torch.zeros_like(batch["sex"])
+    changed_sex = {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in same_inputs.items()}
+    changed_sex["sex"] = torch.ones_like(batch["sex"])
+
+    with torch.no_grad():
+        out_a = model(**same_inputs)["hidden"]
+        out_b = model(**changed_sex)["hidden"]
+
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_value_head_student_t_limits_outlier_gradients():
+    cfg = tiny_config()
+    model = Genterp(cfg)
+    hidden = torch.zeros(1, cfg.dim, requires_grad=True)
+    concept = torch.zeros(1, cfg.dim)
+    target = torch.tensor([100.0])
+
+    loss = model.value_head.nll(hidden, concept, target).sum()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
+    assert hidden.grad.norm().item() < 10.0
+
+
+def test_value_loss_reports_and_clips_extreme_magnitudes():
+    cfg = tiny_config()
+    model = Genterp(cfg)
+    model.value_mod.set_stats(
+        value_mu=torch.zeros(cfg.n_atoms),
+        value_sigma=torch.ones(cfg.n_atoms),
+        atom_has_mag=torch.ones(cfg.n_atoms, dtype=torch.bool),
+    )
+    batch = make_batch(n_atoms=cfg.n_atoms)
+    batch["event_values"] = torch.full_like(batch["event_values"], 1e30)
+
+    ld = model.loss(**batch)
+
+    assert torch.isfinite(ld["loss"])
+    assert ld["value_z_abs_max"].item() <= model.value_mod.z_clip
+    assert ld["value_z_clipped"].item() > 0
+    assert ld["value_nll_max"].item() < 20.0
+
+
+def test_mark_negative_cache_is_transient():
+    weight = torch.nn.Parameter(torch.randn(16, 8))
+    tpp = MarkedTPPHead(8, 16, weight, sampled_mark_negatives=4)
+    hidden = torch.randn(3, 8)
+    delta_t = torch.ones(3)
+    target = torch.tensor([1, 2, 3])
+
+    tpp.sampled_mark_nll(hidden, delta_t, target)
+
+    assert tpp._mark_negative_cache.numel() > 0
+    assert "_mark_negative_cache" not in tpp.state_dict()
+
+
+def test_mark_negative_cache_is_reused_and_reset_when_distribution_changes():
+    weight = torch.nn.Parameter(torch.randn(16, 8))
+    tpp = MarkedTPPHead(8, 16, weight, sampled_mark_negatives=4)
+
+    first = tpp._sample_mark_negatives(4)
+    cache_id = tpp._mark_negative_cache.data_ptr()
+    offset_after_first = tpp._mark_negative_cache_offset
+    second = tpp._sample_mark_negatives(4)
+
+    assert tpp._mark_negative_cache.data_ptr() == cache_id
+    assert tpp._mark_negative_cache_offset == offset_after_first + 4
+    assert not torch.equal(first, second)
+
+    counts = torch.arange(16, dtype=torch.float32)
+    tpp.set_mark_noise_distribution(counts)
+
+    assert tpp._mark_negative_cache.numel() == 0
+    assert tpp._mark_negative_cache_offset == 0
 
 
 def test_mark_loss_samples_negatives_only_while_training(monkeypatch):

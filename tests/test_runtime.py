@@ -4,11 +4,12 @@ from types import SimpleNamespace
 
 import torch
 
-from genterp.runtime import GIB, accelerator_label, batch_size_for_cuda_memory, get_torch_runtime
+from genterp.runtime import GIB, TorchRuntime, accelerator_label, batch_size_for_cuda_memory, configure_torch_runtime, get_torch_runtime
 
 
 def test_cuda_batch_size_scales_with_visible_memory():
     assert batch_size_for_cuda_memory(12 * GIB) == 1
+    assert batch_size_for_cuda_memory(15 * GIB) == 2
     assert batch_size_for_cuda_memory(20 * GIB) == 2
     assert batch_size_for_cuda_memory(40 * GIB) == 4
     assert batch_size_for_cuda_memory(64 * GIB) == 8
@@ -83,6 +84,34 @@ def test_cuda_runtime_uses_fp16_without_unsupported_newer_cuda_features(monkeypa
     assert not runtime.use_data_parallel
 
 
+def test_cuda_runtime_survives_bf16_probe_failure(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            total_memory=24 * GIB,
+            name="ampere-with-bad-driver-probe",
+            major=8,
+            minor=0,
+            multi_processor_count=80,
+        ),
+    )
+
+    def fail_bf16():
+        raise RuntimeError("driver probe failed")
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", fail_bf16)
+
+    runtime = get_torch_runtime()
+
+    assert not runtime.bf16
+    assert runtime.fp16
+    assert runtime.tf32
+
+
 def test_cuda_runtime_keeps_pre_tensor_core_devices_in_fp32(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
@@ -109,6 +138,29 @@ def test_cuda_runtime_keeps_pre_tensor_core_devices_in_fp32(monkeypatch):
     assert not runtime.tf32
     assert not runtime.torch_compile
     assert runtime.optim == "adamw_torch"
+
+
+def test_cuda_runtime_uses_property_fallbacks(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            total_memory=20 * GIB,
+            name="capability-from-api",
+            multi_processor_count=24,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.cuda_capability == (7, 0)
+    assert runtime.fp16
+    assert runtime.per_device_train_batch_size == 2
 
 
 def test_cuda_runtime_picks_best_visible_mixed_gpu(monkeypatch):
@@ -159,6 +211,43 @@ def test_cuda_runtime_prefers_larger_fp16_device_over_smaller_fp16_device(monkey
     assert set_devices == [2]
 
 
+def test_rocm_like_cuda_runtime_avoids_nvidia_only_options(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            total_memory=64 * GIB,
+            name="rocm-accelerator",
+            major=9,
+            minor=0,
+            multi_processor_count=120,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", "6.0.0", raising=False)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.bf16
+    assert not runtime.tf32
+    assert not runtime.torch_compile
+    assert runtime.optim == "adamw_torch"
+
+
+def test_cuda_available_with_no_devices_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.device.type == "cpu"
+    assert runtime.cuda_device_count == 0
+
+
 def test_mps_runtime_avoids_cuda_only_options(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
@@ -172,3 +261,34 @@ def test_mps_runtime_avoids_cuda_only_options(monkeypatch):
     assert not runtime.torch_compile
     assert runtime.optim == "adamw_torch"
     assert not runtime.dataloader_pin_memory
+
+
+def test_configure_runtime_tolerates_missing_cuda_backend_hooks(monkeypatch):
+    calls = []
+
+    runtime = TorchRuntime(
+        device=torch.device("cuda", 0),
+        cuda_device_count=1,
+        cuda_name="accelerator",
+        cuda_capability=(8, 0),
+        per_device_train_batch_size=2,
+        bf16=True,
+        fp16=False,
+        tf32=True,
+        torch_compile=True,
+        torch_compile_backend="inductor",
+        torch_compile_mode="reduce-overhead",
+        optim="adamw_torch_fused",
+        use_data_parallel=False,
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=4,
+        auto_find_batch_size=True,
+    )
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda value: calls.append(value))
+    monkeypatch.setattr(torch.backends.cuda, "enable_flash_sdp", lambda _: (_ for _ in ()).throw(RuntimeError("no flash")))
+
+    configured = configure_torch_runtime(runtime)
+
+    assert configured is runtime
+    assert calls == ["high"]

@@ -9,7 +9,11 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 
 from genterp.runtime import TorchRuntime
 from genterp.train import (
+    EVAL_STEPS,
     GenterpTrainer,
+    LOGGING_STEPS,
+    SAVE_STEPS,
+    SAVE_TOTAL_LIMIT,
     _limit_eval_worker,
     build_training_args,
     checkpoint_is_complete,
@@ -161,6 +165,10 @@ def test_training_args_use_wsd_and_cuda_gradient_checkpointing(tmp_path: Path):
         "decay_type": "linear",
         "min_lr_ratio": 0.0,
     }
+    assert args["logging_steps"] == LOGGING_STEPS
+    assert args["eval_steps"] == EVAL_STEPS
+    assert args["save_steps"] == SAVE_STEPS
+    assert args["save_total_limit"] == SAVE_TOTAL_LIMIT
     assert args["gradient_checkpointing"] is True
     assert args["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
 
@@ -198,6 +206,39 @@ def test_trainer_skips_incompatible_optimizer_and_scaler_state(tmp_path: Path, m
 
     trainer._load_optimizer_and_scheduler(str(tmp_path))
     trainer._load_scaler(str(tmp_path))
+
+
+def test_trainer_keeps_lengths_on_host_for_attention_control_flow(tmp_path: Path):
+    runtime = TorchRuntime(
+        device=torch.device("meta"),
+        cuda_device_count=0,
+        cuda_name=None,
+        cuda_capability=None,
+        per_device_train_batch_size=1,
+        bf16=False,
+        fp16=False,
+        tf32=False,
+        torch_compile=False,
+        torch_compile_backend=None,
+        torch_compile_mode=None,
+        optim="adamw_torch",
+        use_data_parallel=False,
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+        dataloader_prefetch_factor=None,
+        auto_find_batch_size=False,
+    )
+    trainer = GenterpTrainer(
+        model=torch.nn.Linear(1, 1),
+        args=transformers.TrainingArguments(output_dir=str(tmp_path)),
+        runtime=runtime,
+    )
+    batch = {"event_atoms": torch.ones(2, 4), "length": torch.tensor([4, 2])}
+
+    prepared = trainer._prepare_input(batch)
+
+    assert prepared["event_atoms"].device == runtime.device
+    assert prepared["length"].device.type == "cpu"
 
 
 def test_dataloader_worker_thread_limits(monkeypatch):

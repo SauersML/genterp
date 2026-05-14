@@ -93,6 +93,10 @@ CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 MAX_STEPS = 50_000
 WARMUP_STEPS = 500
 WSD_DECAY_STEPS = MAX_STEPS // 10
+LOGGING_STEPS = 50
+EVAL_STEPS = 2_000
+SAVE_STEPS = 2_000
+SAVE_TOTAL_LIMIT = 3
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -148,6 +152,65 @@ class VerboseTrainerProgressCallback(transformers.TrainerCallback):
     def __init__(self) -> None:
         self.logger = ProgressLogger("trainer", total_units=None)
 
+    @staticmethod
+    def _format_metrics(logs: dict[str, object] | None) -> str:
+        if not logs:
+            return "no metrics payload"
+        ordered = [
+            "loss",
+            "eval_loss",
+            "learning_rate",
+            "grad_norm",
+            "time_nll",
+            "mark_nll",
+            "value_nll",
+            "value_nll_max",
+            "value_z_abs_max",
+            "value_z_clip_pct",
+            "censor_nll",
+            "n_real",
+            "n_censor",
+            "n_mag",
+            "real_per_subject",
+            "censor_per_subject",
+            "mag_per_real",
+            "eval_runtime",
+            "eval_samples_per_second",
+            "eval_steps_per_second",
+            "eval_time_nll",
+            "eval_mark_nll",
+            "eval_value_nll",
+            "eval_value_nll_max",
+            "eval_value_z_abs_max",
+            "eval_value_z_clip_pct",
+            "eval_censor_nll",
+            "eval_n_real",
+            "eval_n_censor",
+            "eval_n_mag",
+            "eval_real_per_subject",
+            "eval_censor_per_subject",
+            "eval_mag_per_real",
+            "epoch",
+        ]
+        pieces = [f"{key}={logs[key]}" for key in ordered if key in logs]
+        pieces.extend(f"{key}={value}" for key, value in sorted(logs.items()) if key not in ordered)
+        alerts = []
+        n_censor = logs.get("n_censor")
+        if isinstance(n_censor, (int, float)) and n_censor == 0 and "loss" in logs:
+            alerts.append("NO_CENSOR_TOKENS")
+        eval_n_censor = logs.get("eval_n_censor")
+        if isinstance(eval_n_censor, (int, float)) and eval_n_censor == 0:
+            alerts.append("EVAL_NO_CENSOR_TOKENS")
+        value_nll_max = logs.get("value_nll_max")
+        if isinstance(value_nll_max, (int, float)) and value_nll_max > 8:
+            alerts.append("VALUE_OUTLIER")
+        eval_value_nll_max = logs.get("eval_value_nll_max")
+        if isinstance(eval_value_nll_max, (int, float)) and eval_value_nll_max > 8:
+            alerts.append("EVAL_VALUE_OUTLIER")
+        if alerts:
+            pieces.append(f"alerts={'+'.join(alerts)}")
+        return ", ".join(pieces)
+
     def on_train_begin(self, args, state, control, **kwargs):
         total = int(state.max_steps or args.max_steps or 0)
         self.logger.set_progress(int(state.global_step), total)
@@ -173,15 +236,13 @@ class VerboseTrainerProgressCallback(transformers.TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         total = int(state.max_steps or args.max_steps or 0)
         self.logger.set_progress(int(state.global_step), total)
-        metrics = ", ".join(f"{key}={value}" for key, value in sorted((logs or {}).items()))
-        self.logger.log("training metrics emitted", metrics or "no metrics payload")
+        self.logger.log("training metrics emitted", self._format_metrics(logs))
         return control
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         total = int(state.max_steps or args.max_steps or 0)
         self.logger.set_progress(int(state.global_step), total)
-        payload = ", ".join(f"{key}={value}" for key, value in sorted((metrics or {}).items()))
-        self.logger.log("evaluation complete", payload or "no eval metrics payload")
+        self.logger.log("evaluation complete", self._format_metrics(metrics))
         return control
 
     def on_save(self, args, state, control, **kwargs):
@@ -228,8 +289,8 @@ class GenterpTrainer(transformers.Trainer):
         # censor_nll, n_real, n_censor, n_mag). One list of per-step floats per key
         # for {train, eval}; we average on emit so each logging_steps interval (or
         # full eval pass) reports the mean component NLL over its tokens.
-        self._loss_accum_train: dict[str, list[float]] = {}
-        self._loss_accum_eval: dict[str, list[float]] = {}
+        self._loss_accum_train: dict[str, list[torch.Tensor]] = {}
+        self._loss_accum_eval: dict[str, list[torch.Tensor]] = {}
         super().__init__(*args, **kwargs)
         if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
             self.args._n_gpu = 1
@@ -245,25 +306,55 @@ class GenterpTrainer(transformers.Trainer):
         inner = model.model if hasattr(model, "model") else model
         ld = inner.loss(**inputs)
         bucket = self._loss_accum_train if model.training else self._loss_accum_eval
-        for key in ("time_nll", "mark_nll", "value_nll", "censor_nll", "n_real", "n_censor", "n_mag"):
+        for key in (
+            "time_nll",
+            "mark_nll",
+            "value_nll",
+            "value_nll_max",
+            "value_z_abs_max",
+            "value_z_clipped",
+            "censor_nll",
+            "n_real",
+            "n_censor",
+            "n_mag",
+            "n_subject",
+        ):
             tensor = ld.get(key)
             if tensor is None:
                 continue
-            bucket.setdefault(key, []).append(float(tensor.detach().item()))
+            bucket.setdefault(key, []).append(tensor.detach().float())
         loss = ld["loss"]
         if return_outputs:
             outputs = transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=loss.detach().reshape(1))
             return loss, outputs
         return loss
 
-    def _drain_loss_bucket(self, bucket: dict[str, list[float]], prefix: str = "") -> dict[str, float]:
+    def _drain_loss_bucket(self, bucket: dict[str, list[torch.Tensor]], prefix: str = "") -> dict[str, float]:
         out: dict[str, float] = {}
         for key, values in bucket.items():
             if not values:
                 continue
-            out[f"{prefix}{key}"] = sum(values) / len(values)
+            stacked = torch.stack(values)
+            reducer = torch.max if key.endswith("_max") else torch.mean
+            out[f"{prefix}{key}"] = float(reducer(stacked).cpu().item())
+        self._add_derived_metrics(out, prefix)
         bucket.clear()
         return out
+
+    @staticmethod
+    def _add_derived_metrics(logs: dict[str, float], prefix: str = "") -> None:
+        n_subject = logs.get(f"{prefix}n_subject", 0.0)
+        n_real = logs.get(f"{prefix}n_real", 0.0)
+        n_censor = logs.get(f"{prefix}n_censor", 0.0)
+        n_mag = logs.get(f"{prefix}n_mag", 0.0)
+        n_clipped = logs.get(f"{prefix}value_z_clipped", 0.0)
+        if n_subject > 0:
+            logs[f"{prefix}real_per_subject"] = n_real / n_subject
+            logs[f"{prefix}censor_per_subject"] = n_censor / n_subject
+        if n_real > 0:
+            logs[f"{prefix}mag_per_real"] = n_mag / n_real
+        if n_mag > 0:
+            logs[f"{prefix}value_z_clip_pct"] = 100.0 * n_clipped / n_mag
 
     def log(self, logs, *args, **kwargs):
         """Merge accumulated component metrics into the next emitted log payload.
@@ -371,7 +462,10 @@ class GenterpTrainer(transformers.Trainer):
             device = self.runtime.device if self.runtime is not None else self.args.device
             return data.to(device, non_blocking=device.type == "cuda")
         if isinstance(data, Mapping):
-            return type(data)((key, self._prepare_input(value)) for key, value in data.items())
+            return type(data)(
+                (key, value if key == "length" and isinstance(value, torch.Tensor) else self._prepare_input(value))
+                for key, value in data.items()
+            )
         if isinstance(data, tuple):
             return tuple(self._prepare_input(value) for value in data)
         if isinstance(data, list):
@@ -572,12 +666,12 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
         "tf32": runtime.tf32,
         "torch_compile": runtime.torch_compile,
         "save_strategy": "steps",
-        "save_steps": 500,
-        "save_total_limit": 5,
+        "save_steps": SAVE_STEPS,
+        "save_total_limit": SAVE_TOTAL_LIMIT,
         "eval_strategy": "steps",
-        "eval_steps": 500,
+        "eval_steps": EVAL_STEPS,
         "prediction_loss_only": True,
-        "logging_steps": 25,
+        "logging_steps": LOGGING_STEPS,
         "logging_first_step": True,
         "optim": runtime.optim,
         "dataloader_num_workers": runtime.dataloader_num_workers,
@@ -601,6 +695,12 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
         training_args["torch_compile_backend"] = runtime.torch_compile_backend
         training_args["torch_compile_mode"] = runtime.torch_compile_mode
     return training_args
+
+
+def tensor_core_padding_multiple(runtime: TorchRuntime) -> int | None:
+    if runtime.device.type == "cuda" and (runtime.fp16 or runtime.bf16):
+        return 8
+    return None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -713,7 +813,7 @@ def main(argv: list[str] | None = None) -> None:
     model.model.value_mod.set_stats(mu, sigma, has_mag)
     setup.finish_unit("apply value modulation stats", f"magnitude_atoms={int(has_mag.sum().item()):,}")
 
-    setup.start_unit("build training arguments", "max_steps=50000 with per-step logging and checkpoint saves")
+    setup.start_unit("build training arguments", "max_steps=50000 with lower-overhead logging, eval, and checkpoint cadence")
     training_args = build_training_args(output_dir, runtime)
     setup.finish_unit(
         "build training arguments",
@@ -724,12 +824,13 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     setup.start_unit("instantiate Trainer", "attaching runtime-state and verbose progress callbacks")
+    data_collator = partial(collate, pad_to_multiple_of=tensor_core_padding_multiple(runtime))
     trainer = GenterpTrainer(
         model=model,
         args=transformers.TrainingArguments(**training_args),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=collate,
+        data_collator=data_collator,
         runtime=runtime,
         reset_training_state_on_resume=reset_training_state,
         callbacks=[RuntimeStateCallback(runtime), VerboseTrainerProgressCallback()],

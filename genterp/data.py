@@ -156,16 +156,20 @@ class CohortDataset(Dataset):
 
         The events store is shared by train and eval datasets, so counting the
         raw Arrow chunks would silently include held-out subjects. Count only
-        this dataset's subject windows to keep sampled-mark training matched to
-        the training distribution and avoid train/eval leakage.
+        this dataset's predictive event tokens, after the same static/event
+        split and max-history truncation used by ``__getitem__``.
         """
         counts = np.zeros(n_atoms, dtype=np.float64)
-        for start, end in zip(self.start, self.end, strict=True):
+        for start, end, birth in zip(self.start, self.end, self.birth_seconds, strict=True):
             length = int(end) + 1 - int(start)
             if length <= 0:
                 continue
             atoms = self.event_atoms.slice(int(start), length).to_numpy(zero_copy_only=False)
-            counts += np.bincount(atoms, minlength=n_atoms)[:n_atoms]
+            times = self.event_times.slice(int(start), length).to_numpy(zero_copy_only=False)
+            delta_days = (times - float(birth)) / 86400.0
+            event_atoms = atoms[(delta_days > 0.5) & (atoms != PAD_ATOM)][-self.max_events :]
+            if event_atoms.size:
+                counts += np.bincount(event_atoms, minlength=n_atoms)[:n_atoms]
         counts[PAD_ATOM] = 0.0
         if counts.sum() <= 0:
             raise ValueError("events.parquet has no non-PAD atoms")

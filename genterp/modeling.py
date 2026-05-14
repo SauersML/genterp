@@ -33,9 +33,19 @@ def _assert_right_padded_event_mask(event_pad: torch.Tensor) -> None:
         raise ValueError("event_pad must have shape (batch, events)")
     if event_pad.numel() == 0:
         return
+    if event_pad.is_cuda:
+        return
     invalid = event_pad[:, :-1] & ~event_pad[:, 1:]
     if invalid.any().item():
         raise ValueError("event_pad must be right-padded: valid events cannot appear after padding")
+
+
+def _length_list(event_pad: torch.Tensor, event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None) -> list[int]:
+    if isinstance(event_lengths, (list, tuple)):
+        return [int(length) for length in event_lengths]
+    if event_lengths is not None:
+        return [int(length) for length in event_lengths.detach().cpu().tolist()]
+    return [int(length) for length in (~event_pad).sum(dim=1).detach().cpu().tolist()]
 
 
 class ContinuousTimeRoPE(nn.Module):
@@ -111,10 +121,11 @@ class CausalRoPEAttention(nn.Module):
         v: torch.Tensor,
         static_len: int,
         event_pad: torch.Tensor,
+        event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None,
     ) -> torch.Tensor:
         B, S, H, D = q.shape
         _assert_right_padded_event_mask(event_pad)
-        valid_events = (~event_pad).sum(dim=1)
+        valid_event_lengths = _length_list(event_pad, event_lengths)
         out = q.new_zeros(B, S, H, D)
         dropout_p = self.dropout if self.training else 0.0
 
@@ -126,7 +137,8 @@ class CausalRoPEAttention(nn.Module):
                 dropout_p=dropout_p,
             ).transpose(1, 2)
 
-        if valid_events.max().item() == 0:
+        max_event_len = max(valid_event_lengths, default=0)
+        if max_event_len == 0:
             return out
 
         flash_fn = None
@@ -136,7 +148,7 @@ class CausalRoPEAttention(nn.Module):
             event_keep = ~event_pad
             kv_keep = torch.ones(B, S, dtype=torch.bool, device=q.device)
             kv_keep[:, static_len:] = event_keep
-            q_lens = valid_events.to(torch.int32)
+            q_lens = torch.tensor(valid_event_lengths, dtype=torch.int32, device=q.device)
             kv_lens = q_lens + static_len
             q_packed = q[:, static_len:][event_keep].contiguous()
             k_packed = k[kv_keep].contiguous()
@@ -149,20 +161,23 @@ class CausalRoPEAttention(nn.Module):
                 v_packed,
                 cu_q,
                 cu_kv,
-                int(q_lens.max().item()),
-                int(kv_lens.max().item()),
+                max_event_len,
+                max_event_len + static_len,
                 dropout_p=dropout_p,
                 causal=True,
             )
             out[:, static_len:][event_keep] = event_out
             return out
 
-        for event_len_t in valid_events.unique(sorted=True).tolist():
-            event_len = int(event_len_t)
+        for event_len in sorted(set(valid_event_lengths)):
             if event_len == 0:
                 continue
             kv_len = static_len + event_len
-            rows = valid_events == event_len
+            rows = torch.tensor(
+                [length == event_len for length in valid_event_lengths],
+                device=q.device,
+                dtype=torch.bool,
+            )
             qe = q[rows, static_len : static_len + event_len].transpose(1, 2)
             ke = k[rows, :kv_len].transpose(1, 2)
             ve = v[rows, :kv_len].transpose(1, 2)
@@ -184,6 +199,7 @@ class CausalRoPEAttention(nn.Module):
         angles: torch.Tensor,
         event_pad: torch.Tensor,
         static_len: int,
+        event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = rearrange(q, "b s (h d) -> b s h d", h=self.heads)
@@ -191,7 +207,7 @@ class CausalRoPEAttention(nn.Module):
         v = rearrange(v, "b s (h d) -> b s h d", h=self.heads)
         q = self.rope.apply(q.transpose(1, 2), angles).transpose(1, 2)
         k = self.rope.apply(k.transpose(1, 2), angles).transpose(1, 2)
-        out = self._packed_prefix_causal_attention(q, k, v, static_len, event_pad)
+        out = self._packed_prefix_causal_attention(q, k, v, static_len, event_pad, event_lengths)
         return self.proj(rearrange(out, "b s h d -> b s (h d)"))
 
 
@@ -209,9 +225,10 @@ class Block(nn.Module):
         angles: torch.Tensor,
         event_pad: torch.Tensor,
         static_len: int,
+        event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (post_block_residual, pre_mlp_residual, mlp_additive_output)."""
-        x = x + self.attn(self.norm1(x), angles, event_pad, static_len)
+        x = x + self.attn(self.norm1(x), angles, event_pad, static_len, event_lengths)
         mlp_out = self.mlp(self.norm2(x))
         return x + mlp_out, x, mlp_out
 
@@ -299,8 +316,11 @@ class ValueModulator(nn.Module):
     → tanh ≈ 0.96 at init so magnitude events start near identity multiplication.
     """
 
-    def __init__(self, dim: int, n_atoms: int, hidden: int = 64):
+    def __init__(self, dim: int, n_atoms: int, hidden: int = 64, z_clip: float = 12.0):
         super().__init__()
+        if z_clip <= 0:
+            raise ValueError("z_clip must be > 0")
+        self.z_clip = float(z_clip)
         self.value_mlp = nn.Sequential(
             nn.Linear(1 + dim, hidden),
             nn.GELU(),
@@ -326,21 +346,33 @@ class ValueModulator(nn.Module):
         sigma = self.value_sigma[leaf_atom].clamp(min=1e-6)
         z = (value.float() - mu) / sigma
         z = torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-        return _log1p_signed(z)
+        return _log1p_signed(z).clamp(min=-self.z_clip, max=self.z_clip)
 
     def forward(self, e_concept: torch.Tensor, leaf_atom: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         has_mag = self.event_has_magnitude(leaf_atom, value)
-        z = self.z_score(leaf_atom, value).unsqueeze(-1)
-        mlp_input = torch.cat([z, e_concept.float()], dim=-1)
+        selected_concepts = e_concept[has_mag]
+        selected_z = self.z_score(leaf_atom[has_mag], value[has_mag]).unsqueeze(-1)
+        mlp_input = torch.cat([selected_z, selected_concepts.float()], dim=-1)
         modulation = torch.tanh(self.value_mlp(mlp_input)).to(e_concept.dtype)
-        return torch.where(has_mag.unsqueeze(-1), e_concept * modulation, e_concept)
+        out = e_concept.clone()
+        out[has_mag] = selected_concepts * modulation
+        return out
 
 
 class ValueHead(nn.Module):
-    """Gaussian over log1p-signed z, conditioned on (hidden, predicted-leaf-atom embedding)."""
+    """Student-t over log1p-signed z, conditioned on (hidden, predicted-leaf-atom embedding)."""
 
-    def __init__(self, dim: int, hidden: int = 64):
+    def __init__(self, dim: int, hidden: int = 64, df: float = 4.0):
         super().__init__()
+        if df <= 0:
+            raise ValueError("df must be > 0")
+        self.df = float(df)
+        log_norm = (
+            math.lgamma((self.df + 1.0) * 0.5)
+            - math.lgamma(self.df * 0.5)
+            - 0.5 * (math.log(self.df) + math.log(math.pi))
+        )
+        self.register_buffer("_log_norm", torch.tensor(log_norm, dtype=torch.float32), persistent=False)
         self.net = nn.Sequential(
             nn.Linear(2 * dim, hidden),
             nn.GELU(),
@@ -353,12 +385,19 @@ class ValueHead(nn.Module):
 
     def nll(self, hidden: torch.Tensor, concept_emb: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
         mu, log_sigma = self.params(hidden, concept_emb)
-        return 0.5 * ((z_target - mu) * (-log_sigma).exp()).pow(2) + log_sigma + 0.5 * math.log(2 * math.pi)
+        df = self.df
+        y = ((z_target - mu).float() * (-log_sigma).exp().float()).pow(2) / df
+        log_prob = self._log_norm - log_sigma.float() - 0.5 * (df + 1.0) * torch.log1p(y)
+        return -log_prob.to(z_target.dtype)
 
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor, concept_emb: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         mu, log_sigma = self.params(hidden, concept_emb)
-        return mu + log_sigma.exp() * torch.randn(mu.shape, device=mu.device, dtype=mu.dtype, generator=generator)
+        gamma_shape = torch.full(mu.shape, self.df * 0.5, device=mu.device, dtype=torch.float32)
+        chi2 = 2.0 * torch._standard_gamma(gamma_shape, generator=generator)
+        noise = torch.randn(mu.shape, generator=generator, device=mu.device, dtype=mu.dtype)
+        student_t = noise / torch.sqrt((chi2 / self.df).clamp_min(torch.finfo(chi2.dtype).tiny)).to(mu.dtype)
+        return mu + log_sigma.exp() * student_t
 
 
 class MarkedTPPHead(nn.Module):
@@ -398,6 +437,8 @@ class MarkedTPPHead(nn.Module):
         mark_noise_probs = torch.ones(n_marks, dtype=torch.float32)
         mark_noise_probs[0] = 0.0
         self.register_buffer("mark_noise_probs", mark_noise_probs / mark_noise_probs.sum().clamp(min=1.0))
+        self.register_buffer("_mark_negative_cache", torch.empty(0, dtype=torch.long), persistent=False)
+        self._mark_negative_cache_offset = 0
 
     @torch.no_grad()
     def set_mark_noise_distribution(self, counts: torch.Tensor) -> None:
@@ -409,6 +450,21 @@ class MarkedTPPHead(nn.Module):
         if total <= 0:
             raise ValueError("mark noise distribution has no non-PAD mass")
         self.mark_noise_probs.copy_(probs / total)
+        self._mark_negative_cache = self._mark_negative_cache.new_empty(0)
+        self._mark_negative_cache_offset = 0
+
+    def _sample_mark_negatives(self, k: int) -> torch.Tensor:
+        if k <= 0:
+            return torch.empty(0, dtype=torch.long, device=self.mark_noise_probs.device)
+        remaining = self._mark_negative_cache.numel() - self._mark_negative_cache_offset
+        if remaining < k:
+            draw_count = max(k * 256, k)
+            self._mark_negative_cache = torch.multinomial(self.mark_noise_probs, draw_count, replacement=True)
+            self._mark_negative_cache_offset = 0
+        start = self._mark_negative_cache_offset
+        stop = start + k
+        self._mark_negative_cache_offset = stop
+        return self._mark_negative_cache[start:stop]
 
     def _phi(self, delta_t: torch.Tensor) -> torch.Tensor:
         log_dt = (delta_t.clamp(min=1e-6)).log().unsqueeze(-1)
@@ -437,7 +493,7 @@ class MarkedTPPHead(nn.Module):
             return hidden.sum() * 0.0
         features = self.mark_features(hidden, delta_t)
         k = min(self.sampled_mark_negatives, max(self.n_marks - 1, 1))
-        negatives = torch.multinomial(self.mark_noise_probs, k, replacement=False)
+        negatives = self._sample_mark_negatives(k)
         weight = self.mark_out.weight
 
         target = target.long()
@@ -471,24 +527,29 @@ class GenterpConfig:
     n_layers: int = 8
     n_static_blocks: int = 2
     k_static_summary: int = 8
+    n_sexes: int = 3
     mlp_mult: int = 4
     dropout: float = 0.0
     pad_atom_idx: int = 0
     n_time_mix: int = 8
     time_phi_dim: int = 32
     value_mlp_hidden: int = 64
+    value_z_clip: float = 12.0
     value_head_hidden: int = 64
+    value_head_df: float = 4.0
     sampled_mark_negatives: int = 4096
 
 
 class Genterp(nn.Module):
-    """Clinical FM: collapsed atom tokens, value-modulated, Set-Transformer static prefix, continuous-time RoPE, marked-TPP head, gaussian value head."""
+    """Clinical FM: collapsed atom tokens, value-modulated, Set-Transformer static prefix, continuous-time RoPE, marked-TPP head, Student-t value head."""
 
     def __init__(self, cfg: GenterpConfig):
         super().__init__()
         self.cfg = cfg
         self.embed = AtomEmbedding(cfg.n_atoms, cfg.dim, padding_idx=cfg.pad_atom_idx)
-        self.value_mod = ValueModulator(cfg.dim, cfg.n_atoms, cfg.value_mlp_hidden)
+        self.sex_embedding = nn.Embedding(cfg.n_sexes, cfg.dim)
+        nn.init.normal_(self.sex_embedding.weight, std=0.02)
+        self.value_mod = ValueModulator(cfg.dim, cfg.n_atoms, cfg.value_mlp_hidden, cfg.value_z_clip)
         self.static_encoder = SetTransformer(cfg.dim, cfg.n_heads, cfg.n_static_blocks, cfg.k_static_summary, cfg.mlp_mult)
         self.rope = ContinuousTimeRoPE(cfg.dim // cfg.n_heads)
         self.blocks = nn.ModuleList(
@@ -503,7 +564,7 @@ class Genterp(nn.Module):
             cfg.time_phi_dim,
             cfg.sampled_mark_negatives,
         )
-        self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden)
+        self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden, cfg.value_head_df)
         self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
         self.gradient_checkpointing = False
         self._gradient_checkpointing_func = checkpoint
@@ -527,21 +588,26 @@ class Genterp(nn.Module):
         self,
         static_atoms: torch.Tensor,
         static_pad: torch.Tensor,
+        sex: torch.Tensor,
         event_atoms: torch.Tensor,
         event_ages: torch.Tensor,
         event_pad: torch.Tensor,
         target_atoms: torch.Tensor,
         event_values: torch.Tensor,
+        length: torch.Tensor | None = None,
         return_transcoder_acts: bool = False,
         **loss_only_kwargs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        del loss_only_kwargs  # censor_age + sex + other loss-only or external fields ride the same batch dict
+        del loss_only_kwargs  # censor_age + other loss-only or external fields ride the same batch dict
         B = static_atoms.shape[0]
         T = event_ages.shape[1]
         K = self.cfg.k_static_summary
         device = event_ages.device
 
-        summary = self.static_encoder(self._embed(static_atoms), static_pad)
+        sex_context = self.sex_embedding(sex.long()).unsqueeze(1)
+        static_context = torch.cat([sex_context, self._embed(static_atoms)], dim=1)
+        static_context_pad = F.pad(static_pad, (1, 0), value=False)
+        summary = self.static_encoder(static_context, static_context_pad)
         events = self._embed(event_atoms)
         events = self.value_mod(events, target_atoms, event_values)
         x = torch.cat([summary, events], dim=1)
@@ -549,14 +615,15 @@ class Genterp(nn.Module):
         is_static = self._static_mask(B, K, T, device)
         ages_full = F.pad(event_ages, (K, 0), value=0.0)
         angles = self.rope.angles(ages_full, is_static)
+        event_lengths = _length_list(event_pad, length) if length is not None else None
 
         pre_mlps: list[torch.Tensor] = []
         mlp_outs: list[torch.Tensor] = []
         for blk in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, event_pad, K)
+                x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, event_pad, K, event_lengths)
             else:
-                x, pre_mlp, mlp_out = blk(x, angles, event_pad, K)
+                x, pre_mlp, mlp_out = blk(x, angles, event_pad, K, event_lengths)
             if return_transcoder_acts:
                 pre_mlps.append(pre_mlp[:, K:])
                 mlp_outs.append(mlp_out[:, K:])
@@ -610,7 +677,7 @@ def marked_tpp_value_loss(
     event_pad: torch.Tensor,
     censor_age: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Joint NLL: marked-TPP (time + mark) + value (z-space gaussian) + right-censoring.
+    """Joint NLL: marked-TPP (time + mark) + value (robust z-space density) + right-censoring.
 
     Real next event at t:    -log p(Δt|h_t) - log p(m|h_t, Δt) - has_mag · log p(z|h_t, e_m)
     Censoring:               -log S(Δt_c|h_last)
@@ -654,6 +721,9 @@ def marked_tpp_value_loss(
     z_target = value_mod.z_score(leaf_mag, value_real[mag_mask])
     value_nll_tokens = value_head.nll(h_pred[mag_mask], atom_embedding[leaf_mag], z_target)
     value_loss = value_nll_tokens.sum()
+    value_nll_max = value_nll_tokens.detach().float().max() if value_nll_tokens.numel() else hidden.new_tensor(0.0)
+    value_z_abs_max = z_target.detach().float().abs().max() if z_target.numel() else hidden.new_tensor(0.0)
+    value_z_clipped = z_target.detach().float().abs().ge(value_mod.z_clip).float().sum()
 
     time_loss = -real_time_lp.sum()
     censor_loss = -censor_time_ls.sum()
@@ -671,8 +741,12 @@ def marked_tpp_value_loss(
         "time_nll": time_nll,
         "mark_nll": mark_nll,
         "value_nll": value_nll,
+        "value_nll_max": value_nll_max,
+        "value_z_abs_max": value_z_abs_max,
+        "value_z_clipped": value_z_clipped,
         "censor_nll": censor_nll,
         "n_real": n_real,
         "n_censor": n_censor,
         "n_mag": n_mag,
+        "n_subject": hidden.new_tensor(hidden.shape[0]),
     }

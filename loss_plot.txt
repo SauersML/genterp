@@ -1,0 +1,294 @@
+"""Paste into a notebook cell. Auto-finds the active Genterp run (full or
+--tiny), prints key training diagnostics, plots loss curves, and dumps every
+event for 5 random subjects.
+
+Uses only numpy + pyarrow + matplotlib (all already in the training env).
+"""
+
+import json
+import re
+import time
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
+RUN_DIRS = [Path.home() / "genterp" / "runs", Path.home() / "genterp" / "runs-tiny"]
+ETL_DIR = Path.home() / "genterp" / "etl"
+N_SAMPLE_SUBJECTS = 1
+# Seed from OS entropy so every cell run picks a different subject — pass an
+# int here if you want reproducibility.
+RNG_SEED = None
+
+
+def latest_ckpt(d):
+    if not d.is_dir():
+        return None
+    cks = [p for p in d.iterdir() if p.is_dir() and CKPT_RE.match(p.name)]
+    return max(cks, key=lambda p: int(CKPT_RE.match(p.name).group(1))) if cks else None
+
+
+cands = [(d, latest_ckpt(d)) for d in RUN_DIRS]
+cands = [(d, c) for d, c in cands if c is not None]
+if not cands:
+    raise SystemExit(f"no checkpoints under {[str(d) for d in RUN_DIRS]}")
+run_dir, ckpt = max(cands, key=lambda dc: dc[1].stat().st_mtime)
+is_tiny = run_dir.name == "runs-tiny"
+fresh_min = (time.time() - ckpt.stat().st_mtime) / 60
+
+state = json.loads((ckpt / "trainer_state.json").read_text())
+rt = json.loads((ckpt / "genterp_runtime.json").read_text()) if (ckpt / "genterp_runtime.json").is_file() else {}
+history = state.get("log_history", [])
+train = [e for e in history if "loss" in e and "eval_loss" not in e]
+evals = [e for e in history if "eval_loss" in e]
+
+
+def col(rows, k):
+    return np.array([r[k] for r in rows if k in r], dtype=float)
+
+
+def steps(rows, k):
+    return np.array([r["step"] for r in rows if k in r], dtype=float)
+
+
+def ema(y, a=0.05):
+    if len(y) == 0:
+        return y
+    o = np.empty_like(y, dtype=float); o[0] = y[0]
+    for i in range(1, len(y)):
+        o[i] = a * y[i] + (1 - a) * o[i - 1]
+    return o
+
+
+step = int(state.get("global_step", 0))
+max_steps = int(state.get("max_steps", 0))
+pct = 100 * step / max(max_steps, 1)
+ys = col(train, "loss"); xs = steps(train, "loss")
+
+print("═" * 78)
+print(f"mode:        {'TINY' if is_tiny else 'FULL'}    {'ACTIVE' if fresh_min < 10 else f'idle {fresh_min:.0f}min'}")
+print(f"run dir:     {run_dir}")
+print(f"checkpoint:  {ckpt.name}    progress: {step:,}/{max_steps:,} ({pct:.1f}%)")
+if rt:
+    cc = rt.get("cuda_capability") or [None, None]
+    print(f"runtime:     {rt.get('device_type')}  cc={cc[0]}.{cc[1]}  {rt.get('precision')}  optim={rt.get('optim')}")
+print("─" * 78)
+if len(ys):
+    print(f"loss:        first={ys[0]:.4f}   last={ys[-1]:.4f}   best={ys.min():.4f}@step{int(xs[np.argmin(ys)]):,}   "
+          f"mean={ys.mean():.4f}   std={ys.std():.4f}")
+    recent = ys[-min(50, len(ys)):]
+    print(f"recent (last {len(recent)} logs): mean={recent.mean():.4f}  min={recent.min():.4f}  max={recent.max():.4f}")
+print("─" * 78)
+for k in ["loss", "time_nll", "mark_nll", "value_nll", "censor_nll",
+          "n_real", "n_censor", "n_mag", "grad_norm", "learning_rate"]:
+    vals = [r[k] for r in train[-50:] if k in r]
+    if vals:
+        v = np.asarray(vals, dtype=float)
+        print(f"  {k:14s} mean={v.mean():>12.5g}   min={v.min():>12.5g}   max={v.max():>12.5g}")
+if evals:
+    print("─" * 78)
+    e = evals[-1]
+    print(f"latest eval @ step {int(e.get('step', 0)):,}:  " +
+          "  ".join(f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
+                    for k, v in sorted(e.items()) if k.startswith("eval")))
+print("─" * 78)
+n_cen = sum(1 for r in train if r.get("n_censor", 0) > 0)
+n_real = sum(1 for r in train if r.get("n_real", 0) > 0)
+n_mag = sum(1 for r in train if r.get("n_mag", 0) > 0)
+print(f"target coverage:  n_real>0 {n_real}/{len(train)}   n_mag>0 {n_mag}/{len(train)}   "
+      f"n_censor>0 {n_cen}/{len(train)}")
+if n_cen == 0 and len(train) > 0:
+    print("  WARNING: censor head never sees a target.")
+print("═" * 78 + "\n")
+
+# ───────── plots ─────────
+plt.rcParams.update({
+    "figure.facecolor": "white", "axes.facecolor": "#fafafa",
+    "axes.edgecolor": "#cccccc", "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.color": "#e6e6e6", "grid.linewidth": 0.7,
+    "axes.titleweight": "semibold", "axes.titlepad": 10,
+    "legend.frameon": False, "font.family": "DejaVu Sans",
+})
+
+
+def stepfmt(x, _):
+    if x >= 1e6: return f"{x/1e6:.1f}M"
+    if x >= 1e3: return f"{x/1e3:.0f}k"
+    return f"{int(x)}"
+
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+
+ax = axes[0, 0]
+if len(ys):
+    ax.plot(xs, ys, color="#1f77b4", alpha=0.20, lw=0.8, label="train (raw)")
+    ax.plot(xs, ema(ys), color="#0a3d68", lw=2.2, label="train (EMA)")
+    cmin = np.minimum.accumulate(ys)
+    ax.plot(xs, cmin, color="#2ca02c", lw=1.2, ls=":", label="cumulative min")
+    imin = int(np.argmin(ys))
+    ax.plot(xs[imin], ys[imin], "v", color="#2ca02c", ms=11, mec="white", mew=1.2,
+            label=f"min={ys[imin]:.3f}")
+if evals:
+    ex, ey = steps(evals, "eval_loss"), col(evals, "eval_loss")
+    ax.plot(ex, ey, "o-", color="#d62728", lw=1.8, ms=7, mec="white", mew=1.2, label="eval")
+ax.set_title("Loss over time", loc="left")
+ax.set_xlabel("step"); ax.set_ylabel("loss"); ax.legend(loc="best", ncol=2)
+ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(8))
+
+ax = axes[0, 1]
+for k, c in [("time_nll", "#1b9e77"), ("mark_nll", "#d95f02"),
+             ("value_nll", "#7570b3"), ("censor_nll", "#e7298a")]:
+    if any(k in r for r in train):
+        xk, yk = steps(train, k), col(train, k)
+        ax.plot(xk, yk, color=c, alpha=0.20, lw=0.8)
+        ax.plot(xk, ema(yk), color=c, lw=1.8, label=k.replace("_nll", ""))
+ax.axhline(0, color="#999", lw=0.6, ls="--")
+ax.set_title("Component NLLs", loc="left")
+ax.set_xlabel("step"); ax.set_ylabel("nll"); ax.legend(loc="best", ncol=2)
+ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(6))
+
+ax = axes[1, 0]
+if any("grad_norm" in r for r in train):
+    xk = steps(train, "grad_norm"); g = np.clip(col(train, "grad_norm"), 1e-3, None)
+    ax.semilogy(xk, g, color="#8c564b", alpha=0.20, lw=0.8)
+    ax.semilogy(xk, ema(g), color="#8c564b", lw=2.0)
+ax.set_title("Gradient norm (log)", loc="left")
+ax.set_xlabel("step"); ax.set_ylabel("‖g‖")
+ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(6))
+ax.grid(which="both", color="#e6e6e6", lw=0.6)
+
+ax = axes[1, 1]
+if any("learning_rate" in r for r in train):
+    xk, yk = steps(train, "learning_rate"), col(train, "learning_rate")
+    ax.fill_between(xk, 0, yk, color="#666", alpha=0.12)
+    ax.plot(xk, yk, color="#666", lw=2.0)
+ax.set_title("Learning rate", loc="left")
+ax.set_xlabel("step"); ax.set_ylabel("lr")
+ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 3))
+ax.xaxis.set_major_formatter(FuncFormatter(stepfmt)); ax.xaxis.set_major_locator(MaxNLocator(6))
+
+fig.suptitle(f"Genterp — {ckpt.name}  ({'TINY' if is_tiny else 'FULL'}, step {step:,}/{max_steps:,})",
+             fontsize=14, fontweight="bold")
+plt.show()
+
+# ───────── raw token streams (ALL events per subject) ─────────
+print("\n" + "═" * 78)
+print(f"RAW TOKEN STREAMS  —  {N_SAMPLE_SUBJECTS} random subjects, ALL events")
+print("═" * 78)
+try:
+    import os
+    vocab = json.loads((ETL_DIR / "vocab.json").read_text())
+    atom_to_codes = defaultdict(list)
+    for code, aid in vocab.items():
+        atom_to_codes[int(aid)].append(code)
+    for aid in atom_to_codes:
+        atom_to_codes[aid].sort()
+
+    # Pick the subjects ONCE up front (single RNG draw). RNG_SEED=None pulls from
+    # OS entropy so every cell run lands on a fresh subject.
+    subj_table = pq.read_table(ETL_DIR / "subjects.parquet")
+    subj_rows = subj_table.to_pylist()
+    rng = np.random.default_rng(RNG_SEED)
+    pick_idx = rng.choice(len(subj_rows), size=min(N_SAMPLE_SUBJECTS, len(subj_rows)), replace=False)
+    picks = [subj_rows[int(i)] for i in pick_idx]
+    print(f"  RNG seed entropy={rng.bit_generator.state['state']['state'] & 0xFFFFFFFF:08x}  "
+          f"picked subject_ids={[p.get('subject_id', '?') for p in picks]}")
+
+    # Read events once, memory-mapped; subsequent .slice() calls are O(1) on the chunked arrays.
+    events = pq.read_table(ETL_DIR / "events.parquet",
+                           columns=["time_seconds", "atom", "value"], memory_map=True)
+    e_time = events.column("time_seconds")
+    e_atom = events.column("atom")
+    e_value = events.column("value")
+
+    # Resolve OMOP concept names so atoms read as e.g. "Aspirin 81 MG Oral Tablet"
+    # instead of "RxNorm/37418". concept_codes.json caches concept_id -> "VOCAB/CODE";
+    # we invert it, then query the OMOP `concept` table once for the names of every
+    # code that appears in the subjects already picked above.
+    code_to_name: dict[str, str] = {}
+    try:
+        cache_glob = list((ETL_DIR / "cache").glob("*"))
+        cache_dirs = [d for d in cache_glob
+                      if ("tiny" in d.name) == is_tiny and (d / "concept_codes.json").is_file()]
+        if cache_dirs:
+            cache_dir = max(cache_dirs, key=lambda d: d.stat().st_mtime)
+            cid_to_code = {int(cid): str(code)
+                           for cid, code in json.loads((cache_dir / "concept_codes.json").read_text())}
+            code_to_cid = {code: cid for cid, code in cid_to_code.items()}
+            cdr = os.environ.get("WORKSPACE_CDR")
+            if cdr:
+                from google.cloud import bigquery  # type: ignore
+                needed_atoms: set[int] = set()
+                for r in picks:
+                    needed_atoms.update(int(a) for a in
+                                        e_atom.slice(int(r["start"]),
+                                                     int(r["end"]) - int(r["start"]) + 1).to_pylist())
+                needed_codes = {c for a in needed_atoms for c in atom_to_codes.get(a, [])}
+                needed_cids = [code_to_cid[c] for c in needed_codes if c in code_to_cid]
+                if needed_cids:
+                    print(f"  resolving {len(needed_cids):,} concept names from BigQuery ({cdr})...")
+                    client = bigquery.Client()
+                    job = client.query(
+                        f"SELECT concept_id, concept_name FROM `{cdr}.concept` WHERE concept_id IN UNNEST(@ids)",
+                        job_config=bigquery.QueryJobConfig(
+                            query_parameters=[bigquery.ArrayQueryParameter("ids", "INT64", needed_cids)]
+                        ),
+                    )
+                    cid_to_name = {int(r["concept_id"]): str(r["concept_name"]) for r in job}
+                    for code, cid in code_to_cid.items():
+                        if cid in cid_to_name:
+                            code_to_name[code] = cid_to_name[cid]
+                    print(f"  resolved {len(code_to_name):,} concept names.")
+    except Exception as exc:
+        print(f"  (concept-name lookup skipped: {type(exc).__name__}: {exc})")
+
+    def _format_concept(code: str) -> str:
+        name = code_to_name.get(code)
+        return f"{code} = {name}" if name else code
+
+    for row in picks:
+        s, e = int(row["start"]), int(row["end"])
+        n_ev = e - s + 1
+        sid = row.get("subject_id", "?")
+        sex = {0: "F", 1: "M"}.get(int(row.get("sex", -1)), "?")
+        birth_s = float(row.get("birth_seconds", 0))
+        censor_s = float(row.get("censor_seconds", 0))
+        split = row.get("split", "?")
+        times = e_time.slice(s, n_ev).to_pylist()
+        atoms = e_atom.slice(s, n_ev).to_pylist()
+        vals = e_value.slice(s, n_ev).to_pylist()
+
+        subject_el = ET.Element("subject", {
+            "id": str(sid),
+            "sex": sex,
+            "split": str(split),
+            "n_events": str(n_ev),
+            "age_at_censor_years": f"{(censor_s - birth_s) / 86400 / 365.25:.2f}",
+            "birth_seconds": str(int(birth_s)),
+            "censor_seconds": str(int(censor_s)),
+        })
+        for i in range(n_ev):
+            age_days = (float(times[i]) - birth_s) / 86400.0
+            atom_id = int(atoms[i])
+            val = vals[i]
+            attrs = {
+                "idx": str(i),
+                "age_days": f"{age_days:.3f}",
+                "atom": str(atom_id),
+            }
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                attrs["value"] = f"{float(val):.6g}"
+            codes = atom_to_codes.get(atom_id, [])
+            if codes:
+                attrs["concept"] = " | ".join(_format_concept(c) for c in codes)
+            ET.SubElement(subject_el, "event", attrs)
+        ET.indent(subject_el, space="  ")
+        print(ET.tostring(subject_el, encoding="unicode"))
+except Exception as exc:
+    print(f"  (failed to dump tokens: {type(exc).__name__}: {exc})")
+print("═" * 78)

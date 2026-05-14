@@ -8,6 +8,7 @@ import shutil
 import uuid
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 from genterp.data import CohortDataset, collate
 from genterp.progress import ProgressLogger, count_parameters
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
-from genterp.train import GenterpForCausalLM, atomic_write_json, final_model_path
+from genterp.train import GenterpForCausalLM, atomic_write_json, final_model_path, tensor_core_padding_multiple
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder, harvest_transcoder_acts, unwrap_genterp_model
 
 CLT_FINAL_POINTER_FILE = "final_clt.json"
@@ -83,7 +84,13 @@ def _autocast_context(runtime: TorchRuntime) -> torch.autocast:
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     non_blocking = device.type == "cuda"
     return {
-        key: value.to(device, non_blocking=non_blocking) if isinstance(value, torch.Tensor) else value
+        key: (
+            value
+            if key == "length" and isinstance(value, torch.Tensor)
+            else value.to(device, non_blocking=non_blocking)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
         for key, value in batch.items()
     }
 
@@ -124,9 +131,10 @@ def build_clt_dataloader(
 ) -> DataLoader:
     sampler = LengthGroupedSampler(batch_size, lengths=dataset.lengths) if training else None
     workers = runtime.dataloader_num_workers
+    pad_to_multiple_of = tensor_core_padding_multiple(runtime)
     kwargs: dict[str, Any] = {
         "batch_size": batch_size,
-        "collate_fn": collate,
+        "collate_fn": partial(collate, pad_to_multiple_of=pad_to_multiple_of),
         "num_workers": workers,
         "pin_memory": runtime.dataloader_pin_memory,
         "persistent_workers": workers > 0,

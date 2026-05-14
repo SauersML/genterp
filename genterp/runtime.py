@@ -35,7 +35,7 @@ class TorchRuntime:
 
 
 def batch_size_for_cuda_memory(total_memory: int) -> int:
-    if total_memory < 16 * GIB:
+    if total_memory < 14 * GIB:
         return 1
     if total_memory < 24 * GIB:
         return 2
@@ -54,11 +54,18 @@ def _mps_available() -> bool:
 
 
 def _cuda_bf16_supported() -> bool:
-    return bool(torch.cuda.is_bf16_supported())
+    try:
+        return bool(torch.cuda.is_bf16_supported())
+    except (AttributeError, RuntimeError):
+        return False
 
 
 def _cuda_fp16_supported(capability: tuple[int, int]) -> bool:
     return capability[0] >= 7
+
+
+def _cuda_backend_is_rocm() -> bool:
+    return bool(getattr(torch.version, "hip", None))
 
 
 def _cuda_bf16_runtime_supported(capability: tuple[int, int]) -> bool:
@@ -70,7 +77,10 @@ def _cuda_capability(index: int, props: Any) -> tuple[int, int]:
     minor = getattr(props, "minor", None)
     if major is not None and minor is not None:
         return int(major), int(minor)
-    capability = torch.cuda.get_device_capability(index)
+    try:
+        capability = torch.cuda.get_device_capability(index)
+    except (AttributeError, RuntimeError):
+        return 0, 0
     return int(capability[0]), int(capability[1])
 
 
@@ -88,19 +98,19 @@ def _cuda_precision_tier(capability: tuple[int, int]) -> int:
 
 def _cuda_score(index: int, props: Any) -> tuple[int, int, int, int]:
     capability = _cuda_capability(index, props)
-    return _cuda_precision_tier(capability), int(props.total_memory), _cuda_sm_count(props), -index
+    return _cuda_precision_tier(capability), int(getattr(props, "total_memory", 0)), _cuda_sm_count(props), -index
 
 
 def _cuda_devices_are_homogeneous(props: list[Any]) -> bool:
     if len(props) < 2:
         return False
     first_capability = _cuda_capability(0, props[0])
-    first_memory = int(props[0].total_memory)
+    first_memory = int(getattr(props[0], "total_memory", 0))
     first_sms = _cuda_sm_count(props[0])
     for index, item in enumerate(props[1:], start=1):
         if _cuda_capability(index, item) != first_capability:
             return False
-        memory = int(item.total_memory)
+        memory = int(getattr(item, "total_memory", 0))
         if abs(memory - first_memory) / max(first_memory, 1) > 0.05:
             return False
         sms = _cuda_sm_count(item)
@@ -120,9 +130,40 @@ def _cuda_dataloader_workers(active_device_count: int) -> int:
     return min(8, max(2, cpu_count // 4))
 
 
+def _cuda_compile_supported(capability: tuple[int, int]) -> bool:
+    return capability[0] >= 8 and hasattr(torch, "compile") and not _cuda_backend_is_rocm()
+
+
+def _cuda_fused_optimizer_supported(capability: tuple[int, int]) -> bool:
+    return _cuda_fp16_supported(capability) and not _cuda_backend_is_rocm()
+
+
+def _set_attr_if_present(obj: object, attr: str, value: bool) -> bool:
+    if not hasattr(obj, attr):
+        return False
+    try:
+        setattr(obj, attr, value)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _call_if_present(obj: object, name: str, *args: object) -> bool:
+    fn = getattr(obj, name, None)
+    if fn is None:
+        return False
+    try:
+        fn(*args)
+    except RuntimeError:
+        return False
+    return True
+
+
 def get_torch_runtime() -> TorchRuntime:
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
+        if device_count <= 0:
+            return _non_cuda_runtime()
         all_props = [torch.cuda.get_device_properties(index) for index in range(device_count)]
         use_data_parallel = _cuda_devices_are_homogeneous(all_props)
         device_index = 0 if use_data_parallel else _best_cuda_device(all_props)
@@ -132,17 +173,17 @@ def get_torch_runtime() -> TorchRuntime:
         name = str(getattr(props, "name", "CUDA"))
         bf16 = _cuda_bf16_runtime_supported(capability)
         fp16 = not bf16 and _cuda_fp16_supported(capability)
-        tf32 = capability[0] >= 8
-        compile_model = capability[0] >= 8
+        tf32 = capability[0] >= 8 and not _cuda_backend_is_rocm()
+        compile_model = _cuda_compile_supported(capability)
         large_hopper = capability[0] >= 9
-        fused_optimizer = _cuda_fp16_supported(capability)
+        fused_optimizer = _cuda_fused_optimizer_supported(capability)
         active_device_count = device_count if use_data_parallel else 1
         return TorchRuntime(
             device=torch.device("cuda", device_index),
             cuda_device_count=device_count,
             cuda_name=name,
             cuda_capability=capability,
-            per_device_train_batch_size=batch_size_for_cuda_memory(props.total_memory),
+            per_device_train_batch_size=batch_size_for_cuda_memory(int(getattr(props, "total_memory", 0))),
             bf16=bf16,
             fp16=fp16,
             tf32=tf32,
@@ -156,6 +197,11 @@ def get_torch_runtime() -> TorchRuntime:
             dataloader_prefetch_factor=4,
             auto_find_batch_size=True,
         )
+
+    return _non_cuda_runtime()
+
+
+def _non_cuda_runtime() -> TorchRuntime:
     if _mps_available():
         return TorchRuntime(
             device=torch.device("mps"),
@@ -208,20 +254,26 @@ def configure_torch_runtime(runtime: TorchRuntime | None = None) -> TorchRuntime
     logger.finish_unit("set float32 matmul precision", "precision=high")
 
     logger.start_unit("configure TF32 flags", f"enabled={runtime.tf32}")
-    torch.backends.cuda.matmul.allow_tf32 = runtime.tf32
-    torch.backends.cudnn.allow_tf32 = runtime.tf32
-    logger.finish_unit("configure TF32 flags", f"enabled={runtime.tf32}")
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None) if cuda_backend is not None else None
+    matmul_set = _set_attr_if_present(matmul_backend, "allow_tf32", runtime.tf32) if matmul_backend is not None else False
+    cudnn_set = _set_attr_if_present(cudnn_backend, "allow_tf32", runtime.tf32) if cudnn_backend is not None else False
+    logger.finish_unit("configure TF32 flags", f"enabled={runtime.tf32} matmul={matmul_set} cudnn={cudnn_set}")
 
     logger.start_unit("configure cuDNN benchmark", f"enabled={runtime.device.type == 'cuda'}")
-    torch.backends.cudnn.benchmark = runtime.device.type == "cuda"
-    logger.finish_unit("configure cuDNN benchmark", f"enabled={runtime.device.type == 'cuda'}")
+    benchmark_set = _set_attr_if_present(cudnn_backend, "benchmark", runtime.device.type == "cuda") if cudnn_backend is not None else False
+    logger.finish_unit("configure cuDNN benchmark", f"enabled={runtime.device.type == 'cuda'} set={benchmark_set}")
 
     logger.start_unit("configure CUDA scaled-dot-product attention kernels", f"device_type={runtime.device.type}")
-    if runtime.device.type == "cuda":
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-        torch.backends.cuda.enable_math_sdp(True)
-        logger.finish_unit("configure CUDA scaled-dot-product attention kernels", "flash=True mem_efficient=True math=True")
+    if runtime.device.type == "cuda" and cuda_backend is not None:
+        flash = _call_if_present(cuda_backend, "enable_flash_sdp", True)
+        mem_efficient = _call_if_present(cuda_backend, "enable_mem_efficient_sdp", True)
+        math = _call_if_present(cuda_backend, "enable_math_sdp", True)
+        logger.finish_unit(
+            "configure CUDA scaled-dot-product attention kernels",
+            f"flash={flash} mem_efficient={mem_efficient} math={math}",
+        )
     else:
         logger.finish_unit("configure CUDA scaled-dot-product attention kernels", "skipped for non-CUDA runtime")
     return runtime
