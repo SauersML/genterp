@@ -54,6 +54,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+from sksurv.metrics import concordance_index_censored
 from torch.utils.data import DataLoader, Dataset
 
 from genterp.data import AtomVocab, EventStore, PAD_ATOM, collate
@@ -668,35 +669,50 @@ def _compute_disease_risks(
     log_mark_flat = mark_lp.index_select(-1, flat_atoms_t).view(B, G, -1)
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
+    # Clamp log-hazard before exp so a destabilized value head can't push
+    # lambda → +inf, which would silently propagate to NaN in the integral
+    # and then through the C-index (where the previous custom impl scored
+    # NaN risks as "comparable, never concordant" → C-index ≈ 0).
+    log_lambda_per_atom = log_lambda_per_atom.clamp(min=-30.0, max=20.0)
     lambda_per_atom = log_lambda_per_atom.exp()
     dgrid = torch.diff(grid, dim=-1).unsqueeze(-1)
     avg = 0.5 * (lambda_per_atom[:, :-1] + lambda_per_atom[:, 1:])
     cum_hazard_per_atom = (avg * dgrid).sum(dim=1).clamp(min=0.0)
 
     cum_hazard_set = cum_hazard_per_atom @ set_membership.t().float()
+    cum_hazard_set = torch.nan_to_num(cum_hazard_set, nan=0.0, posinf=50.0, neginf=0.0)
     return 1.0 - (-cum_hazard_set).exp()
 
 
 def _harrell_cindex(risks: np.ndarray, time_to_event: np.ndarray, observed: np.ndarray) -> tuple[float, int]:
+    """Harrell's C — delegated to ``sksurv.metrics.concordance_index_censored``.
+
+    Previously hand-rolled, which had a silent NaN-handling bug: NaN risks
+    (from numerical collapse of the hazard pipeline) made every comparison
+    return False, so concordant=0 while permissible counted every pair,
+    driving the reported C → 0 and faking "perfectly inverted" predictions
+    when the actual situation was "predictions are NaN". sksurv's
+    implementation is the survival-analysis canonical reference; we filter
+    out non-finite risks/times up front so the library never sees them.
+    """
     if len(risks) < 2:
         return float("nan"), 0
     risks = np.asarray(risks, dtype=np.float64)
     t = np.asarray(time_to_event, dtype=np.float64)
     e = np.asarray(observed, dtype=bool)
-    event_indices = np.flatnonzero(e)
-    concordant = 0.0
-    permissible = 0
-    for i in event_indices:
-        partners = t > t[i]
-        if not partners.any():
-            continue
-        rj = risks[partners]
-        ri = risks[i]
-        permissible += int(partners.sum())
-        concordant += float(np.sum(ri > rj)) + 0.5 * float(np.sum(ri == rj))
-    if permissible == 0:
+    valid = np.isfinite(risks) & np.isfinite(t)
+    if valid.sum() < 2 or not (e & valid).any():
         return float("nan"), 0
-    return concordant / permissible, permissible
+    try:
+        cindex, concordant, discordant, tied_risk, _tied_time = (
+            concordance_index_censored(e[valid], t[valid], risks[valid])
+        )
+    except (ValueError, ZeroDivisionError):
+        return float("nan"), 0
+    n_pairs = int(concordant + discordant + tied_risk)
+    if n_pairs == 0:
+        return float("nan"), 0
+    return float(cindex), n_pairs
 
 
 def _bootstrap_c(
