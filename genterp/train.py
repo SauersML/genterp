@@ -1127,7 +1127,7 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit(
         "prepare C-index cohort",
-        "OHDSI Condition top-N sweep (fall back to curated DEFAULT_DISEASES if ETL cache is legacy)",
+        "OHDSI Condition top-N sweep (domain==Condition AND standard_concept=='S')",
     )
     cindex_cohort = None
     try:
@@ -1137,22 +1137,23 @@ def main(argv: list[str] | None = None) -> None:
             prepare_cindex_cohort,
         )
         sweep_phenotypes = build_cohort_condition_phenotypes(etl, top_n=DEFAULT_SWEEP_TOP_N)
-        if sweep_phenotypes:
-            mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N} OHDSI Conditions)"
-            phenotypes_arg = sweep_phenotypes
-        else:
-            mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
-            phenotypes_arg = None
+        if not sweep_phenotypes:
+            raise SystemExit(
+                "OHDSI sweep returned no phenotypes — concept metadata missing "
+                "from ETL cache. Re-run scripts/aou_etl.py to populate "
+                "domain_id and standard_concept."
+            )
         cindex_cohort = prepare_cindex_cohort(
             etl, vocab,
             events=event_store,
             pin_memory=runtime.dataloader_pin_memory,
-            phenotypes=phenotypes_arg,
+            phenotypes=sweep_phenotypes,
             max_subjects=CINDEX_MAX_SUBJECTS_IN_LOOP,
         )
         setup.finish_unit(
             "prepare C-index cohort",
-            f"mode={mode}  subjects={len(cindex_cohort.subjects):,}  "
+            f"mode=sweep (top-{DEFAULT_SWEEP_TOP_N} OHDSI Conditions)  "
+            f"subjects={len(cindex_cohort.subjects):,}  "
             f"diseases={len(cindex_cohort.disease_names)}",
         )
     except Exception as exc:  # noqa: BLE001 — survival eval is optional; never block training

@@ -441,20 +441,18 @@ def main(argv: list[str] | None = None) -> None:
         f"OHDSI domain==Condition + top-{DEFAULT_SWEEP_TOP_N} by cohort coverage",
     )
     sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
-    cohort_mode: str
-    if sweep_phenotypes:
-        cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
-        cohort = prepare_cindex_cohort(
-            etl_dir, vocab,
-            pin_memory=runtime.dataloader_pin_memory,
-            phenotypes=sweep_phenotypes,
+    if not sweep_phenotypes:
+        raise SystemExit(
+            "OHDSI sweep returned no phenotypes — concept metadata missing "
+            "from ETL cache. Re-run scripts/aou_etl.py to populate domain_id "
+            "and standard_concept."
         )
-    else:
-        cohort_mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
-        cohort = prepare_cindex_cohort(
-            etl_dir, vocab,
-            pin_memory=runtime.dataloader_pin_memory,
-        )
+    cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
+    cohort = prepare_cindex_cohort(
+        etl_dir, vocab,
+        pin_memory=runtime.dataloader_pin_memory,
+        phenotypes=sweep_phenotypes,
+    )
     setup.finish_unit(
         "build cindex cohort",
         f"mode={cohort_mode}  subjects={len(cohort.subjects):,}  "

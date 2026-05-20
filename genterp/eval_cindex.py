@@ -90,21 +90,6 @@ class DiseasePhenotype:
         return s.strip("_")
 
 
-DEFAULT_DISEASES: list[DiseasePhenotype] = [
-    DiseasePhenotype("Type 2 diabetes mellitus", "SNOMED/44054006"),
-    DiseasePhenotype("Essential hypertension",   "SNOMED/59621000"),
-    DiseasePhenotype("Acute MI",                 "SNOMED/22298006"),
-    DiseasePhenotype("Heart failure",            "SNOMED/84114007"),
-    DiseasePhenotype("Atrial fibrillation",      "SNOMED/49436004"),
-    DiseasePhenotype("Stroke (CVA)",             "SNOMED/230690007"),
-    DiseasePhenotype("Chronic kidney disease",   "SNOMED/709044004"),
-    DiseasePhenotype("COPD",                     "SNOMED/13645005"),
-    DiseasePhenotype("Alzheimer's disease",      "SNOMED/26929004"),
-    DiseasePhenotype("Breast cancer",            "SNOMED/254837009", sex="F"),
-    DiseasePhenotype("Prostate cancer",          "SNOMED/399068003", sex="M"),
-    DiseasePhenotype("Colorectal cancer",        "SNOMED/93761005"),
-]
-
 LANDMARK_AGE_MIN_DAYS = 40.0 * 365.25
 LANDMARK_AGE_MAX_DAYS = 85.0 * 365.25
 HORIZON_DAYS = 10.0 * 365.25
@@ -295,12 +280,10 @@ class _CohortConceptCache:
 def _load_cohort_concept_cache(etl_dir: Path) -> _CohortConceptCache:
     """Read concept_codes.json + latest coverage_and_ancestors-*.json.
 
-    ``concept_codes.json`` is accepted in either the legacy 2-tuple
-    ``[[cid, code], ...]`` or the enriched 5-tuple
-    ``[[cid, code, domain, class, name], ...]`` shape. The legacy shape
-    leaves domain/class/name as empty strings so callers can detect old
-    caches and skip the domain-filtered sweep (without breaking the
-    curated DEFAULT_DISEASES path, which doesn't need domain info).
+    Current on-disk shape is the 6-tuple
+    ``[[cid, code, domain, class, standard_concept, name], ...]``.
+    Older 5-tuple and 2-tuple shapes still load; missing standard_concept
+    surfaces as an empty string and the sweep raises if it can't filter.
     """
     cache_dir = _find_etl_cache(etl_dir)
     if cache_dir is None:
@@ -314,15 +297,27 @@ def _load_cohort_concept_cache(etl_dir: Path) -> _CohortConceptCache:
         cid = int(row[0])  # type: ignore[arg-type]
         code = str(row[1])
         cid_to_code[cid] = code
-        if len(row) >= 5:
+        if len(row) >= 6:
             concept_meta[cid] = {
                 "code": code,
                 "domain": str(row[2]) if row[2] is not None else "",
                 "class": str(row[3]) if row[3] is not None else "",
+                "standard_concept": str(row[4]) if row[4] is not None else "",
+                "name": str(row[5]) if row[5] is not None else "",
+            }
+        elif len(row) >= 5:
+            concept_meta[cid] = {
+                "code": code,
+                "domain": str(row[2]) if row[2] is not None else "",
+                "class": str(row[3]) if row[3] is not None else "",
+                "standard_concept": "",
                 "name": str(row[4]) if row[4] is not None else "",
             }
         else:
-            concept_meta[cid] = {"code": code, "domain": "", "class": "", "name": ""}
+            concept_meta[cid] = {
+                "code": code, "domain": "", "class": "",
+                "standard_concept": "", "name": "",
+            }
     code_to_cid = {code: cid for cid, code in cid_to_code.items()}
 
     ca_files = sorted(cache_dir.glob("coverage_and_ancestors-*.json"),
@@ -374,7 +369,7 @@ def build_cohort_condition_phenotypes(
 
     Requires the ETL to have been re-run with the enriched concept_codes
     schema that includes ``domain_id``; older caches surface a warning and
-    return an empty list (the curated DEFAULT_DISEASES path is unaffected).
+    return an empty list and callers SystemExit, prompting an ETL re-run.
 
     Descendant atom sets come from the existing ``concept_ancestor`` closure
     — identical mechanism to the curated path, just a different seed list.
@@ -382,20 +377,28 @@ def build_cohort_condition_phenotypes(
     cache = _load_cohort_concept_cache(etl_dir)
 
     n_total = len(cache.concept_meta)
-    n_condition = sum(1 for m in cache.concept_meta.values() if m["domain"] == "Condition")
 
-    # OHDSI/SNOMED splits the Condition domain by concept_class_id: "Disorder"
-    # = actual diseases (Type 2 diabetes, MI, etc.); "Clinical Finding" /
-    # "Context-dependent category" / "Event" = generic rollups and symptoms
-    # that aren't useful prediction targets. Filter to Disorders only.
+    # OHDSI vocabulary defines a "disease" via two columns on the OMOP concept
+    # table, both populated by the OHDSI vocabulary team — not derived by us:
+    #
+    #   * ``domain_id == "Condition"``      — Condition is the OHDSI domain
+    #                                         assigned to clinical findings /
+    #                                         disorders (vs. Drug, Procedure,
+    #                                         Measurement, Observation, …).
+    #   * ``standard_concept == "S"``       — Standard concepts are the canonical
+    #                                         OHDSI-curated nodes that all
+    #                                         source codes map to (excludes
+    #                                         non-standard / classification-only
+    #                                         entries).
+    #
+    # This is the OHDSI-defined disease filter — no hierarchy heuristics.
     condition_cids = [
         cid for cid, meta in cache.concept_meta.items()
-        if meta["domain"] == "Condition" and meta["class"] == "Disorder"
+        if meta["domain"] == "Condition" and meta.get("standard_concept", "S") == "S"
     ]
     print(
-        f"  [sweep] OHDSI filter: domain=Condition AND concept_class_id=Disorder  "
-        f"→ {len(condition_cids):,} of {n_condition:,} Condition concepts "
-        f"({n_total:,} total in cohort vocab)"
+        f"  [sweep] OHDSI filter: domain_id=Condition AND standard_concept=S  "
+        f"→ {len(condition_cids):,} of {n_total:,} concepts in cohort vocab"
     )
     if not condition_cids:
         any_domain_populated = any(meta["domain"] for meta in cache.concept_meta.values())
@@ -409,7 +412,7 @@ def build_cohort_condition_phenotypes(
     condition_cids.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
     selected = condition_cids[:top_n]
     print(
-        f"  [sweep] ranking {len(condition_cids):,} Disorders by cohort coverage, "
+        f"  [sweep] ranking {len(condition_cids):,} OHDSI Conditions by cohort coverage, "
         f"keeping top {len(selected)}:"
     )
     for rank, cid in enumerate(selected[:10], start=1):
@@ -439,20 +442,15 @@ def build_cohort_condition_phenotypes(
 def _resolve_disease_atom_sets(
     vocab: AtomVocab,
     etl_dir: Path,
-    phenotypes: list[DiseasePhenotype] | None = None,
+    phenotypes: list[DiseasePhenotype],
     *,
     verbose: bool = True,
 ) -> tuple[list[DiseasePhenotype], list[set[int]], dict[str, dict[str, object]]]:
     """Resolve each ``DiseasePhenotype`` to its cohort-descendant atom set.
 
-    If ``phenotypes`` is None, falls back to the hand-curated DEFAULT_DISEASES
-    list so existing callers (training-loop eval) keep their stable schema.
-    Pass an explicit list to evaluate a different cohort — e.g., the
-    coverage-driven sweep produced by
-    :func:`build_cohort_condition_phenotypes`.
+    Callers must supply ``phenotypes`` explicitly — typically from
+    :func:`build_cohort_condition_phenotypes` (OHDSI Condition sweep).
     """
-    if phenotypes is None:
-        phenotypes = list(DEFAULT_DISEASES)
     cache = _load_cohort_concept_cache(etl_dir)
 
     resolved_phenotypes: list[DiseasePhenotype] = []
@@ -762,16 +760,14 @@ def prepare_cindex_cohort(
     batch_size: int = EVAL_BATCH_SIZE,
     num_workers: int = DATALOADER_WORKERS,
     pin_memory: bool = False,
-    phenotypes: list[DiseasePhenotype] | None = None,
+    phenotypes: list[DiseasePhenotype],
     max_subjects: int | None = None,
     subsample_seed: int = 0,
 ) -> CindexCohort:
     """Build the eval cohort, outcome table, and disease atom membership.
 
-    ``phenotypes`` defaults to the hand-curated :data:`DEFAULT_DISEASES`. Pass
-    an explicit list (e.g. from :func:`build_cohort_condition_phenotypes`) to
-    score against a different, broader phenotype set — the rest of the
-    pipeline (outcome table, atom membership, risk scoring) is identical.
+    ``phenotypes`` is required — typically from
+    :func:`build_cohort_condition_phenotypes` (OHDSI Condition sweep).
 
     ``max_subjects`` caps the eligible test cohort to a deterministic random
     subsample. The in-loop training eval passes a small cap (~2048) so each
@@ -790,7 +786,7 @@ def prepare_cindex_cohort(
             f"(deterministic seed={subsample_seed})"
         )
     resolved, atom_sets, phenotype_info = _resolve_disease_atom_sets(
-        vocab, etl_dir, phenotypes=phenotypes, verbose=phenotypes is None,
+        vocab, etl_dir, phenotypes=phenotypes, verbose=False,
     )
     if not subjects:
         raise SystemExit("no eligible test subjects after filters")
@@ -800,7 +796,7 @@ def prepare_cindex_cohort(
     # Only enumerate the per-phenotype resolution table when the cohort is
     # small enough to be readable. Hundreds of swept conditions would flood
     # the terminal; for those callers can introspect phenotype_info directly.
-    if phenotypes is None or len(resolved) <= 30:
+    if len(resolved) <= 30:
         print("  resolved disease phenotypes (root + cohort-descendant atoms; ≥occ rule):")
         for pheno in resolved:
             info = phenotype_info[pheno.name]
@@ -1017,20 +1013,18 @@ def main(argv: list[str] | None = None) -> None:
         f"OHDSI domain==Condition + top-{DEFAULT_SWEEP_TOP_N} by cohort coverage",
     )
     sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
-    cohort_mode: str
-    if sweep_phenotypes:
-        cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
-        cohort = prepare_cindex_cohort(
-            etl_dir, vocab,
-            pin_memory=runtime.dataloader_pin_memory,
-            phenotypes=sweep_phenotypes,
+    if not sweep_phenotypes:
+        raise SystemExit(
+            "OHDSI sweep returned no phenotypes — concept metadata missing "
+            "from ETL cache. Re-run scripts/aou_etl.py to populate domain_id "
+            "and standard_concept."
         )
-    else:
-        cohort_mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
-        cohort = prepare_cindex_cohort(
-            etl_dir, vocab,
-            pin_memory=runtime.dataloader_pin_memory,
-        )
+    cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
+    cohort = prepare_cindex_cohort(
+        etl_dir, vocab,
+        pin_memory=runtime.dataloader_pin_memory,
+        phenotypes=sweep_phenotypes,
+    )
     setup.finish_unit(
         "build cindex cohort",
         f"mode={cohort_mode}  subjects={len(cohort.subjects):,}  "

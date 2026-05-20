@@ -1094,7 +1094,7 @@ def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int
         return {}
     sql = (
         f"SELECT concept_id, vocabulary_id, concept_code, domain_id, "
-        f"concept_class_id, concept_name FROM `{cdr}.concept` "
+        f"concept_class_id, standard_concept, concept_name FROM `{cdr}.concept` "
         f"WHERE concept_id IN UNNEST(@ids)"
     )
     id_list = list(ids)
@@ -1112,12 +1112,14 @@ def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int
         codes = table.column("concept_code").to_pylist()
         domains = table.column("domain_id").to_pylist()
         classes = table.column("concept_class_id").to_pylist()
+        standards = table.column("standard_concept").to_pylist()
         names = table.column("concept_name").to_pylist()
-        for c, v, k, dom, cls, name in zip(cids, vocabs, codes, domains, classes, names, strict=True):
+        for c, v, k, dom, cls, std, name in zip(cids, vocabs, codes, domains, classes, standards, names, strict=True):
             result[int(c)] = {
                 "code": f"{v}/{k}",
                 "domain": str(dom) if dom is not None else "",
                 "class": str(cls) if cls is not None else "",
+                "standard_concept": str(std) if std is not None else "",
                 "name": str(name) if name is not None else "",
             }
     return result
@@ -1154,12 +1156,12 @@ def _cached_concept_codes(
 ) -> dict[int, dict[str, str]]:
     """Cached concept metadata lookup keyed by concept_id.
 
-    On-disk format is a JSON list of records: ``[[cid, code, domain, class, name], ...]``.
-    For backward compatibility the loader also accepts the older 2-tuple
-    ``[[cid, code], ...]`` shape — entries from old caches are upgraded with
-    empty domain/class/name strings; the next BQ refresh re-fetches them with
-    real values. The eval-side disease sweep skips concepts with empty domain
-    so old caches degrade safely without breaking the existing curated path.
+    On-disk format is a JSON list of 6-tuples:
+    ``[[cid, code, domain, class, standard_concept, name], ...]``.
+    Older 5-tuple (no standard_concept) and 2-tuple (cid+code only) shapes are
+    accepted on read; entries missing standard_concept get re-fetched from BQ
+    so the OHDSI sweep filter (domain==Condition AND standard_concept=='S')
+    always sees populated values.
     """
     path = cache_dir / "concept_codes.json"
     cached: dict[int, dict[str, str]] = {}
@@ -1168,21 +1170,37 @@ def _cached_concept_codes(
         for entry in raw:
             row = list(entry)
             cid = int(row[0])  # type: ignore[arg-type]
-            if len(row) >= 5:
+            if len(row) >= 6:
                 cached[cid] = {
                     "code": str(row[1]),
                     "domain": str(row[2]) if row[2] is not None else "",
                     "class": str(row[3]) if row[3] is not None else "",
+                    "standard_concept": str(row[4]) if row[4] is not None else "",
+                    "name": str(row[5]) if row[5] is not None else "",
+                }
+            elif len(row) >= 5:
+                # Legacy 5-tuple: no standard_concept column → trigger re-fetch.
+                cached[cid] = {
+                    "code": str(row[1]),
+                    "domain": str(row[2]) if row[2] is not None else "",
+                    "class": str(row[3]) if row[3] is not None else "",
+                    "standard_concept": "",
                     "name": str(row[4]) if row[4] is not None else "",
                 }
             else:
                 # Legacy [cid, code] shape — leave metadata empty; will be
                 # backfilled by the next BQ fetch if this cid is in `ids`.
-                cached[cid] = {"code": str(row[1]), "domain": "", "class": "", "name": ""}
+                cached[cid] = {
+                    "code": str(row[1]), "domain": "", "class": "",
+                    "standard_concept": "", "name": "",
+                }
 
-    # A cid counts as "cached" only if we have the full metadata. Entries
-    # imported from the legacy format have empty domain → re-fetch.
-    fully_cached = {cid for cid, meta in cached.items() if meta["domain"]}
+    # A cid counts as "cached" only if we have all the metadata. Legacy entries
+    # are missing domain or standard_concept → re-fetch.
+    fully_cached = {
+        cid for cid, meta in cached.items()
+        if meta["domain"] and meta.get("standard_concept", "")
+    }
     missing = ids - fully_cached
     if not missing:
         _log(f"concept code cache satisfied: cached={len(cached):,} requested={len(ids):,} missing=0")
@@ -1192,7 +1210,8 @@ def _cached_concept_codes(
     cached.update(_concept_codes(client(), cdr, missing))
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, [
-        [cid, meta["code"], meta["domain"], meta["class"], meta["name"]]
+        [cid, meta["code"], meta["domain"], meta["class"],
+         meta.get("standard_concept", ""), meta["name"]]
         for cid, meta in sorted(cached.items())
     ])
     return cached
