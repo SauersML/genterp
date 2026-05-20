@@ -111,6 +111,16 @@ SAVE_TOTAL_LIMIT = 3
 # C-index has stable sampling.
 EVAL_SUBSAMPLE_SIZE = 1024
 EVAL_SUBSAMPLE_SEED = 0
+# Cap the C-index cohort. The eligible test pool is ~30k+ subjects; scoring
+# every one of them every EVAL_STEPS dominates training wall-clock. But
+# Harrell's C power scales with *event count* per disease, not subject
+# count: a 1%-incidence cancer in 2k subjects only fires ~20 events, which
+# gives noisy per-disease estimates. 8192 hits ~80 events for a 1%-incidence
+# disease and ~800 for a 10%-incidence one — well-powered across the
+# leaderboard. Eval wall-clock at batch_size=16 ≈ 4-5 min per cycle, ~5%
+# of training time at the 2000-step cadence. Standalone eval_cindex /
+# eval_rollout CLIs leave the cap off (None) and score the full cohort.
+CINDEX_MAX_SUBJECTS_IN_LOOP = 8192
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -1117,19 +1127,33 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit(
         "prepare C-index cohort",
-        "SNOMED-descendant phenotypes + outcome table for periodic in-loop scoring",
+        "OHDSI Condition top-N sweep (fall back to curated DEFAULT_DISEASES if ETL cache is legacy)",
     )
     cindex_cohort = None
     try:
-        from genterp.eval_cindex import prepare_cindex_cohort
+        from genterp.eval_cindex import (
+            DEFAULT_SWEEP_TOP_N,
+            build_cohort_condition_phenotypes,
+            prepare_cindex_cohort,
+        )
+        sweep_phenotypes = build_cohort_condition_phenotypes(etl, top_n=DEFAULT_SWEEP_TOP_N)
+        if sweep_phenotypes:
+            mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N} OHDSI Conditions)"
+            phenotypes_arg = sweep_phenotypes
+        else:
+            mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
+            phenotypes_arg = None
         cindex_cohort = prepare_cindex_cohort(
             etl, vocab,
             events=event_store,
             pin_memory=runtime.dataloader_pin_memory,
+            phenotypes=phenotypes_arg,
+            max_subjects=CINDEX_MAX_SUBJECTS_IN_LOOP,
         )
         setup.finish_unit(
             "prepare C-index cohort",
-            f"subjects={len(cindex_cohort.subjects):,}  diseases={len(cindex_cohort.disease_names)}",
+            f"mode={mode}  subjects={len(cindex_cohort.subjects):,}  "
+            f"diseases={len(cindex_cohort.disease_names)}",
         )
     except Exception as exc:  # noqa: BLE001 — survival eval is optional; never block training
         print(f"[cindex] cohort prep skipped: {type(exc).__name__}: {exc}")

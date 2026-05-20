@@ -70,7 +70,7 @@ class ContinuousTimeRoPE(nn.Module):
         return (age_days.float().unsqueeze(-1) * self.freq.float()).masked_fill(is_static.unsqueeze(-1), 0.0)
 
     @staticmethod
-    def apply(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    def rotate(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
         x_rot = rearrange(x, "b h s (d r) -> b h s d r", r=2)
         cos = torch.cos(angles.float()).to(x.dtype).unsqueeze(1)
         sin = torch.sin(angles.float()).to(x.dtype).unsqueeze(1)
@@ -207,8 +207,8 @@ class CausalRoPEAttention(nn.Module):
         q = rearrange(q, "b s (h d) -> b s h d", h=self.heads)
         k = rearrange(k, "b s (h d) -> b s h d", h=self.heads)
         v = rearrange(v, "b s (h d) -> b s h d", h=self.heads)
-        q = self.rope.apply(q.transpose(1, 2), angles).transpose(1, 2)
-        k = self.rope.apply(k.transpose(1, 2), angles).transpose(1, 2)
+        q = self.rope.rotate(q.transpose(1, 2), angles).transpose(1, 2)
+        k = self.rope.rotate(k.transpose(1, 2), angles).transpose(1, 2)
         return q, k, v
 
     def _project_out(self, out: torch.Tensor) -> torch.Tensor:

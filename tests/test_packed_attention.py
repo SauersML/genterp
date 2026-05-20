@@ -18,8 +18,8 @@ def _dense_prefix_causal_reference(
     q = rearrange(q, "b s (h d) -> b h s d", h=attn.heads)
     k = rearrange(k, "b s (h d) -> b h s d", h=attn.heads)
     v = rearrange(v, "b s (h d) -> b h s d", h=attn.heads)
-    q = attn.rope.apply(q, angles)
-    k = attn.rope.apply(k, angles)
+    q = attn.rope.rotate(q, angles)
+    k = attn.rope.rotate(k, angles)
 
     B, _, S, _ = q.shape
     i = torch.arange(S, device=x.device).unsqueeze(1)

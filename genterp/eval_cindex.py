@@ -737,6 +737,8 @@ def prepare_cindex_cohort(
     num_workers: int = DATALOADER_WORKERS,
     pin_memory: bool = False,
     phenotypes: list[DiseasePhenotype] | None = None,
+    max_subjects: int | None = None,
+    subsample_seed: int = 0,
 ) -> CindexCohort:
     """Build the eval cohort, outcome table, and disease atom membership.
 
@@ -744,10 +746,23 @@ def prepare_cindex_cohort(
     an explicit list (e.g. from :func:`build_cohort_condition_phenotypes`) to
     score against a different, broader phenotype set — the rest of the
     pipeline (outcome table, atom membership, risk scoring) is identical.
+
+    ``max_subjects`` caps the eligible test cohort to a deterministic random
+    subsample. The in-loop training eval passes a small cap (~2048) so each
+    eval pass finishes in seconds instead of the ~30+ minutes a full 30k+
+    subject scan would take. Standalone CLI evals leave it at None to score
+    every eligible subject.
     """
     if events is None:
         events = EventStore.from_parquet(etl_dir / "events.parquet")
     subjects = _build_subject_index(events, etl_dir)
+    if max_subjects is not None and max_subjects > 0 and len(subjects) > max_subjects:
+        order = np.random.default_rng(subsample_seed).permutation(len(subjects))[:max_subjects]
+        subjects = [subjects[int(i)] for i in order]
+        print(
+            f"[eval_cindex] subsampled to {len(subjects):,} subjects "
+            f"(deterministic seed={subsample_seed})"
+        )
     resolved, atom_sets, phenotype_info = _resolve_disease_atom_sets(
         vocab, etl_dir, phenotypes=phenotypes, verbose=phenotypes is None,
     )
