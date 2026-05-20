@@ -443,9 +443,9 @@ def main(argv: list[str] | None = None) -> None:
     sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
     if not sweep_phenotypes:
         raise SystemExit(
-            "OHDSI sweep returned no phenotypes — concept metadata missing "
-            "from ETL cache. Re-run scripts/aou_etl.py to populate domain_id "
-            "and standard_concept."
+            "OHDSI sweep returned no phenotypes — ohdsi_disease_phenotypes.json "
+            "missing from ETL cache. Re-run scripts/aou_etl.py to build the "
+            "OHDSI PhenotypeLibrary canonical disease list."
         )
     cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
     cohort = prepare_cindex_cohort(

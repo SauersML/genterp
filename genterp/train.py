@@ -1127,7 +1127,7 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit(
         "prepare C-index cohort",
-        "OHDSI Condition top-N sweep (domain==Condition AND standard_concept=='S')",
+        "OHDSI PhenotypeLibrary canonical disease sweep (cached by aou_etl.py)",
     )
     cindex_cohort = None
     try:
@@ -1139,9 +1139,9 @@ def main(argv: list[str] | None = None) -> None:
         sweep_phenotypes = build_cohort_condition_phenotypes(etl, top_n=DEFAULT_SWEEP_TOP_N)
         if not sweep_phenotypes:
             raise SystemExit(
-                "OHDSI sweep returned no phenotypes — concept metadata missing "
-                "from ETL cache. Re-run scripts/aou_etl.py to populate "
-                "domain_id and standard_concept."
+                "OHDSI sweep returned no phenotypes — ohdsi_disease_phenotypes.json "
+                "missing from ETL cache. Re-run scripts/aou_etl.py to build the "
+                "OHDSI PhenotypeLibrary canonical disease list."
             )
         cindex_cohort = prepare_cindex_cohort(
             etl, vocab,

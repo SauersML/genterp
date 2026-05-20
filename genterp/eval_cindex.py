@@ -354,82 +354,74 @@ def build_cohort_condition_phenotypes(
     min_occurrences: int = 2,
     min_gap_days: float = 30.0,
 ) -> list[DiseasePhenotype]:
-    """Top-N OMOP Condition concepts by cohort coverage.
+    """OHDSI PhenotypeLibrary canonical disease phenotypes, ranked by cohort coverage.
 
-    Two-part definition, both rigorous:
+    The disease list is the OHDSI Phenotype Library's Reference cohorts
+    (``isReferenceCohort = 1``) filtered to ConditionOccurrence-primary,
+    single-include / zero-exclude cohorts whose include root descends from
+    SNOMED 'Disease (disorder)' (concept_code 64572001). That filtering is
+    done once by ``scripts/aou_etl.py`` and cached as
+    ``<cache_dir>/ohdsi_disease_phenotypes.json``.
 
-      * **"Is a disease"**: OHDSI's standardized vocabulary classifier
-        ``domain_id == "Condition"``. Every concept in the OMOP concept
-        table is assigned a domain by the OHDSI vocabulary team; Condition
-        is the domain for diseases/disorders. This is the canonical
-        OHDSI-defined disease filter — no hierarchy inference.
-      * **"Top-N"**: rank by distinct-patient cohort coverage and take the
-        first ``top_n``. Picks the diseases the cohort actually exhibits in
-        sufficient numbers to score, in one number, no other thresholds.
+    OMOP's ``concept_class_id`` collapses SNOMED's "(disorder)" and
+    "(finding)" semantic tags into "Clinical Finding", so it cannot be used
+    to separate diseases from symptoms; the SNOMED-Disease ancestor filter
+    is the functionally-equivalent OHDSI-canonical signal.
 
-    Requires the ETL to have been re-run with the enriched concept_codes
-    schema that includes ``domain_id``; older caches surface a warning and
-    return an empty list and callers SystemExit, prompting an ETL re-run.
+    Of the ~235 canonical diseases, we intersect with the cohort vocab
+    (drops phenotypes whose root code isn't present in this cohort) and keep
+    the top ``top_n`` by cohort coverage so the in-loop eval stays fast.
 
-    Descendant atom sets come from the existing ``concept_ancestor`` closure
-    — identical mechanism to the curated path, just a different seed list.
+    Descendant atom sets are resolved downstream via the existing
+    ``concept_ancestor`` closure in the ETL cache.
     """
     cache = _load_cohort_concept_cache(etl_dir)
 
-    n_total = len(cache.concept_meta)
-
-    # OHDSI vocabulary defines a "disease" via two columns on the OMOP concept
-    # table, both populated by the OHDSI vocabulary team — not derived by us:
-    #
-    #   * ``domain_id == "Condition"``      — Condition is the OHDSI domain
-    #                                         assigned to clinical findings /
-    #                                         disorders (vs. Drug, Procedure,
-    #                                         Measurement, Observation, …).
-    #   * ``standard_concept == "S"``       — Standard concepts are the canonical
-    #                                         OHDSI-curated nodes that all
-    #                                         source codes map to (excludes
-    #                                         non-standard / classification-only
-    #                                         entries).
-    #
-    # This is the OHDSI-defined disease filter — no hierarchy heuristics.
-    condition_cids = [
-        cid for cid, meta in cache.concept_meta.items()
-        if meta["domain"] == "Condition" and meta.get("standard_concept", "S") == "S"
-    ]
-    print(
-        f"  [sweep] OHDSI filter: domain_id=Condition AND standard_concept=S  "
-        f"→ {len(condition_cids):,} of {n_total:,} concepts in cohort vocab"
-    )
-    if not condition_cids:
-        any_domain_populated = any(meta["domain"] for meta in cache.concept_meta.values())
-        if not any_domain_populated:
-            print(
-                "  [sweep] concept metadata missing in ETL cache "
-                "(domain/class/name absent); re-run aou_etl.py to populate."
-            )
+    cache_dir = _find_etl_cache(etl_dir)
+    pl_path = cache_dir / "ohdsi_disease_phenotypes.json" if cache_dir else None
+    if pl_path is None or not pl_path.exists():
+        print(
+            f"  [sweep] OHDSI disease phenotype list missing "
+            f"({pl_path}); re-run scripts/aou_etl.py to build it."
+        )
         return []
 
-    condition_cids.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
-    selected = condition_cids[:top_n]
+    raw = json.loads(pl_path.read_text())
+    if not isinstance(raw, list) or not raw:
+        print(f"  [sweep] OHDSI disease phenotype list at {pl_path} is empty.")
+        return []
+
+    eligible: list[tuple[int, str, dict[str, object]]] = []
+    missing_codes = 0
+    for entry in raw:
+        code = str(entry.get("concept_code", ""))
+        if not code:
+            missing_codes += 1
+            continue
+        cid = cache.code_to_cid.get(code)
+        if cid is None:
+            missing_codes += 1
+            continue
+        eligible.append((cid, code, entry))
+
+    eligible.sort(key=lambda t: cache.coverage.get(t[0], 0), reverse=True)
+    selected = eligible[:top_n]
     print(
-        f"  [sweep] ranking {len(condition_cids):,} OHDSI Conditions by cohort coverage, "
-        f"keeping top {len(selected)}:"
+        f"  [sweep] OHDSI PhenotypeLibrary canonical diseases: {len(raw):,} curated "
+        f"→ {len(eligible):,} in cohort vocab "
+        f"({missing_codes:,} dropped: not present in this cohort) "
+        f"→ top {len(selected)} by cohort coverage:"
     )
-    for rank, cid in enumerate(selected[:10], start=1):
-        meta = cache.concept_meta.get(cid, {})
-        name = meta.get("name") or cache.cid_to_code.get(cid, str(cid))
+    for rank, (cid, code, entry) in enumerate(selected[:10], start=1):
+        name = str(entry.get("concept_name") or code)
         cov = cache.coverage.get(cid, 0)
         print(f"    {rank:>2}. {name[:60]:60s}  coverage={cov:,}")
     if len(selected) > 10:
         print(f"    ... {len(selected) - 10} more")
 
     phenotypes: list[DiseasePhenotype] = []
-    for cid in selected:
-        code = cache.cid_to_code.get(cid)
-        if code is None:
-            continue
-        meta = cache.concept_meta.get(cid, {})
-        name = meta.get("name") or code
+    for cid, code, entry in selected:
+        name = str(entry.get("concept_name") or code)
         phenotypes.append(DiseasePhenotype(
             name=name,
             root_code=code,
@@ -1015,9 +1007,9 @@ def main(argv: list[str] | None = None) -> None:
     sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
     if not sweep_phenotypes:
         raise SystemExit(
-            "OHDSI sweep returned no phenotypes — concept metadata missing "
-            "from ETL cache. Re-run scripts/aou_etl.py to populate domain_id "
-            "and standard_concept."
+            "OHDSI sweep returned no phenotypes — ohdsi_disease_phenotypes.json "
+            "missing from ETL cache. Re-run scripts/aou_etl.py to build the "
+            "OHDSI PhenotypeLibrary canonical disease list."
         )
     cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
     cohort = prepare_cindex_cohort(

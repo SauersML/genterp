@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import csv
 import faulthandler
 import hashlib
+import io
 import json
 import os
 import re
@@ -24,6 +26,8 @@ import signal
 import sys
 import time
 import traceback
+import urllib.request
+import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -1217,6 +1221,243 @@ def _cached_concept_codes(
     return cached
 
 
+# ---------------------------------------------------------------------------
+# OHDSI PhenotypeLibrary canonical disease list
+# ---------------------------------------------------------------------------
+# OMOP's ``concept_class_id`` collapses SNOMED's "(disorder)" and "(finding)"
+# semantic tags into the single value "Clinical Finding", so it can't be used
+# to separate diseases from symptoms. The functionally-equivalent OHDSI signal
+# is the SNOMED hierarchy: every "(disorder)" concept descends from SNOMED
+# 'Disease (disorder)' (concept_code 64572001). We combine that ancestor
+# filter with the peer-curated OHDSI Phenotype Library's Reference cohorts
+# to land at ~235 canonical disease phenotypes, each rooted at a single
+# standard SNOMED concept_id.
+
+_OHDSI_PL_URL = "https://github.com/OHDSI/PhenotypeLibrary/archive/refs/heads/main.zip"
+_OHDSI_PL_DIRNAME = "PhenotypeLibrary-main"
+_SNOMED_DISEASE_ROOT_CODE = "64572001"  # SNOMED 'Disease (disorder)'
+
+
+def _ensure_ohdsi_phenotype_library(cache_dir: Path) -> Path:
+    pl_dir = cache_dir / _OHDSI_PL_DIRNAME
+    if (pl_dir / "inst" / "cohorts").exists():
+        return pl_dir
+    _log(f"downloading OHDSI PhenotypeLibrary → {pl_dir}")
+    with urllib.request.urlopen(_OHDSI_PL_URL) as resp:
+        data = resp.read()
+    _log(f"  PL zip downloaded ({len(data) / 1e6:.1f} MB); extracting")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        zf.extractall(cache_dir)
+    if not (pl_dir / "inst" / "cohorts").exists():
+        raise RuntimeError(f"OHDSI PL extract failed: {pl_dir}/inst/cohorts missing")
+    return pl_dir
+
+
+def _parse_ohdsi_reference_condition_cohorts(
+    pl_dir: Path,
+) -> tuple[dict[int, dict[str, object]], dict[str, int]]:
+    """Walk PL → {include_root_cid: cohort meta}, plus a skip-reason counter.
+
+    Filters applied here:
+      (a) ``isReferenceCohort == 1``        — canonical OHDSI variants only.
+      (b) ConditionOccurrence primary       — diagnosis-driven phenotypes.
+      (c) Single include, zero excludes     — 1:1 cohort↔SNOMED root mapping.
+
+    Filter (d) — root must descend from SNOMED 'Disease (disorder)' — runs
+    later because it needs a BigQuery concept_ancestor lookup.
+    """
+    cohorts_csv = pl_dir / "inst" / "Cohorts.csv"
+    json_dir = pl_dir / "inst" / "cohorts"
+
+    meta_by_id: dict[int, dict[str, object]] = {}
+    with cohorts_csv.open(newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                cohort_id = int(row["cohortId"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            is_ref_raw = row.get("isReferenceCohort") or "0"
+            try:
+                is_ref = int(float(is_ref_raw))
+            except ValueError:
+                is_ref = 0
+            meta_by_id[cohort_id] = {
+                "cohort_name": row.get("cohortName", ""),
+                "status": row.get("status", ""),
+                "is_reference": is_ref,
+            }
+
+    ref_ids = sorted(cid for cid, m in meta_by_id.items() if m["is_reference"] == 1)
+
+    root_to_cohort: dict[int, dict[str, object]] = {}
+    skipped = {"missing_json": 0, "parse": 0, "non_condition_primary": 0,
+               "multi_include_or_exclude": 0}
+
+    for cohort_id in ref_ids:
+        path = json_dir / f"{cohort_id}.json"
+        if not path.exists():
+            skipped["missing_json"] += 1
+            continue
+        try:
+            raw = path.read_bytes()
+            try:
+                j = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                j = json.loads(raw.decode("latin-1"))
+        except Exception:
+            skipped["parse"] += 1
+            continue
+
+        codeset_id = None
+        for crit in j.get("PrimaryCriteria", {}).get("CriteriaList", []):
+            if "ConditionOccurrence" in crit:
+                codeset_id = crit["ConditionOccurrence"].get("CodesetId")
+                break
+        if codeset_id is None:
+            skipped["non_condition_primary"] += 1
+            continue
+
+        cs = next((c for c in j.get("ConceptSets", []) if c.get("id") == codeset_id), None)
+        if cs is None:
+            skipped["parse"] += 1
+            continue
+        items = cs.get("expression", {}).get("items", [])
+        incs = [it for it in items if not it.get("isExcluded")]
+        excs = [it for it in items if it.get("isExcluded")]
+        if len(incs) != 1 or len(excs) != 0:
+            skipped["multi_include_or_exclude"] += 1
+            continue
+
+        root_cid = int(incs[0]["concept"]["CONCEPT_ID"])
+        meta = meta_by_id[cohort_id]
+        if root_cid not in root_to_cohort or cohort_id < int(root_to_cohort[root_cid]["cohort_id"]):
+            root_to_cohort[root_cid] = {
+                "cohort_id": cohort_id,
+                "cohort_name": meta["cohort_name"],
+                "status": meta["status"],
+            }
+
+    return root_to_cohort, skipped
+
+
+def _resolve_snomed_disease_root_cid(client: bigquery.Client, cdr: str) -> int:
+    sql = f"""
+        SELECT concept_id FROM `{cdr}.concept`
+        WHERE vocabulary_id = 'SNOMED'
+          AND concept_code = '{_SNOMED_DISEASE_ROOT_CODE}'
+          AND standard_concept = 'S'
+    """
+    table = _run_aggregation(client, sql, "ohdsi: resolve SNOMED 'Disease (disorder)' root")
+    cids = table.column("concept_id").to_pylist()
+    if not cids:
+        raise RuntimeError(
+            f"SNOMED {_SNOMED_DISEASE_ROOT_CODE} not found in {cdr}.concept"
+        )
+    return int(cids[0])
+
+
+def _filter_disease_descendants(
+    client: bigquery.Client, cdr: str, roots: list[int], disease_root_cid: int,
+) -> set[int]:
+    sql = f"""
+        WITH roots AS (SELECT concept_id FROM UNNEST(@roots) AS concept_id),
+             dis   AS (SELECT descendant_concept_id AS concept_id
+                       FROM `{cdr}.concept_ancestor`
+                       WHERE ancestor_concept_id = {disease_root_cid})
+        SELECT r.concept_id
+        FROM roots r INNER JOIN dis USING (concept_id)
+    """
+    table = _run_aggregation(
+        client, sql, "ohdsi: filter roots to SNOMED Disease descendants",
+        parameters=[bigquery.ArrayQueryParameter("roots", "INT64", roots)],
+    )
+    return {int(c) for c in table.column("concept_id").to_pylist()}
+
+
+def _lookup_disease_concept_codes(
+    client: bigquery.Client, cdr: str, cids: list[int],
+) -> dict[int, tuple[str, str]]:
+    sql = f"""
+        SELECT concept_id, vocabulary_id, concept_code, concept_name
+        FROM `{cdr}.concept`
+        WHERE concept_id IN UNNEST(@cids)
+    """
+    table = _run_aggregation(
+        client, sql, "ohdsi: lookup disease concept codes + names",
+        parameters=[bigquery.ArrayQueryParameter("cids", "INT64", cids)],
+    )
+    out: dict[int, tuple[str, str]] = {}
+    for cid, vocab, code, name in zip(
+        table.column("concept_id").to_pylist(),
+        table.column("vocabulary_id").to_pylist(),
+        table.column("concept_code").to_pylist(),
+        table.column("concept_name").to_pylist(),
+    ):
+        out[int(cid)] = (f"{vocab}/{code}", str(name) if name else "")
+    return out
+
+
+def _cached_ohdsi_disease_phenotypes(
+    client_factory: Callable[[], bigquery.Client], cdr: str, cache_dir: Path,
+) -> list[dict[str, object]]:
+    """Build (or load cached) OHDSI canonical disease phenotype list.
+
+    Output JSON shape: list of
+        {"concept_id", "concept_code", "concept_name",
+         "ohdsi_cohort_id", "ohdsi_cohort_name", "status"}
+    """
+    path = cache_dir / "ohdsi_disease_phenotypes.json"
+    if path.exists():
+        cached = json.loads(path.read_text())
+        if isinstance(cached, list) and cached:
+            _log(f"OHDSI disease phenotype cache hit: {path.name} ({len(cached):,} phenotypes)")
+            return cached
+
+    _log("OHDSI disease phenotype cache cold — building from PhenotypeLibrary + BigQuery")
+    pl_dir = _ensure_ohdsi_phenotype_library(cache_dir)
+    root_to_cohort, skipped = _parse_ohdsi_reference_condition_cohorts(pl_dir)
+    _log(
+        f"OHDSI PL Reference cohorts → single-include condition cohorts: "
+        f"kept={len(root_to_cohort):,}  "
+        f"skipped: missing_json={skipped['missing_json']:,} "
+        f"parse_err={skipped['parse']:,} "
+        f"non_condition_primary={skipped['non_condition_primary']:,} "
+        f"multi_include_or_exclude={skipped['multi_include_or_exclude']:,}"
+    )
+
+    client = client_factory()
+    disease_root_cid = _resolve_snomed_disease_root_cid(client, cdr)
+    roots_all = sorted(root_to_cohort.keys())
+    disease_roots = _filter_disease_descendants(client, cdr, roots_all, disease_root_cid)
+    dropped = len(roots_all) - len(disease_roots)
+    _log(
+        f"SNOMED 'Disease (disorder)' ancestor filter: kept {len(disease_roots):,}, "
+        f"dropped {dropped:,} symptom/finding-rooted Reference cohorts"
+    )
+    final_cids = [r for r in roots_all if r in disease_roots]
+    codes_names = _lookup_disease_concept_codes(client, cdr, final_cids)
+
+    out: list[dict[str, object]] = []
+    for cid in final_cids:
+        meta = root_to_cohort[cid]
+        code, name = codes_names.get(cid, ("", ""))
+        if not code:
+            continue
+        out.append({
+            "concept_id": cid,
+            "concept_code": code,
+            "concept_name": name or str(meta["cohort_name"]),
+            "ohdsi_cohort_id": meta["cohort_id"],
+            "ohdsi_cohort_name": meta["cohort_name"],
+            "status": meta["status"],
+        })
+    out.sort(key=lambda r: str(r["concept_name"]).lower())
+    _write_json(path, out)
+    _log(f"OHDSI disease phenotype list written: {len(out):,} phenotypes → {path.name}")
+    return out
+
+
 def _own_counts_sql(cdr: str) -> str:
     """Distinct subjects per source concept_id, computed at BigQuery.
 
@@ -1637,6 +1878,17 @@ def main(argv: list[str] | None = None) -> None:
             "refresh concept_codes metadata (legacy → 5-tuple)",
             "skipped — no concept_codes.json on disk yet",
         )
+
+    _WORK.start_unit(
+        "build OHDSI canonical disease phenotype list",
+        "OHDSI PhenotypeLibrary Reference cohorts → ConditionOccurrence primary "
+        "→ single-include/zero-exclude → descend from SNOMED 'Disease (disorder)'",
+    )
+    ohdsi_diseases = _cached_ohdsi_disease_phenotypes(client, cdr, cache_dir)
+    _WORK.finish_unit(
+        "build OHDSI canonical disease phenotype list",
+        f"phenotypes={len(ohdsi_diseases):,}",
+    )
 
     _WORK.start_unit(
         "compute per-atom value stats",
