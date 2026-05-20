@@ -1591,6 +1591,34 @@ def main(argv: list[str] | None = None) -> None:
     _write_json(out_dir / "vocab.json", atom_idx)
     _WORK.finish_unit("collapse vocabulary", f"atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
 
+    # Refresh concept_codes metadata if it's still in the legacy 2-tuple
+    # format. The eval-side OHDSI Condition sweep needs ``domain_id`` per
+    # concept; the older cache shape only has ``[cid, code]``. When the
+    # collapsed_vocab cache hits (above) the concept-codes fetcher never
+    # runs, so on long-running workspaces the metadata can lag the code
+    # schema. Force a check here that only hits BQ for cids missing
+    # metadata (no-op if everything is already 5-tuple).
+    _WORK.start_unit(
+        "refresh concept_codes metadata (legacy → 5-tuple)",
+        "ensures eval-side OHDSI sweep can filter by concept.domain_id",
+    )
+    concept_codes_path = cache_dir / "concept_codes.json"
+    if concept_codes_path.exists():
+        existing = json.loads(concept_codes_path.read_text())
+        existing_cids = {int(row[0]) for row in existing}
+        # Triggers a BQ refetch for any cid whose cached entry lacks domain.
+        meta_after = _cached_concept_codes(client, cdr, existing_cids, cache_dir)
+        with_domain = sum(1 for m in meta_after.values() if m.get("domain"))
+        _WORK.finish_unit(
+            "refresh concept_codes metadata (legacy → 5-tuple)",
+            f"cids_total={len(meta_after):,} with_domain={with_domain:,}",
+        )
+    else:
+        _WORK.finish_unit(
+            "refresh concept_codes metadata (legacy → 5-tuple)",
+            "skipped — no concept_codes.json on disk yet",
+        )
+
     _WORK.start_unit(
         "compute per-atom value stats",
         "DuckDB mean/stddev/count GROUP BY code with HAVING n>=THRESHOLD; spills to disk under PRAGMA memory_limit",
