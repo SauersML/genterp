@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_TOTAL_UNITS=10
+RUN_TOTAL_UNITS=11
 RUN_COMPLETED_UNITS=0
 RUN_STARTED_AT="$(date +%s)"
 
@@ -115,6 +115,17 @@ finish_run_unit "sync Python dependencies with uv"
 log_run "START run AoU ETL workflow"
 uv run python -m scripts.aou_etl "$@"
 finish_run_unit "run AoU ETL workflow"
+
+# Build the per-atom ancestor table from the ETL cache (idempotent — exits
+# fast when the fingerprint matches the existing ancestors.npz). Activates
+# hierarchical embeddings in the model: rare leaf atoms inherit signal from
+# their SNOMED IS-A ancestors via additive ancestor-sum embeddings. Warm-
+# start safe: ancestor_embedding initializes to zero, so the first forward
+# after activation is bit-identical to the flat-embedding checkpoint and
+# gradient pressure then learns the hierarchy from there.
+log_run "START build hierarchical ancestor table"
+uv run python -m scripts.build_ancestors "$@"
+finish_run_unit "build hierarchical ancestor table"
 
 log_run "START run Genterp training workflow"
 uv run python -m genterp.train "$@"
