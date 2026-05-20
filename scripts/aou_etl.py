@@ -1254,6 +1254,24 @@ def _ensure_ohdsi_phenotype_library(cache_dir: Path) -> Path:
     return pl_dir
 
 
+def _parse_ohdsi_truthy_flag(raw: object) -> int:
+    """Accept any plausible truthy serialization in OHDSI's CSV columns.
+
+    OHDSI's R-exported metadata has used 0/1, TRUE/FALSE (R style), Yes/No,
+    and quoted variants across releases. Anything we don't recognize as
+    truthy → 0.
+    """
+    s = str(raw if raw is not None else "").strip().strip('"').lower()
+    if not s or s in {"na", "nan", "null", "none"}:
+        return 0
+    if s in {"1", "true", "t", "yes", "y"}:
+        return 1
+    try:
+        return 1 if int(float(s)) == 1 else 0
+    except ValueError:
+        return 0
+
+
 def _parse_ohdsi_reference_condition_cohorts(
     pl_dir: Path,
 ) -> tuple[dict[int, dict[str, object]], dict[str, int]]:
@@ -1271,17 +1289,21 @@ def _parse_ohdsi_reference_condition_cohorts(
     json_dir = pl_dir / "inst" / "cohorts"
 
     meta_by_id: dict[int, dict[str, object]] = {}
+    csv_columns: list[str] = []
+    first_row_sample: dict[str, str] | None = None
+    n_csv_rows = 0
     with cohorts_csv.open(newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        csv_columns = list(reader.fieldnames or [])
+        for row in reader:
+            n_csv_rows += 1
+            if first_row_sample is None:
+                first_row_sample = {k: str(v)[:40] for k, v in row.items() if v}
             try:
-                cohort_id = int(row["cohortId"])
-            except (TypeError, ValueError, KeyError):
+                cohort_id = int(str(row.get("cohortId", "")).strip())
+            except (TypeError, ValueError):
                 continue
-            is_ref_raw = row.get("isReferenceCohort") or "0"
-            try:
-                is_ref = int(float(is_ref_raw))
-            except ValueError:
-                is_ref = 0
+            is_ref = _parse_ohdsi_truthy_flag(row.get("isReferenceCohort"))
             meta_by_id[cohort_id] = {
                 "cohort_name": row.get("cohortName", ""),
                 "status": row.get("status", ""),
@@ -1289,6 +1311,12 @@ def _parse_ohdsi_reference_condition_cohorts(
             }
 
     ref_ids = sorted(cid for cid, m in meta_by_id.items() if m["is_reference"] == 1)
+    if not ref_ids:
+        _log(
+            f"OHDSI PL Cohorts.csv parsed {n_csv_rows} rows but found 0 "
+            f"isReferenceCohort==1 entries. columns={csv_columns} "
+            f"sample_row={first_row_sample}"
+        )
 
     root_to_cohort: dict[int, dict[str, object]] = {}
     skipped = {"missing_json": 0, "parse": 0, "non_condition_primary": 0,
@@ -1360,6 +1388,8 @@ def _resolve_snomed_disease_root_cid(client: bigquery.Client, cdr: str) -> int:
 def _filter_disease_descendants(
     client: bigquery.Client, cdr: str, roots: list[int], disease_root_cid: int,
 ) -> set[int]:
+    if not roots:
+        return set()
     sql = f"""
         WITH roots AS (SELECT concept_id FROM UNNEST(@roots) AS concept_id),
              dis   AS (SELECT descendant_concept_id AS concept_id
@@ -1372,12 +1402,16 @@ def _filter_disease_descendants(
         client, sql, "ohdsi: filter roots to SNOMED Disease descendants",
         parameters=[bigquery.ArrayQueryParameter("roots", "INT64", roots)],
     )
+    if "concept_id" not in table.schema.names:
+        return set()
     return {int(c) for c in table.column("concept_id").to_pylist()}
 
 
 def _lookup_disease_concept_codes(
     client: bigquery.Client, cdr: str, cids: list[int],
 ) -> dict[int, tuple[str, str]]:
+    if not cids:
+        return {}
     sql = f"""
         SELECT concept_id, vocabulary_id, concept_code, concept_name
         FROM `{cdr}.concept`
@@ -1387,6 +1421,8 @@ def _lookup_disease_concept_codes(
         client, sql, "ohdsi: lookup disease concept codes + names",
         parameters=[bigquery.ArrayQueryParameter("cids", "INT64", cids)],
     )
+    if "concept_id" not in table.schema.names:
+        return {}
     out: dict[int, tuple[str, str]] = {}
     for cid, vocab, code, name in zip(
         table.column("concept_id").to_pylist(),
@@ -1425,6 +1461,11 @@ def _cached_ohdsi_disease_phenotypes(
         f"non_condition_primary={skipped['non_condition_primary']:,} "
         f"multi_include_or_exclude={skipped['multi_include_or_exclude']:,}"
     )
+    if not root_to_cohort:
+        raise RuntimeError(
+            "OHDSI PL parse yielded 0 Reference condition cohorts — see preceding "
+            f"diagnostic. Check Cohorts.csv schema at {pl_dir}/inst/Cohorts.csv."
+        )
 
     client = client_factory()
     disease_root_cid = _resolve_snomed_disease_root_cid(client, cdr)
