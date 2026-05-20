@@ -858,6 +858,86 @@ def _observation_events_sql(cdr: str) -> str:
     """
 
 
+DEATH_CONCEPT_ID = 4306655  # OMOP standard concept for Death (SNOMED 419620001).
+
+
+def _death_events_sql(cdr: str) -> str:
+    """One synthetic Death event per person with a death record.
+
+    Sources from ``aou_death``, picking the row with the highest
+    ``primary_death_record`` flag and (as a tiebreaker) the earliest date —
+    same precedence pgsEngine uses for death-date resolution. We emit the
+    event at the resolved death date using the OMOP standard concept id for
+    Death (4306655), so the concept passes through normal vocab collapse and
+    inherits SNOMED ancestor closure rather than being a synthetic-code
+    outlier. The downstream censor query (below) makes death_date a hard
+    censor whenever it predates the observation-period end, so the model is
+    not asked to predict any events past death.
+    """
+    death_concept = DEATH_CONCEPT_ID
+    return f"""
+    WITH ranked AS (
+      SELECT
+        person_id,
+        COALESCE(death_date, DATE(death_datetime)) AS death_date,
+        ROW_NUMBER() OVER (
+          PARTITION BY person_id
+          ORDER BY
+            IFNULL(primary_death_record, FALSE) DESC,
+            COALESCE(death_date, DATE(death_datetime)) ASC
+        ) AS row_num
+      FROM `{cdr}.aou_death`
+      WHERE COALESCE(death_date, DATE(death_datetime)) IS NOT NULL{_tiny_predicate("person_id")}
+    )
+    SELECT
+      CAST(r.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(TIMESTAMP(r.death_date)) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
+      {death_concept} AS cid,
+      CAST(NULL AS FLOAT64) AS value
+    FROM ranked r
+    JOIN `{cdr}.concept` c ON c.concept_id = {death_concept}
+    WHERE r.row_num = 1
+    """
+
+
+def _demographics_events_sql(cdr: str) -> str:
+    """Race and ethnicity as static-prefix events at birth-time.
+
+    Currently AoU's race_concept_id and ethnicity_concept_id sit in the
+    person table but never reach the model — sex is the only signal
+    propagated to the static prefix. Emitting these at ``time = birth``
+    (delta_days ≈ 0) lands them in ``static_atoms`` where the
+    SetTransformer pools them alongside sex. Real OMOP concept ids → real
+    ancestor closures via concept_ancestor → real vocab atoms.
+    """
+    birth_ts = (
+        "TIMESTAMP(DATE(p.year_of_birth, "
+        "COALESCE(p.month_of_birth, 1), COALESCE(p.day_of_birth, 1)))"
+    )
+    return f"""
+    SELECT
+      CAST(p.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS({birth_ts}) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
+      p.race_concept_id AS cid,
+      CAST(NULL AS FLOAT64) AS value
+    FROM `{cdr}.person` p
+    JOIN `{cdr}.concept` c ON c.concept_id = p.race_concept_id
+    WHERE p.race_concept_id > 0{_tiny_predicate("p.person_id")}
+    UNION ALL
+    SELECT
+      CAST(p.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS({birth_ts}) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
+      p.ethnicity_concept_id AS cid,
+      CAST(NULL AS FLOAT64) AS value
+    FROM `{cdr}.person` p
+    JOIN `{cdr}.concept` c ON c.concept_id = p.ethnicity_concept_id
+    WHERE p.ethnicity_concept_id > 0{_tiny_predicate("p.person_id")}
+    """
+
+
 def _all_events_sql(cdr: str) -> str:
     """One combined event stream, unsorted.
 
@@ -876,6 +956,8 @@ def _all_events_sql(cdr: str) -> str:
       UNION ALL ({_measurement_events_sql(cdr)})
       UNION ALL ({_observation_events_sql(cdr)})
       UNION ALL ({_observation_string_value_events_sql(cdr)})
+      UNION ALL ({_death_events_sql(cdr)})
+      UNION ALL ({_demographics_events_sql(cdr)})
     )
     SELECT subject_id, time_seconds, code, cid, value
     FROM events
@@ -910,6 +992,9 @@ def _coverage_sql(cdr: str) -> str:
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
       UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
       UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
+      UNION ALL SELECT person_id, {DEATH_CONCEPT_ID} AS cid FROM `{cdr}.aou_death` WHERE COALESCE(death_date, DATE(death_datetime)) IS NOT NULL
+      UNION ALL SELECT person_id, race_concept_id AS cid FROM `{cdr}.person` WHERE race_concept_id > 0
+      UNION ALL SELECT person_id, ethnicity_concept_id AS cid FROM `{cdr}.person` WHERE ethnicity_concept_id > 0
     ),
     cid_sketches AS (
       SELECT cid, HLL_COUNT.INIT(person_id, 12) AS sketch
@@ -1120,7 +1205,14 @@ def _own_counts_sql(cdr: str) -> str:
     cid (n_unique aggregation, 104K groups) and got SIGKILL'd by the OOM killer
     even with the polars streaming engine. BQ has unlimited memory for this kind
     of distinct count — and the result is tiny (one row per cid, ~100K rows).
+
+    The UNION must mirror every source in ``_all_events_sql`` exactly, so the
+    threshold filter in ``collapse_vocabulary`` sees the same per-concept
+    patient counts that the events stream will materialize. The death and
+    demographics sources are included here so their concept ids survive the
+    threshold cut and end up as vocab atoms.
     """
+    death_concept = DEATH_CONCEPT_ID
     return f"""
     WITH events AS (
       {_non_drug_events_cte(cdr, with_time=False)}
@@ -1128,6 +1220,9 @@ def _own_counts_sql(cdr: str) -> str:
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
       UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
       UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
+      UNION ALL SELECT person_id, {death_concept} AS cid FROM `{cdr}.aou_death` WHERE COALESCE(death_date, DATE(death_datetime)) IS NOT NULL
+      UNION ALL SELECT person_id, race_concept_id AS cid FROM `{cdr}.person` WHERE race_concept_id > 0
+      UNION ALL SELECT person_id, ethnicity_concept_id AS cid FROM `{cdr}.person` WHERE ethnicity_concept_id > 0
     )
     SELECT cid, COUNT(DISTINCT person_id) AS n
     FROM events
@@ -1541,19 +1636,42 @@ def main(argv: list[str] | None = None) -> None:
     )
     _WORK.finish_unit("pull person demographics", f"rows={persons.height:,}")
 
-    _WORK.start_unit("pull observation-period censoring", "latest observation_period_end_date per subject")
+    _WORK.start_unit(
+        "pull censor (observation-period end + aou_death)",
+        "censor_seconds = LEAST(observation_period_end, death_date) — death is a hard censor",
+    )
     censor = _cache_parquet(
         cache_dir / "censor.parquet",
         lambda: _arrow_to_polars(
-            _query_to_arrow(client(), f"""SELECT CAST(person_id AS INT64) AS subject_id,
-                           UNIX_SECONDS(TIMESTAMP(MAX(observation_period_end_date))) AS censor_seconds
-                    FROM `{cdr}.observation_period`
-                    WHERE TRUE{_tiny_predicate("person_id")}
-                    GROUP BY person_id""", "observation_period"),
-            "observation_period",
+            _query_to_arrow(client(), f"""
+                WITH obs_end AS (
+                  SELECT person_id,
+                         MAX(observation_period_end_date) AS observation_end
+                  FROM `{cdr}.observation_period`
+                  WHERE TRUE{_tiny_predicate("person_id")}
+                  GROUP BY person_id
+                ),
+                death AS (
+                  SELECT person_id,
+                         MIN(COALESCE(death_date, DATE(death_datetime))) AS death_date
+                  FROM `{cdr}.aou_death`
+                  WHERE COALESCE(death_date, DATE(death_datetime)) IS NOT NULL
+                    {_tiny_predicate("person_id")}
+                  GROUP BY person_id
+                )
+                SELECT
+                  CAST(o.person_id AS INT64) AS subject_id,
+                  UNIX_SECONDS(TIMESTAMP(LEAST(
+                    o.observation_end,
+                    COALESCE(d.death_date, o.observation_end)
+                  ))) AS censor_seconds
+                FROM obs_end o
+                LEFT JOIN death d ON d.person_id = o.person_id
+            """, "censor"),
+            "censor",
         ),
     )
-    _WORK.finish_unit("pull observation-period censoring", f"rows={censor.height:,}")
+    _WORK.finish_unit("pull censor (observation-period end + aou_death)", f"rows={censor.height:,}")
 
     _WORK.start_unit("build subject metadata", "row offsets, demographics, censoring, deterministic split labels")
     offsets = (
