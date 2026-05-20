@@ -118,6 +118,63 @@ def test_decode_step_matches_extended_forward():
         torch.testing.assert_close(h_step2, h2_forward, rtol=1e-4, atol=1e-4)
 
 
+def test_rollout_multi_horizon_snapshot_is_cumulative():
+    """Each chain's per-horizon disease_hit must be cumulative: a hit at age
+    H1 < H2 < H3 should be counted at all three horizon snapshots, not just
+    the one closest in age. Catches an off-by-one in the horizon-mask logic.
+    """
+    from genterp.eval_rollout import _rollout_subject_batch, _build_atom_to_disease
+
+    torch.manual_seed(3)
+    cfg = tiny_config()
+    model_inner = Genterp(cfg).eval()
+
+    # Mock the outer model the way GenterpForCausalLM wraps it.
+    class _Wrapper:
+        def __init__(self, inner):
+            self.model = inner
+            self.training = False
+
+        def eval(self):
+            self.training = False
+            return self
+    model = _Wrapper(model_inner)
+
+    # Build a 1-subject batch with deterministic prefix.
+    batch = _batch_with_length(n_atoms=cfg.n_atoms, seed=7)
+    B = int(batch["event_atoms"].shape[0])
+    # Single disease covering the model's last few atoms.
+    disease_atoms = {1, 2, 3}
+    n_diseases = 1
+
+    # Build atom_to_disease directly (avoid needing a full cohort).
+    atom_to_disease = torch.zeros(cfg.n_atoms, n_diseases, dtype=torch.bool)
+    for a in disease_atoms:
+        atom_to_disease[a, 0] = True
+
+    # Cap a single subject so n_chains×B stays small.
+    one_subject_batch = {k: (v[:1] if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] >= 1 else v) for k, v in batch.items()}
+    horizon_offsets = (365.25, 5 * 365.25, 10 * 365.25)
+
+    risk = _rollout_subject_batch(
+        model, one_subject_batch,
+        n_chains=4, max_steps=20,
+        horizon_offsets_days=horizon_offsets,
+        atom_to_disease=atom_to_disease,
+        autocast_dtype=None,
+        device=torch.device("cpu"),
+    )
+    # Shape: (B, n_horizons, n_diseases)
+    assert risk.shape == (1, 3, 1)
+    # Cumulative: longer horizons can only have ≥ risk than shorter ones.
+    risks_per_horizon = risk[0, :, 0].cpu().tolist()
+    for short, longer in zip(risks_per_horizon, risks_per_horizon[1:]):
+        assert longer >= short - 1e-6, (
+            f"risk at longer horizon must be ≥ shorter (got {risks_per_horizon})"
+        )
+    _ = B  # silence
+
+
 def test_decode_step_respects_advance_mask():
     """A chain whose advance_mask is False must NOT have its valid_length grow,
     even though its cache K, V append the same way as alive chains. Verified
