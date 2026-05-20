@@ -169,13 +169,18 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
 
     node_to_cid = np.asarray(all_anc_cids, dtype=np.int64)
     tmp = output.with_suffix(output.suffix + ".tmp")
-    np.savez_compressed(
-        tmp,
-        ancestor_ids=ancestor_ids,
-        n_ancestor_rows=np.int64(n_ancestor_rows),
-        node_to_cid=node_to_cid,
-        source_fingerprint=np.frombuffer(fp.encode().ljust(16, b"\x00"), dtype=np.uint8),
-    )
+    # np.savez_compressed auto-appends ".npz" to STRING/Path filenames,
+    # so passing "foo.npz.tmp" silently writes "foo.npz.tmp.npz" and the
+    # atomic-rename target doesn't exist. Pass a file object to suppress
+    # that behavior — numpy writes to exactly the path we opened.
+    with open(tmp, "wb") as f:
+        np.savez_compressed(
+            f,
+            ancestor_ids=ancestor_ids,
+            n_ancestor_rows=np.int64(n_ancestor_rows),
+            node_to_cid=node_to_cid,
+            source_fingerprint=np.frombuffer(fp.encode().ljust(16, b"\x00"), dtype=np.uint8),
+        )
     tmp.replace(output)
     print(f"  wrote {output}")
 
