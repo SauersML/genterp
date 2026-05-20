@@ -381,7 +381,22 @@ def build_cohort_condition_phenotypes(
     """
     cache = _load_cohort_concept_cache(etl_dir)
 
-    condition_cids = [cid for cid, meta in cache.concept_meta.items() if meta["domain"] == "Condition"]
+    n_total = len(cache.concept_meta)
+    n_condition = sum(1 for m in cache.concept_meta.values() if m["domain"] == "Condition")
+
+    # OHDSI/SNOMED splits the Condition domain by concept_class_id: "Disorder"
+    # = actual diseases (Type 2 diabetes, MI, etc.); "Clinical Finding" /
+    # "Context-dependent category" / "Event" = generic rollups and symptoms
+    # that aren't useful prediction targets. Filter to Disorders only.
+    condition_cids = [
+        cid for cid, meta in cache.concept_meta.items()
+        if meta["domain"] == "Condition" and meta["class"] == "Disorder"
+    ]
+    print(
+        f"  [sweep] OHDSI filter: domain=Condition AND concept_class_id=Disorder  "
+        f"→ {len(condition_cids):,} of {n_condition:,} Condition concepts "
+        f"({n_total:,} total in cohort vocab)"
+    )
     if not condition_cids:
         any_domain_populated = any(meta["domain"] for meta in cache.concept_meta.values())
         if not any_domain_populated:
@@ -393,6 +408,17 @@ def build_cohort_condition_phenotypes(
 
     condition_cids.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
     selected = condition_cids[:top_n]
+    print(
+        f"  [sweep] ranking {len(condition_cids):,} Disorders by cohort coverage, "
+        f"keeping top {len(selected)}:"
+    )
+    for rank, cid in enumerate(selected[:10], start=1):
+        meta = cache.concept_meta.get(cid, {})
+        name = meta.get("name") or cache.cid_to_code.get(cid, str(cid))
+        cov = cache.coverage.get(cid, 0)
+        print(f"    {rank:>2}. {name[:60]:60s}  coverage={cov:,}")
+    if len(selected) > 10:
+        print(f"    ... {len(selected) - 10} more")
 
     phenotypes: list[DiseasePhenotype] = []
     for cid in selected:
