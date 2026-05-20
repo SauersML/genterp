@@ -274,17 +274,22 @@ def _find_etl_cache(etl_dir: Path) -> Path | None:
     return max(candidates, key=lambda d: d.stat().st_mtime)
 
 
-def _resolve_disease_atom_sets(
-    vocab: AtomVocab, etl_dir: Path
-) -> tuple[list[DiseasePhenotype], list[set[int]], dict[str, dict[str, object]]]:
-    """Resolve each `DiseasePhenotype` to its cohort-descendant atom set.
+@dataclass(frozen=True)
+class _CohortConceptCache:
+    """Parsed view of the ETL's concept_codes + coverage_and_ancestors cache.
 
-    Walks the ETL's cached coverage_and_ancestors-*.json to find IS-A
-    descendants of each root concept WITHIN the cohort. Descendants that
-    didn't survive vocab collapse are silently dropped. Returns parallel
-    lists of (phenotypes, atom_sets) restricted to resolvable diseases,
-    plus an info dict with the source-code class for transparency.
+    Loaded once and reused for both hand-curated phenotype resolution and
+    SNOMED-disorder sweep enumeration so we don't re-parse the JSON files
+    twice per eval run.
     """
+    cid_to_code: dict[int, str]
+    code_to_cid: dict[str, int]
+    coverage: dict[int, int]                  # cid → distinct-patient count
+    descendants_of: dict[int, set[int]]       # ancestor cid → descendant cids (inclusive of self)
+
+
+def _load_cohort_concept_cache(etl_dir: Path) -> _CohortConceptCache:
+    """Read concept_codes.json + latest coverage_and_ancestors-*.json."""
     cache_dir = _find_etl_cache(etl_dir)
     if cache_dir is None:
         raise SystemExit(f"no ETL cache dir under {etl_dir}/cache — run aou_etl.py first")
@@ -299,6 +304,8 @@ def _resolve_disease_atom_sets(
         raise SystemExit(f"no coverage_and_ancestors-*.json under {cache_dir}")
     cov_anc = json.loads(ca_files[0].read_text())
 
+    coverage = {int(cid): int(count) for cid, count in cov_anc.get("coverage", [])}
+
     descendants_of: dict[int, set[int]] = defaultdict(set)
     for entry in cov_anc.get("ancestors", []):
         desc_cid, ancestors_list = int(entry[0]), entry[1]
@@ -306,22 +313,115 @@ def _resolve_disease_atom_sets(
         for anc_pair in ancestors_list:
             descendants_of[int(anc_pair[0])].add(desc_cid)
 
+    return _CohortConceptCache(
+        cid_to_code=cid_to_code,
+        code_to_cid=code_to_cid,
+        coverage=coverage,
+        descendants_of=descendants_of,
+    )
+
+
+# SNOMED "Disorder" root — every clinically-meaningful disease concept is
+# an IS-A descendant of this in the SNOMED hierarchy. Used as the default
+# anchor for ``build_snomed_disorder_phenotypes``.
+SNOMED_DISORDER_ROOT_CODE = "SNOMED/64572001"
+
+# Conservative defaults for sweep eval. Min cohort coverage filters out
+# diseases too rare to score; max phenotypes caps the leaderboard length
+# so the per-eval cost stays bounded. Both can be overridden at the call.
+DEFAULT_SWEEP_MIN_COHORT_COVERAGE = 1_000
+DEFAULT_SWEEP_MAX_PHENOTYPES = 500
+
+
+def build_snomed_disorder_phenotypes(
+    etl_dir: Path,
+    *,
+    min_cohort_coverage: int = DEFAULT_SWEEP_MIN_COHORT_COVERAGE,
+    max_phenotypes: int | None = DEFAULT_SWEEP_MAX_PHENOTYPES,
+    root_code: str = SNOMED_DISORDER_ROOT_CODE,
+    exclude_root_codes: Iterable[str] = (),
+    min_occurrences: int = 2,
+    min_gap_days: float = 30.0,
+) -> list[DiseasePhenotype]:
+    """Enumerate every SNOMED disorder with enough cohort coverage to evaluate.
+
+    Walks the ETL's cached coverage_and_ancestors. For each IS-A descendant
+    of ``root_code`` whose distinct-patient coverage clears
+    ``min_cohort_coverage``, emits a ``DiseasePhenotype`` keyed by that SNOMED
+    concept. Ranked by coverage descending and truncated at ``max_phenotypes``
+    so the leaderboard stays measurable (each disease still needs enough
+    *post-landmark* events to clear the C-index summary threshold).
+
+    Useful for sweep-style eval — instead of measuring 11 hand-picked
+    phenotypes you discover which slices of disease the model actually
+    predicts well, and which are noise-floor. Curated DEFAULT_DISEASES is
+    untouched and remains the path used by training's in-loop eval.
+    """
+    cache = _load_cohort_concept_cache(etl_dir)
+    root_cid = cache.code_to_cid.get(root_code)
+    if root_cid is None:
+        raise SystemExit(f"sweep root {root_code} not in cohort vocab")
+    exclude_cids = {cache.code_to_cid[c] for c in exclude_root_codes if c in cache.code_to_cid}
+    exclude_cids.add(root_cid)  # don't evaluate the root itself
+
+    candidates = [
+        cid for cid in cache.descendants_of.get(root_cid, set())
+        if cid not in exclude_cids and cache.coverage.get(cid, 0) >= min_cohort_coverage
+    ]
+    candidates.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
+    if max_phenotypes is not None:
+        candidates = candidates[:max_phenotypes]
+
+    phenotypes: list[DiseasePhenotype] = []
+    for cid in candidates:
+        code = cache.cid_to_code.get(cid)
+        if code is None:
+            continue
+        phenotypes.append(DiseasePhenotype(
+            name=code,  # SNOMED/<cid>; concept_name isn't in the ETL cache yet
+            root_code=code,
+            min_occurrences=min_occurrences,
+            min_gap_days=min_gap_days,
+        ))
+    return phenotypes
+
+
+def _resolve_disease_atom_sets(
+    vocab: AtomVocab,
+    etl_dir: Path,
+    phenotypes: list[DiseasePhenotype] | None = None,
+    *,
+    verbose: bool = True,
+) -> tuple[list[DiseasePhenotype], list[set[int]], dict[str, dict[str, object]]]:
+    """Resolve each ``DiseasePhenotype`` to its cohort-descendant atom set.
+
+    If ``phenotypes`` is None, falls back to the hand-curated DEFAULT_DISEASES
+    list so existing callers (training-loop eval) keep their stable schema.
+    Pass an explicit list to evaluate a different cohort — e.g., the SNOMED
+    sweep produced by :func:`build_snomed_disorder_phenotypes`.
+    """
+    if phenotypes is None:
+        phenotypes = list(DEFAULT_DISEASES)
+    cache = _load_cohort_concept_cache(etl_dir)
+
     resolved_phenotypes: list[DiseasePhenotype] = []
     atom_sets: list[set[int]] = []
     info: dict[str, dict[str, object]] = {}
-    for pheno in DEFAULT_DISEASES:
-        root_cid = code_to_cid.get(pheno.root_code)
+    for pheno in phenotypes:
+        root_cid = cache.code_to_cid.get(pheno.root_code)
         if root_cid is None:
-            print(f"  [skip] {pheno.name} — root {pheno.root_code} not in cohort vocab")
+            if verbose:
+                print(f"  [skip] {pheno.name} — root {pheno.root_code} not in cohort vocab")
             continue
-        desc_cids = descendants_of.get(root_cid, set())
+        desc_cids = cache.descendants_of.get(root_cid, set())
         if not desc_cids:
-            print(f"  [skip] {pheno.name} — root {pheno.root_code} has no cohort descendants")
+            if verbose:
+                print(f"  [skip] {pheno.name} — root {pheno.root_code} has no cohort descendants")
             continue
         atoms: set[int] = set()
         sample_codes: list[str] = []
         for cid in desc_cids:
-            code = cid_to_code.get(cid)
+            code = cache.cid_to_code.get(cid)
             if code is None:
                 continue
             aid = vocab.encode(code)
@@ -330,7 +430,8 @@ def _resolve_disease_atom_sets(
                 if len(sample_codes) < 4:
                     sample_codes.append(code)
         if not atoms:
-            print(f"  [skip] {pheno.name} — {len(desc_cids)} descendants but none survived vocab collapse")
+            if verbose:
+                print(f"  [skip] {pheno.name} — {len(desc_cids)} descendants but none survived vocab collapse")
             continue
         resolved_phenotypes.append(pheno)
         atom_sets.append(atoms)
@@ -343,6 +444,7 @@ def _resolve_disease_atom_sets(
             "n_descendant_cids": len(desc_cids),
             "n_atoms": len(atoms),
             "sample_codes": sample_codes,
+            "cohort_coverage": cache.coverage.get(int(root_cid), 0),
         }
     return resolved_phenotypes, atom_sets, info
 

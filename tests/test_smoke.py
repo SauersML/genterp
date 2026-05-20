@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from genterp import Genterp
-from genterp.modeling import MarkedTPPHead, marked_tpp_value_loss
+from genterp.modeling import AtomEmbedding, MarkedTPPHead, marked_tpp_value_loss
 from tests._factories import make_batch, tiny_config
 
 
@@ -100,8 +100,8 @@ def test_value_loss_reports_and_clips_extreme_magnitudes():
 
 
 def test_mark_negative_cache_is_transient():
-    weight = torch.nn.Parameter(torch.randn(16, 8))
-    tpp = MarkedTPPHead(8, 16, weight, sampled_mark_negatives=4)
+    embed = AtomEmbedding(16, 8)
+    tpp = MarkedTPPHead(8, 16, embed, sampled_mark_negatives=4)
     hidden = torch.randn(3, 8)
     delta_t = torch.ones(3)
     target = torch.tensor([1, 2, 3])
@@ -113,8 +113,8 @@ def test_mark_negative_cache_is_transient():
 
 
 def test_mark_negative_cache_is_reused_and_reset_when_distribution_changes():
-    weight = torch.nn.Parameter(torch.randn(16, 8))
-    tpp = MarkedTPPHead(8, 16, weight, sampled_mark_negatives=4)
+    embed = AtomEmbedding(16, 8)
+    tpp = MarkedTPPHead(8, 16, embed, sampled_mark_negatives=4)
 
     first = tpp._sample_mark_negatives(4)
     cache_id = tpp._mark_negative_cache.data_ptr()
@@ -173,6 +173,47 @@ def test_mark_loss_samples_negatives_only_while_training(monkeypatch):
     )
 
     assert sampled_calls == [int((~batch["event_pad"][:, :-1] & ~batch["event_pad"][:, 1:]).sum().item())]
+
+
+def test_hierarchical_embedding_warm_start_is_bit_exact():
+    """Activating hierarchical mode with zero-init ancestors must reproduce
+    the flat-embedding model exactly, so a flat checkpoint warm-starts into
+    a hierarchical model without any change in behavior on the first step.
+    """
+    torch.manual_seed(0)
+    flat = AtomEmbedding(32, 16)
+    atoms = torch.randint(low=1, high=32, size=(4, 7))
+
+    flat_out = flat(atoms)
+    flat_weight = flat.effective_weight()
+
+    # Build hierarchical with the same leaf params + a non-trivial ancestor table.
+    hier = AtomEmbedding(32, 16, n_ancestor_rows=5)
+    hier.embedding.load_state_dict(flat.embedding.state_dict())
+    ancestor_ids = torch.zeros(32, 3, dtype=torch.long)
+    # Give half the atoms one or two ancestors; ancestor_embedding is zero-init.
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 0] = 2
+    ancestor_ids[2, 1] = 3
+    ancestor_ids[7, 0] = 4
+    ancestor_ids[12, 0] = 5
+    hier.set_ancestor_ids(ancestor_ids)
+
+    assert hier.has_ancestors()
+    assert torch.equal(hier(atoms), flat_out)
+    assert torch.equal(hier.effective_weight(), flat_weight)
+
+    # Now perturb the ancestor embeddings and confirm the output changes —
+    # i.e. the hierarchical path is wired in, just zero-suppressed at init.
+    with torch.no_grad():
+        hier.ancestor_embedding.weight[1].fill_(0.1)
+    perturbed = hier(atoms)
+    rows_touched = (atoms == 1).any(dim=-1)
+    assert not torch.equal(perturbed, flat_out)
+    # Only rows containing atom 1 (whose ancestor is node 1) should change.
+    unchanged_rows = ~rows_touched
+    if unchanged_rows.any():
+        assert torch.equal(perturbed[unchanged_rows], flat_out[unchanged_rows])
 
 
 def test_transcoder_acts():

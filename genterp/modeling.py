@@ -193,6 +193,28 @@ class CausalRoPEAttention(nn.Module):
             ).transpose(1, 2)
         return out
 
+    def _qkv_rope(self, x: torch.Tensor, angles: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Projection + rope. Returns ``(q, k, v)`` each of shape (B, S, H, D).
+
+        Extracted so the decode pathway (genterp.decode) can reuse identical
+        parameters and rope semantics without re-implementing the linear/rope
+        stack. Training-mode forward calls this then runs packed varlen
+        attention; decode-mode init calls this and stashes (k, v); decode-mode
+        step calls this for the single new token and appends (k, v) to the
+        KV cache.
+        """
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.heads)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.heads)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.heads)
+        q = self.rope.apply(q.transpose(1, 2), angles).transpose(1, 2)
+        k = self.rope.apply(k.transpose(1, 2), angles).transpose(1, 2)
+        return q, k, v
+
+    def _project_out(self, out: torch.Tensor) -> torch.Tensor:
+        """Final output projection. ``out`` is (B, S, H, D)."""
+        return self.proj(rearrange(out, "b s h d -> b s (h d)"))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -201,14 +223,9 @@ class CausalRoPEAttention(nn.Module):
         static_len: int,
         event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = rearrange(q, "b s (h d) -> b s h d", h=self.heads)
-        k = rearrange(k, "b s (h d) -> b s h d", h=self.heads)
-        v = rearrange(v, "b s (h d) -> b s h d", h=self.heads)
-        q = self.rope.apply(q.transpose(1, 2), angles).transpose(1, 2)
-        k = self.rope.apply(k.transpose(1, 2), angles).transpose(1, 2)
+        q, k, v = self._qkv_rope(x, angles)
         out = self._packed_prefix_causal_attention(q, k, v, static_len, event_pad, event_lengths)
-        return self.proj(rearrange(out, "b s h d -> b s (h d)"))
+        return self._project_out(out)
 
 
 class Block(nn.Module):
@@ -276,21 +293,105 @@ class SetTransformer(nn.Module):
 
 
 class AtomEmbedding(nn.Module):
-    """Atom embedding for collapsed OMOP event codes."""
+    """Atom embedding for OMOP event codes, optionally with ancestor-sum hierarchy.
 
-    def __init__(self, n_atoms: int, dim: int, padding_idx: int = 0):
+    Flat mode (default, identical to old behavior): ``embed(atom) = self.embedding(atom)``.
+
+    Hierarchical mode (after ``set_ancestors`` has been called with a non-empty
+    table): ``embed(atom) = self.embedding(atom) + Σ_a∈ancestors(atom) self.ancestor_embedding(a)``.
+    Rare leaf concepts share parameters through their SNOMED IS-A ancestors so a
+    code with only ~50 patient hits still gets a meaningful representation via
+    its broader ancestors, while common codes can override with their own leaf
+    vector. The output projection in :class:`MarkedTPPHead` consumes
+    :attr:`effective_weight` (computed on the fly), so input-side richness flows
+    through to the mark logits without breaking weight tying.
+
+    Warm-start: ancestor_embedding starts at zero, so on the very first call
+    after ``set_ancestors`` the model is bit-identical to the flat-embedding
+    checkpoint it loaded from — gradient pressure then learns the ancestor
+    components. The original ``embedding`` Parameter path is preserved exactly
+    (same module name, same shape) so existing state-dicts deserialize cleanly.
+    """
+
+    def __init__(self, n_atoms: int, dim: int, padding_idx: int = 0, n_ancestor_rows: int = 0):
         super().__init__()
+        self.padding_idx = padding_idx
         self.embedding = nn.Embedding(n_atoms, dim, padding_idx=padding_idx)
         nn.init.normal_(self.embedding.weight, std=0.02)
         with torch.no_grad():
             self.embedding.weight[padding_idx].zero_()
+        # ancestor_embedding shape is fixed at construction so checkpoints
+        # round-trip cleanly (loading happens before set_ancestor_ids; the
+        # parameter is already the right shape). n_ancestor_rows = 0 means
+        # "flat mode": a 1-row zero placeholder that never gets indexed (the
+        # ancestor_ids buffer below has zero columns).
+        rows = max(n_ancestor_rows + 1, 1)
+        self.ancestor_embedding = nn.Embedding(rows, dim, padding_idx=0)
+        nn.init.zeros_(self.ancestor_embedding.weight)
+        self.register_buffer("ancestor_ids", torch.zeros(n_atoms, 0, dtype=torch.long), persistent=False)
+
+    @torch.no_grad()
+    def set_ancestor_ids(self, ancestor_ids: torch.Tensor) -> None:
+        """Attach the per-atom ancestor lookup table.
+
+        ``ancestor_ids`` is a (n_atoms, max_anc) long tensor; row a holds the
+        ancestor-node ids for atom a, right-padded with 0. Node id 0 is the
+        padding slot in ancestor_embedding and contributes nothing to the sum.
+
+        We do NOT resize ``ancestor_embedding`` here — that's a Parameter
+        whose shape must be settled at construction time so checkpoint round-
+        trips work. If the supplied ids reference rows past the embedding's
+        size, we raise: the caller is expected to construct the model with
+        ``n_ancestor_rows`` matching the ETL artifact.
+        """
+        device = self.embedding.weight.device
+        ancestor_ids = ancestor_ids.to(device=device, dtype=torch.long)
+        if ancestor_ids.shape[0] != self.embedding.num_embeddings:
+            raise ValueError(
+                f"ancestor_ids has {ancestor_ids.shape[0]} rows but embedding has "
+                f"{self.embedding.num_embeddings} atoms"
+            )
+        max_node = int(ancestor_ids.max().item()) if ancestor_ids.numel() else 0
+        if max_node >= self.ancestor_embedding.num_embeddings:
+            raise ValueError(
+                f"ancestor_ids references node id {max_node} but ancestor_embedding has only "
+                f"{self.ancestor_embedding.num_embeddings} rows; reconstruct the model with "
+                f"GenterpConfig(n_ancestor_rows={max_node})"
+            )
+        self.ancestor_ids = ancestor_ids
+
+    def has_ancestors(self) -> bool:
+        return self.ancestor_ids.numel() > 0 and self.ancestor_ids.shape[1] > 0
+
+    def effective_weight(self) -> torch.Tensor:
+        """Per-atom embedding (leaf + ancestor sum). Differentiable.
+
+        In flat mode this is exactly ``self.embedding.weight``. In hierarchical
+        mode the ancestor contribution is added via a single embedding-lookup +
+        sum, materializing the full (n_atoms, dim) matrix. n_atoms is ~30k and
+        dim is 512–1024, so the materialized tensor is ~30–60 MB — well within
+        budget and recomputed each forward so gradients propagate back to both
+        leaf and ancestor parameters.
+        """
+        leaf = self.embedding.weight
+        if not self.has_ancestors():
+            return leaf
+        anc_emb = self.ancestor_embedding(self.ancestor_ids)
+        anc_mask = (self.ancestor_ids != 0).to(anc_emb.dtype).unsqueeze(-1)
+        return leaf + (anc_emb * anc_mask).sum(dim=-2)
 
     @property
     def weight(self) -> torch.Tensor:
-        return self.embedding.weight
+        return self.effective_weight()
 
     def forward(self, atoms: torch.Tensor) -> torch.Tensor:
-        return self.embedding(atoms)
+        if not self.has_ancestors():
+            return self.embedding(atoms)
+        leaf = self.embedding(atoms)
+        anc_ids = self.ancestor_ids[atoms]
+        anc_emb = self.ancestor_embedding(anc_ids)
+        anc_mask = (anc_ids != 0).to(anc_emb.dtype).unsqueeze(-1)
+        return leaf + (anc_emb * anc_mask).sum(dim=-2)
 
 
 def _log1p_signed(z: torch.Tensor) -> torch.Tensor:
@@ -413,23 +514,35 @@ class MarkedTPPHead(nn.Module):
         self,
         dim: int,
         n_marks: int,
-        mark_weight: nn.Parameter,
+        embed_module: "AtomEmbedding",
         n_mix: int = 8,
         time_dim: int = 32,
         sampled_mark_negatives: int = 4096,
     ):
         super().__init__()
         assert time_dim % 2 == 0
+        mark_weight = embed_module.embedding.weight
         if mark_weight.shape != (n_marks, dim):
-            raise ValueError("mark_weight must have shape (n_marks, dim)")
+            raise ValueError("embed_module.embedding.weight must have shape (n_marks, dim)")
         self.n_marks = n_marks
         self.n_mix = n_mix
         self.sampled_mark_negatives = sampled_mark_negatives
         self.time_proj = nn.Linear(dim, 3 * n_mix)
         self.mark_h_proj = nn.Linear(dim, dim, bias=False)
         self.mark_time_proj = nn.Linear(time_dim, dim, bias=False)
+        # mark_out remains a Linear so its Parameter ``weight`` stays tied to
+        # the leaf atom embedding (preserves state-dict path used by HF's
+        # save_pretrained dedup and old checkpoints' tied_weights_keys).
+        # Effective output projection — including ancestor contributions when
+        # hierarchical mode is active — is computed via ``_output_weight()``
+        # below, which reads the embedding module dynamically.
         self.mark_out = nn.Linear(dim, n_marks, bias=False)
         self.mark_out.weight = mark_weight
+        # Keep a non-registered reference to the embedding module so we can
+        # resolve the effective output weight at forward time without making
+        # the embedding a submodule of the TPP head (which would double-count
+        # parameters in optimizer state).
+        object.__setattr__(self, "_embed_module", embed_module)
         nn.init.normal_(self.mark_h_proj.weight, std=0.02)
         nn.init.normal_(self.mark_time_proj.weight, std=0.02)
         freqs = torch.exp(torch.linspace(math.log(0.01), math.log(100.0), time_dim // 2))
@@ -482,11 +595,25 @@ class MarkedTPPHead(nn.Module):
         phi = self._phi(delta_t)
         return self.mark_h_proj(hidden) + self.mark_time_proj(phi)
 
+    def _output_weight(self) -> torch.Tensor:
+        """Effective mark-output projection weight (leaf + ancestor sums in
+        hierarchical mode; identical to ``mark_out.weight`` in flat mode).
+
+        We resolve this from the embedding module each call so hierarchical
+        mode "just works" without re-tying parameters, and so a single
+        warm-start checkpoint can flip on hierarchical embeddings at any
+        training step without rebuilding the head.
+        """
+        embed = getattr(self, "_embed_module", None)
+        if embed is None or not embed.has_ancestors():
+            return self.mark_out.weight
+        return embed.effective_weight()
+
     def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
         return self.mark_logits(hidden, delta_t).log_softmax(dim=-1)
 
     def mark_logits(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-        return self.mark_out(self.mark_features(hidden, delta_t))
+        return self.mark_features(hidden, delta_t) @ self._output_weight().T
 
     def sampled_mark_nll(self, hidden: torch.Tensor, delta_t: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if target.numel() == 0:
@@ -494,7 +621,7 @@ class MarkedTPPHead(nn.Module):
         features = self.mark_features(hidden, delta_t)
         k = min(self.sampled_mark_negatives, max(self.n_marks - 1, 1))
         negatives = self._sample_mark_negatives(k)
-        weight = self.mark_out.weight
+        weight = self._output_weight()
 
         target = target.long()
         target_logits = (features * weight[target]).sum(dim=-1, keepdim=True)
@@ -538,6 +665,12 @@ class GenterpConfig:
     value_head_hidden: int = 64
     value_head_df: float = 4.0
     sampled_mark_negatives: int = 4096
+    # Hierarchical embedding: number of distinct ancestor *nodes* across the
+    # vocabulary (excluding the pad row at index 0). 0 keeps the flat path —
+    # ancestor_embedding is a single zero row that's never indexed. Fixed at
+    # construction time so checkpoints round-trip cleanly; flipping it on for
+    # an existing run is a vocab-class change and forces optimizer rebuild.
+    n_ancestor_rows: int = 0
 
 
 class Genterp(nn.Module):
@@ -546,7 +679,12 @@ class Genterp(nn.Module):
     def __init__(self, cfg: GenterpConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed = AtomEmbedding(cfg.n_atoms, cfg.dim, padding_idx=cfg.pad_atom_idx)
+        self.embed = AtomEmbedding(
+            cfg.n_atoms,
+            cfg.dim,
+            padding_idx=cfg.pad_atom_idx,
+            n_ancestor_rows=cfg.n_ancestor_rows,
+        )
         self.sex_embedding = nn.Embedding(cfg.n_sexes, cfg.dim)
         nn.init.normal_(self.sex_embedding.weight, std=0.02)
         self.value_mod = ValueModulator(cfg.dim, cfg.n_atoms, cfg.value_mlp_hidden, cfg.value_z_clip)
@@ -559,7 +697,7 @@ class Genterp(nn.Module):
         self.tpp = MarkedTPPHead(
             cfg.dim,
             cfg.n_atoms,
-            self.embed.embedding.weight,
+            self.embed,
             cfg.n_time_mix,
             cfg.time_phi_dim,
             cfg.sampled_mark_negatives,

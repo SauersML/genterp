@@ -92,14 +92,25 @@ def _install_crash_diagnostics() -> None:
 
 RUNTIME_STATE_FILE = "genterp_runtime.json"
 FINAL_POINTER_FILE = "final_checkpoint.json"
+ANCESTORS_FILE = "ancestors.npz"
 CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
-MAX_STEPS = 50_000
+# Model is undertrained at 50K (loss still dropping fast late in training);
+# Chinchilla-style scaling on this token budget argues for substantially
+# more steps. The WSD scheduler's decay tail is set to 10% of total so the
+# stable phase stretches with longer runs and the decay phase still has
+# enough room to polish.
+MAX_STEPS = 200_000
 WARMUP_STEPS = 500
 WSD_DECAY_STEPS = MAX_STEPS // 10
 LOGGING_STEPS = 50
 EVAL_STEPS = 2_000
 SAVE_STEPS = 2_000
 SAVE_TOTAL_LIMIT = 3
+# In-loop eval subsample size. Full ~12K test cohort is too slow to score
+# every EVAL_STEPS; the random subsample stays large enough that per-disease
+# C-index has stable sampling.
+EVAL_SUBSAMPLE_SIZE = 1024
+EVAL_SUBSAMPLE_SEED = 0
 
 
 class GenterpHFConfig(transformers.PretrainedConfig):
@@ -635,6 +646,31 @@ def runtime_state(runtime: TorchRuntime) -> dict[str, object]:
     }
 
 
+def checkpoint_ancestor_rows(path: str | Path) -> int | None:
+    """How many rows did the checkpoint's ``embed.ancestor_embedding`` have?
+
+    1 means flat mode (placeholder); >1 means hierarchical was active. Returned
+    by sniffing the safetensors header (no full weight load). Used to decide
+    whether activating ancestors in the current run is a config change that
+    requires rebuilding optimizer state.
+    """
+    try:
+        from safetensors import safe_open  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        return None
+    weights = Path(path) / "model.safetensors"
+    if not weights.is_file():
+        return None
+    try:
+        with safe_open(str(weights), framework="pt") as f:  # type: ignore[no-untyped-call]
+            for key in ("model.embed.ancestor_embedding.weight",):
+                if key in f.keys():
+                    return int(f.get_slice(key).get_shape()[0])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def write_runtime_state(path: str | Path, runtime: TorchRuntime) -> None:
     logger = ProgressLogger("runtime_state", total_units=2)
     logger.start_unit("prepare runtime state directory", f"path={path}")
@@ -736,6 +772,30 @@ def save_final_model(trainer: transformers.Trainer, output_dir: str | Path, runt
     logger.start_unit("write final checkpoint pointer", f"file={output_dir / FINAL_POINTER_FILE}")
     atomic_write_json(output_dir / FINAL_POINTER_FILE, {"path": final_dir.name})
     logger.finish_unit("write final checkpoint pointer", f"path={final_dir.name}")
+
+
+def _load_ancestors(path: Path) -> tuple[torch.Tensor, int] | None:
+    """Read the optional hierarchical-embedding ancestor table from ETL.
+
+    Layout (produced by ``scripts/build_ancestors.py``):
+      - ``ancestor_ids`` : (n_atoms, max_anc) int64; row a is the ancestor-node
+        ids for atom a, right-padded with 0. Node id 0 means "no ancestor here".
+      - ``n_ancestor_rows`` : scalar int — distinct non-pad ancestor nodes.
+
+    Missing file is fine: the model stays in flat-embedding mode and the
+    existing checkpoint warm-starts unchanged. Present file activates the
+    hierarchical path with zero-init ancestor vectors, so the very first
+    forward after attaching ancestors reproduces the flat-embedding output
+    bit-for-bit; ancestor gradients are then learned during continued training.
+    """
+    if not path.is_file():
+        return None
+    data = np.load(path, allow_pickle=False)
+    if "ancestor_ids" not in data.files or "n_ancestor_rows" not in data.files:
+        raise ValueError(f"ancestors file {path} is missing required keys")
+    ancestor_ids = torch.from_numpy(np.asarray(data["ancestor_ids"], dtype=np.int64))
+    n_ancestor_rows = int(np.asarray(data["n_ancestor_rows"]).item())
+    return ancestor_ids, n_ancestor_rows
 
 
 def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -875,49 +935,74 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("build evaluation dataset", "split=test; events shared from event_store")
     eval_full = CohortDataset(etl, split="test", events=event_store)
-    # Cap each in-loop eval pass to a fixed subsample. The full ~12K test cohort at
-    # batch_size=1 takes ~30min and OOM-risks the eval-worker fleet for no per-cycle
-    # signal benefit. The subsample is deterministic (longest-first by length) so
-    # eval loss is comparable across steps. Set GENTERP_EVAL_SUBJECTS=0 to disable
-    # the cap and evaluate on the full test set.
-    eval_cap = int(os.environ.get("GENTERP_EVAL_SUBJECTS", "1024"))
-    if eval_cap > 0 and len(eval_full) > eval_cap:
-        order = np.argsort(-np.asarray(eval_full.lengths, dtype=np.int64))[:eval_cap]
+    # Each in-loop eval pass scores a deterministic random subsample of the
+    # held-out test cohort. Random (not longest-first) so the slice is
+    # representative — longest-first biased the eval toward heavy utilizers
+    # whose compressed risk profile suppressed measurable C-index.
+    if len(eval_full) > EVAL_SUBSAMPLE_SIZE:
+        order = np.random.default_rng(EVAL_SUBSAMPLE_SEED).permutation(len(eval_full))[:EVAL_SUBSAMPLE_SIZE]
         eval_dataset: Dataset = _LengthAwareSubset(eval_full, order.tolist())
         setup.finish_unit(
             "build evaluation dataset",
-            f"subjects={len(eval_dataset):,} (subsampled from {len(eval_full):,}; "
-            f"set GENTERP_EVAL_SUBJECTS=0 to use full test set)",
+            f"subjects={len(eval_dataset):,} (random subsample from {len(eval_full):,}; "
+            f"seed={EVAL_SUBSAMPLE_SEED})",
         )
     else:
         eval_dataset = eval_full
         setup.finish_unit("build evaluation dataset", f"subjects={len(eval_dataset):,}")
 
+    setup.start_unit(
+        "pre-scan ancestor table (optional)",
+        f"path={etl / ANCESTORS_FILE} — determines hierarchical embedding shape at construction",
+    )
+    pending_ancestors = _load_ancestors(etl / ANCESTORS_FILE)
+    target_n_ancestor_rows = pending_ancestors[1] if pending_ancestors is not None else 0
+    setup.finish_unit(
+        "pre-scan ancestor table (optional)",
+        f"n_ancestor_rows={target_n_ancestor_rows} ({'hierarchical' if target_n_ancestor_rows > 0 else 'flat'} embedding)",
+    )
+
     if tiny:
         # ~1000× fewer transformer params: dim 32 vs 512 (16×), 2 vs 8 layers (4×).
         # Per-layer dense weights scale as L·dim² → 4·256 = 1024×.
         setup.start_unit("construct model config", "--tiny → dim=32 heads=2 layers=2")
-        cfg = GenterpConfig(n_atoms=len(vocab), dim=32, n_heads=2, n_layers=2)
+        cfg = GenterpConfig(n_atoms=len(vocab), dim=32, n_heads=2, n_layers=2, n_ancestor_rows=target_n_ancestor_rows)
     else:
         setup.start_unit("construct model config", "dim=512 heads=8 layers=8")
-        cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8)
-    setup.finish_unit("construct model config", f"n_atoms={cfg.n_atoms:,} dim={cfg.dim} layers={cfg.n_layers}")
+        cfg = GenterpConfig(n_atoms=len(vocab), dim=512, n_heads=8, n_layers=8, n_ancestor_rows=target_n_ancestor_rows)
+    setup.finish_unit(
+        "construct model config",
+        f"n_atoms={cfg.n_atoms:,} dim={cfg.dim} layers={cfg.n_layers} n_ancestor_rows={cfg.n_ancestor_rows}",
+    )
 
     setup.start_unit("inspect checkpoints", f"output_dir={output_dir}")
     resume_checkpoint = latest_checkpoint(output_dir)
     hardware_changed = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
     ckpt_n_atoms = checkpoint_n_atoms(resume_checkpoint) if resume_checkpoint else None
     vocab_changed = ckpt_n_atoms is not None and ckpt_n_atoms != cfg.n_atoms
+    # Detect ancestor-table activation: if the ETL now has an ancestors file
+    # but the checkpoint was saved with the flat placeholder (or vice versa),
+    # the embed.ancestor_embedding parameter has a new shape on this run and
+    # the saved Adam moments for it are unusable. Treat it like a vocab change
+    # — load whatever weights still fit, rebuild optimizer state.
+    ckpt_ancestor_rows = checkpoint_ancestor_rows(resume_checkpoint) if resume_checkpoint else None
+    target_ancestor_rows = target_n_ancestor_rows + 1
+    ancestors_changed = (
+        ckpt_ancestor_rows is not None and ckpt_ancestor_rows != target_ancestor_rows
+    )
     # Any shape-axis change in the model invalidates the optimizer state (Adam
     # moments are per-parameter and per-shape). Force a state reset so we
     # rebuild fresh moments around the partially-loaded weights.
-    reset_training_state = bool(resume_checkpoint and (hardware_changed or vocab_changed))
+    reset_training_state = bool(
+        resume_checkpoint and (hardware_changed or vocab_changed or ancestors_changed)
+    )
     warm_start_path = final_model_path(output_dir) if resume_checkpoint is None else None
     setup.finish_unit(
         "inspect checkpoints",
         f"resume_checkpoint={resume_checkpoint} warm_start_path={warm_start_path} "
         f"reset_training_state={reset_training_state} hardware_changed={hardware_changed} "
-        f"vocab_changed={vocab_changed} (ckpt_n_atoms={ckpt_n_atoms} cur_n_atoms={cfg.n_atoms})",
+        f"vocab_changed={vocab_changed} (ckpt_n_atoms={ckpt_n_atoms} cur_n_atoms={cfg.n_atoms}) "
+        f"ancestors_changed={ancestors_changed} (ckpt_anc_rows={ckpt_ancestor_rows} cur_anc_rows={target_ancestor_rows})",
     )
 
     setup.start_unit("load or initialize model", "preferring resume checkpoint, then previous final model, then fresh init")
@@ -946,6 +1031,28 @@ def main(argv: list[str] | None = None) -> None:
     setup.start_unit("apply value modulation stats", "copying mu/sigma/has_magnitude tensors into model buffers")
     model.model.value_mod.set_stats(mu, sigma, has_mag)
     setup.finish_unit("apply value modulation stats", f"magnitude_atoms={int(has_mag.sum().item()):,}")
+
+    setup.start_unit(
+        "attach hierarchical ancestor lookup (optional)",
+        "pre-scanned table is now wired into the constructed embedding",
+    )
+    if pending_ancestors is not None:
+        ancestor_ids, n_ancestor_rows = pending_ancestors
+        if ancestor_ids.shape[0] != cfg.n_atoms:
+            print(
+                f"[ancestors] shape mismatch: file has {ancestor_ids.shape[0]} atoms, "
+                f"model has {cfg.n_atoms}; skipping. Rebuild {ANCESTORS_FILE} from current vocab."
+            )
+            setup.finish_unit("attach hierarchical ancestor lookup (optional)", "skipped (atom-count mismatch)")
+        else:
+            model.model.embed.set_ancestor_ids(ancestor_ids)
+            setup.finish_unit(
+                "attach hierarchical ancestor lookup (optional)",
+                f"n_atoms={ancestor_ids.shape[0]:,} max_anc_per_atom={int(ancestor_ids.shape[1])} "
+                f"n_ancestor_rows={n_ancestor_rows:,} (zero-init at first activation keeps warm-start exact)",
+            )
+    else:
+        setup.finish_unit("attach hierarchical ancestor lookup (optional)", "no ancestors file; flat embedding mode")
 
     setup.start_unit("build training arguments", "max_steps=50000 with lower-overhead logging, eval, and checkpoint cadence")
     training_args = build_training_args(output_dir, runtime)

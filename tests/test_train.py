@@ -160,11 +160,12 @@ def test_training_args_use_wsd_and_cuda_gradient_checkpointing(tmp_path: Path):
     args = build_training_args(tmp_path, runtime)
 
     assert gradient_checkpointing_enabled(runtime)
+    from genterp.train import MAX_STEPS, WSD_DECAY_STEPS
     assert args["lr_scheduler_type"] == "warmup_stable_decay"
     assert args["warmup_steps"] == 500
-    assert args["max_steps"] == 50_000
+    assert args["max_steps"] == MAX_STEPS
     assert args["lr_scheduler_kwargs"] == {
-        "num_decay_steps": 5_000,
+        "num_decay_steps": WSD_DECAY_STEPS,
         "decay_type": "linear",
         "min_lr_ratio": 0.0,
     }
