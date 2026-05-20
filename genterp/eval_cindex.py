@@ -649,6 +649,14 @@ def _compute_disease_risks(
     grid = log_grid.exp()
 
     log_w, mu, log_sigma = tpp.time_params(h_last.float())
+    # Bound log_sigma so a destabilized value head can't push sigma → 0
+    # (inv_sigma → +inf → z → ±inf → z.pow(2) → +inf → log_pdf → -inf
+    # for every mixture, and downstream logsumexp can yield NaN if any
+    # mixture lands at +inf simultaneously). Note: torch.clamp does NOT
+    # sanitize NaN, so we nan_to_num first.
+    log_sigma = torch.nan_to_num(log_sigma, nan=0.0, posinf=10.0, neginf=-10.0).clamp(min=-10.0, max=10.0)
+    mu = torch.nan_to_num(mu, nan=0.0, posinf=20.0, neginf=-20.0)
+    log_w = torch.nan_to_num(log_w, nan=-10.0, posinf=0.0, neginf=-30.0)
     inv_sigma = (-log_sigma).exp()
     log_dt = log_grid.unsqueeze(-1)
     log_w_b = log_w.unsqueeze(1)
@@ -669,11 +677,16 @@ def _compute_disease_risks(
     log_mark_flat = mark_lp.index_select(-1, flat_atoms_t).view(B, G, -1)
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
-    # Clamp log-hazard before exp so a destabilized value head can't push
-    # lambda → +inf, which would silently propagate to NaN in the integral
-    # and then through the C-index (where the previous custom impl scored
-    # NaN risks as "comparable, never concordant" → C-index ≈ 0).
-    log_lambda_per_atom = log_lambda_per_atom.clamp(min=-30.0, max=20.0)
+    # Belt-and-suspenders: nan_to_num catches NaN (which clamp does NOT),
+    # then clamp bounds finite extremes. A destabilized value head used to
+    # push lambda → +inf → NaN integral → NaN risks → the custom C-index
+    # silently scored those as "comparable but never concordant" → C ≈ 0
+    # (fake "perfectly inverted" predictions). sksurv + this guard mean
+    # broken models now produce constant risks → tied pairs → C ≈ 0.5
+    # (honest "no signal").
+    log_lambda_per_atom = torch.nan_to_num(
+        log_lambda_per_atom, nan=-30.0, posinf=20.0, neginf=-30.0,
+    ).clamp(min=-30.0, max=20.0)
     lambda_per_atom = log_lambda_per_atom.exp()
     dgrid = torch.diff(grid, dim=-1).unsqueeze(-1)
     avg = 0.5 * (lambda_per_atom[:, :-1] + lambda_per_atom[:, 1:])
