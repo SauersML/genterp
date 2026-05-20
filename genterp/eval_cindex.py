@@ -684,6 +684,14 @@ def _compute_disease_risks(
     log_p_time = torch.logsumexp(log_w_b + log_pdf, dim=-1)
     log_surv = torch.logsumexp(log_w_b + log_surv_per_mix, dim=-1)
     log_hazard_total = log_p_time - log_surv.clamp(min=math.log(1e-12))
+    # Bound log_hazard_total ONCE here so both Λ_per_atom and Λ_total
+    # use the same value. Without this, the two clamp paths (one inside
+    # log_h + log_mark, one on log_h alone) can disagree and break the
+    # invariant Σ_m Λ_m ≤ Λ_total, letting the ratio exceed 1. clamp
+    # alone doesn't sanitize NaN, so we nan_to_num first.
+    log_hazard_total = torch.nan_to_num(
+        log_hazard_total, nan=-30.0, posinf=20.0, neginf=-30.0,
+    ).clamp(min=-30.0, max=20.0)
 
     G = grid.shape[1]
     h_expanded = h_last.unsqueeze(1).expand(B, G, D).reshape(B * G, D)
@@ -692,10 +700,9 @@ def _compute_disease_risks(
     log_mark_flat = mark_lp.index_select(-1, flat_atoms_t).view(B, G, -1)
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
-    # Belt-and-suspenders NaN/Inf bounds before exp. A destabilized value
-    # head used to push lambda → +inf → NaN integral → NaN risks; sksurv
-    # + this guard mean broken models produce constant risks (C ≈ 0.5)
-    # instead of fake-inverted (C ≈ 0). See _harrell_cindex docstring.
+    # log_mark is log-softmax bounded in (-inf, 0], so adding it only
+    # shifts log_lambda down from log_hazard_total. Re-clamp anyway in
+    # case log_mark is -inf for unused atoms after numerical underflow.
     log_lambda_per_atom = torch.nan_to_num(
         log_lambda_per_atom, nan=-30.0, posinf=20.0, neginf=-30.0,
     ).clamp(min=-30.0, max=20.0)
@@ -705,13 +712,9 @@ def _compute_disease_risks(
     avg = 0.5 * (lambda_per_atom[:, :-1] + lambda_per_atom[:, 1:])
     cum_hazard_per_atom = (avg * dgrid_unsq).sum(dim=1).clamp(min=0.0)  # (B, A)
 
-    # Λ_total(τ) for the same grid — same integration, no per-atom dimension.
-    # Used to normalize out the patient's event rate so chronic-disease
-    # ranking isn't biased against high-utilization patients.
-    log_hazard_total_safe = torch.nan_to_num(
-        log_hazard_total, nan=-30.0, posinf=20.0, neginf=-30.0,
-    ).clamp(min=-30.0, max=20.0)
-    hazard_total = log_hazard_total_safe.exp()  # (B, G)
+    # Λ_total(τ) computed from the SAME clamped log_hazard_total used
+    # above — guarantees consistency of the ratio so score ∈ [0, 1].
+    hazard_total = log_hazard_total.exp()  # (B, G)
     cum_hazard_total = (
         0.5 * (hazard_total[:, :-1] + hazard_total[:, 1:]) * dgrid
     ).sum(dim=1).clamp(min=1e-12)  # (B,)
