@@ -1292,7 +1292,10 @@ def _parse_ohdsi_reference_condition_cohorts(
     csv_columns: list[str] = []
     first_row_sample: dict[str, str] | None = None
     n_csv_rows = 0
-    with cohorts_csv.open(newline="") as f:
+    # encoding='utf-8-sig' strips the UTF-8 BOM the OHDSI PL ships at byte 0;
+    # without it csv.DictReader treats the BOM as part of the first column
+    # name ('﻿"cohortId"') and every row.get("cohortId") returns ''.
+    with cohorts_csv.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         csv_columns = list(reader.fieldnames or [])
         for row in reader:
