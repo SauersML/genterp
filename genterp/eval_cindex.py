@@ -180,9 +180,13 @@ def _build_subject_index(events: EventStore, etl_dir: Path) -> list[SubjectIndex
             skipped_no_window += 1
             continue
         # last_event_idx is the position of the last event with age < landmark
-        # within the FULL subject window (used by LandmarkDataset).
+        # within the FULL subject window. Used downstream by eval_rollout to
+        # rank subjects by history length when subsampling. Must apply the
+        # same negative-age filter as the eligibility check above, otherwise
+        # pre-birth junk rows inflate the count and bias the "longest history"
+        # subsample toward subjects with the most bad source rows.
         full_ages = (events.time_seconds.slice(start, n_rows).to_numpy() - birth_seconds) / 86400.0
-        last_event_idx_local = int((full_ages < landmark_age).sum()) - 1
+        last_event_idx_local = int(((full_ages >= 0) & (full_ages < landmark_age)).sum()) - 1
         eligible.append(SubjectIndex(
             subject_id=int(r["subject_id"]),
             start=start,

@@ -637,11 +637,26 @@ class MarkedTPPHead(nn.Module):
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor, generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         log_w, mu, log_sigma = self.time_params(hidden)
+        # NaN/Inf guards: a destabilized value head can emit NaN/Inf for
+        # log_w/mu/log_sigma. Categorical(logits=NaN) is undefined and
+        # (mu + sigma*noise).exp() with extreme mu overflows to +inf,
+        # which then poisons _phi(delta_t) → mark_logits → NaN.
+        # Without guards a single broken batch propagates NaN through the
+        # entire rollout chain (max_steps × n_chains events of garbage).
+        log_w = torch.nan_to_num(log_w, nan=-30.0, posinf=0.0, neginf=-30.0)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=20.0, neginf=-20.0)
+        # log_sigma is already clamped to [-5, 5] inside time_params; nan_to_num
+        # belt-and-suspenders for the NaN case (clamp doesn't sanitize NaN).
+        log_sigma = torch.nan_to_num(log_sigma, nan=0.0)
         k = torch.distributions.Categorical(logits=log_w).sample()
         mu_k = mu.gather(-1, k.unsqueeze(-1)).squeeze(-1)
         sigma_k = log_sigma.gather(-1, k.unsqueeze(-1)).squeeze(-1).exp()
         noise = torch.randn(mu_k.shape, generator=generator, device=mu_k.device, dtype=mu_k.dtype)
-        delta_t = (mu_k + sigma_k * noise).exp()
+        # Clamp log-delta-t to ~[1ms, 1e9 days ≈ 2.7M years] before exp so a
+        # rogue mu can't produce inf delta_t (which would then make _phi(inf)
+        # → NaN downstream).
+        log_delta_t = (mu_k + sigma_k * noise).clamp(min=-7.0, max=21.0)
+        delta_t = log_delta_t.exp()
         # Training treats PAD as zero-probability mass (mark_noise_probs[0]=0),
         # so the model is never asked to emit PAD as a real next event.
         # At inference the unmasked categorical can still draw PAD whenever
@@ -649,6 +664,7 @@ class MarkedTPPHead(nn.Module):
         # on a non-event. Force PAD to -inf before sampling so chains only
         # ever extend with real atoms.
         mark_logits = self.mark_logits(hidden, delta_t).clone()
+        mark_logits = torch.nan_to_num(mark_logits, nan=-1e4, posinf=1e4, neginf=-1e4)
         mark_logits[..., 0] = float("-inf")
         mark = torch.distributions.Categorical(logits=mark_logits).sample()
         return delta_t, mark
