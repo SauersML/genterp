@@ -110,7 +110,10 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
     print(f"  loaded vocab : codes={len(code_to_atom):,} atoms={n_atoms:,}")
 
     cc_pairs = json.loads(cc_path.read_text())
-    cid_to_code: dict[int, str] = {int(cid): str(code) for cid, code in cc_pairs}
+    # Backward-compatible: support both old [[cid, code]] and new
+    # [[cid, code, domain, class, name]] schemas. Only the (cid, code) pair
+    # is needed here.
+    cid_to_code: dict[int, str] = {int(entry[0]): str(entry[1]) for entry in cc_pairs}
     code_to_cid: dict[str, int] = {code: cid for cid, code in cid_to_code.items()}
     print(f"  loaded codes : {len(cid_to_code):,} concept ids")
 

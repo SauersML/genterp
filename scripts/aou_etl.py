@@ -991,17 +991,29 @@ def _coverage_and_ancestors(client: bigquery.Client, cdr: str, cohort_ids: list[
 _CONCEPT_CODES_CHUNK = 100_000  # BQ jobs.insert POST body cap is ~10 MB; ~100k INT64 ids fits safely.
 
 
-def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int, str]:
-    """Resolve concept_id → 'VOCAB/CODE' via BQ. Chunks large id sets because
-    BigQuery's jobs.insert endpoint rejects POST bodies > ~10 MB (HTTP 413).
-    At AoU full-cohort scale we routinely see ≥460k cids in one batch; pre-
-    chunking turns that into a few quick 100k-id queries.
+def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int, dict[str, str]]:
+    """Resolve concept_id → metadata dict via BQ.
+
+    Returns ``{cid: {"code": "VOCAB/CODE", "domain": ..., "class": ..., "name": ...}}``.
+    The eval-side disease sweep filters candidates by ``domain == "Condition"``
+    so we score against OMOP-normalized disease concepts rather than guessing
+    via SNOMED hierarchy descent. ``concept_name`` makes the leaderboard
+    human-readable.
+
+    Chunks large id sets because BigQuery's jobs.insert endpoint rejects POST
+    bodies > ~10 MB (HTTP 413). At AoU full-cohort scale we routinely see
+    ≥460k cids in one batch; pre-chunking turns that into a few quick 100k-id
+    queries.
     """
     if not ids:
         return {}
-    sql = f"SELECT concept_id, vocabulary_id, concept_code FROM `{cdr}.concept` WHERE concept_id IN UNNEST(@ids)"
+    sql = (
+        f"SELECT concept_id, vocabulary_id, concept_code, domain_id, "
+        f"concept_class_id, concept_name FROM `{cdr}.concept` "
+        f"WHERE concept_id IN UNNEST(@ids)"
+    )
     id_list = list(ids)
-    result: dict[int, str] = {}
+    result: dict[int, dict[str, str]] = {}
     n_chunks = (len(id_list) + _CONCEPT_CODES_CHUNK - 1) // _CONCEPT_CODES_CHUNK
     for chunk_idx in range(n_chunks):
         chunk = id_list[chunk_idx * _CONCEPT_CODES_CHUNK : (chunk_idx + 1) * _CONCEPT_CODES_CHUNK]
@@ -1013,8 +1025,16 @@ def _concept_codes(client: bigquery.Client, cdr: str, ids: set[int]) -> dict[int
         cids = table.column("concept_id").to_pylist()
         vocabs = table.column("vocabulary_id").to_pylist()
         codes = table.column("concept_code").to_pylist()
-        for c, v, k in zip(cids, vocabs, codes, strict=True):
-            result[int(c)] = f"{v}/{k}"
+        domains = table.column("domain_id").to_pylist()
+        classes = table.column("concept_class_id").to_pylist()
+        names = table.column("concept_name").to_pylist()
+        for c, v, k, dom, cls, name in zip(cids, vocabs, codes, domains, classes, names, strict=True):
+            result[int(c)] = {
+                "code": f"{v}/{k}",
+                "domain": str(dom) if dom is not None else "",
+                "class": str(cls) if cls is not None else "",
+                "name": str(name) if name is not None else "",
+            }
     return result
 
 
@@ -1044,10 +1064,41 @@ def _cached_coverage_and_ancestors(client: Callable[[], bigquery.Client], cdr: s
     )
 
 
-def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: set[int], cache_dir: Path) -> dict[int, str]:
+def _cached_concept_codes(
+    client: Callable[[], bigquery.Client], cdr: str, ids: set[int], cache_dir: Path,
+) -> dict[int, dict[str, str]]:
+    """Cached concept metadata lookup keyed by concept_id.
+
+    On-disk format is a JSON list of records: ``[[cid, code, domain, class, name], ...]``.
+    For backward compatibility the loader also accepts the older 2-tuple
+    ``[[cid, code], ...]`` shape — entries from old caches are upgraded with
+    empty domain/class/name strings; the next BQ refresh re-fetches them with
+    real values. The eval-side disease sweep skips concepts with empty domain
+    so old caches degrade safely without breaking the existing curated path.
+    """
     path = cache_dir / "concept_codes.json"
-    cached = {int(cid): str(code) for cid, code in json.loads(path.read_text())} if path.exists() else {}
-    missing = ids - set(cached)
+    cached: dict[int, dict[str, str]] = {}
+    if path.exists():
+        raw: list[list[object]] = json.loads(path.read_text())
+        for entry in raw:
+            row = list(entry)
+            cid = int(row[0])  # type: ignore[arg-type]
+            if len(row) >= 5:
+                cached[cid] = {
+                    "code": str(row[1]),
+                    "domain": str(row[2]) if row[2] is not None else "",
+                    "class": str(row[3]) if row[3] is not None else "",
+                    "name": str(row[4]) if row[4] is not None else "",
+                }
+            else:
+                # Legacy [cid, code] shape — leave metadata empty; will be
+                # backfilled by the next BQ fetch if this cid is in `ids`.
+                cached[cid] = {"code": str(row[1]), "domain": "", "class": "", "name": ""}
+
+    # A cid counts as "cached" only if we have the full metadata. Entries
+    # imported from the legacy format have empty domain → re-fetch.
+    fully_cached = {cid for cid, meta in cached.items() if meta["domain"]}
+    missing = ids - fully_cached
     if not missing:
         _log(f"concept code cache satisfied: cached={len(cached):,} requested={len(ids):,} missing=0")
         return cached
@@ -1055,7 +1106,10 @@ def _cached_concept_codes(client: Callable[[], bigquery.Client], cdr: str, ids: 
     _log(f"concept code cache incomplete: cached={len(cached):,} requested={len(ids):,} missing={len(missing):,}")
     cached.update(_concept_codes(client(), cdr, missing))
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(path, [[cid, code] for cid, code in sorted(cached.items())])
+    _write_json(path, [
+        [cid, meta["code"], meta["domain"], meta["class"], meta["name"]]
+        for cid, meta in sorted(cached.items())
+    ])
     return cached
 
 
@@ -1422,7 +1476,8 @@ def main(argv: list[str] | None = None) -> None:
 
         all_ids = set(own_by_cid) | set(cov) | {a for d in anc.values() for a in d}
         _log(f"resolving OMOP concept codes: own={len(own_by_cid):,} coverage={len(cov):,} ancestor_ids={len(all_ids):,}")
-        code_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
+        meta_of = _cached_concept_codes(client, cdr, all_ids, cache_dir)
+        code_of = {cid: meta["code"] for cid, meta in meta_of.items()}
         own_by_code = {code_of[c]: n for c, n in own_by_cid.items() if c in code_of}
         # Synthetic string-value codes get added with no coverage/ancestors —
         # collapse_vocabulary treats them as standalone (ancestors.get(c, {})

@@ -57,21 +57,33 @@ from genterp.data import AtomVocab
 from genterp.decode import decode_init, decode_step
 from genterp.eval_cindex import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
+    DEFAULT_SWEEP_TOP_N,
     HORIZON_DAYS,
     MIN_EVENTS_FOR_C_SUMMARY,
     CindexCohort,
     _bootstrap_c,
     _harrell_cindex,
+    build_cohort_condition_phenotypes,
     prepare_cindex_cohort,
 )
 from genterp.progress import ProgressLogger
 from genterp.runtime import accelerator_label, configure_torch_runtime
 from genterp.train import GenterpForCausalLM, final_model_path
 
-DEFAULT_N_CHAINS = 64
-DEFAULT_MAX_STEPS = 80
-DEFAULT_SUBJECT_BATCH = 4   # subjects per forward (× n_chains = real batch)
-DEFAULT_MAX_SUBJECTS = 0    # 0 = all eligible
+# Rollout cost knobs — set as module constants so the CLI stays flag-free.
+# n_chains × subject_batch is the effective batch size for decode forwards;
+# memory scales linearly with that product. Defaults tuned for a single
+# 32-GB GPU at production prefix lengths.
+N_CHAINS = 64
+MAX_STEPS = 80
+SUBJECT_BATCH = 4
+MAX_SUBJECTS = 0       # 0 = all eligible
+BOOTSTRAP_RESAMPLES = 500
+# Legacy public names kept as aliases so external callers don't break.
+DEFAULT_N_CHAINS = N_CHAINS
+DEFAULT_MAX_STEPS = MAX_STEPS
+DEFAULT_SUBJECT_BATCH = SUBJECT_BATCH
+DEFAULT_MAX_SUBJECTS = MAX_SUBJECTS
 
 
 def _expand_to_chains(batch: dict, n_chains: int, device: torch.device) -> dict:
@@ -327,16 +339,6 @@ def run_rollout_cindex(
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Monte-Carlo trajectory C-index on test cohort.")
     parser.add_argument("--tiny", action="store_true", help="Use runs-tiny/ instead of runs/.")
-    parser.add_argument("--n-chains", type=int, default=DEFAULT_N_CHAINS,
-                        help="Parallel rollout chains per subject (default 64).")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS,
-                        help="Max sampled events per chain (default 80; chains stop early when horizon reached).")
-    parser.add_argument("--subject-batch", type=int, default=DEFAULT_SUBJECT_BATCH,
-                        help="Subjects per forward pass (default 4 — real batch = subject_batch × n_chains).")
-    parser.add_argument("--max-subjects", type=int, default=DEFAULT_MAX_SUBJECTS,
-                        help="Cap subjects scored (0 = all; longest-history prefix when >0).")
-    parser.add_argument("--bootstrap", type=int, default=500,
-                        help="Bootstrap resamples for per-disease 95%% CI (default 500).")
     args = parser.parse_args(argv)
 
     setup = ProgressLogger("eval_rollout", total_units=6)
@@ -364,46 +366,72 @@ def main(argv: list[str] | None = None) -> None:
     vocab = AtomVocab(dict(json.loads((etl_dir / "vocab.json").read_text())))
     setup.finish_unit("load vocab", f"atoms={len(vocab):,}")
 
-    setup.start_unit("build cindex cohort", "per-subject landmark + outcome table")
-    cohort = prepare_cindex_cohort(etl_dir, vocab, pin_memory=runtime.dataloader_pin_memory)
+    setup.start_unit(
+        "build cindex cohort",
+        f"OHDSI domain==Condition + top-{DEFAULT_SWEEP_TOP_N} by cohort coverage",
+    )
+    sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
+    cohort_mode: str
+    if sweep_phenotypes:
+        cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
+        cohort = prepare_cindex_cohort(
+            etl_dir, vocab,
+            pin_memory=runtime.dataloader_pin_memory,
+            phenotypes=sweep_phenotypes,
+        )
+    else:
+        cohort_mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
+        cohort = prepare_cindex_cohort(
+            etl_dir, vocab,
+            pin_memory=runtime.dataloader_pin_memory,
+        )
     setup.finish_unit(
         "build cindex cohort",
-        f"subjects={len(cohort.subjects):,}  diseases={len(cohort.disease_names)}",
+        f"mode={cohort_mode}  subjects={len(cohort.subjects):,}  "
+        f"diseases={len(cohort.disease_names)}",
     )
 
     setup.start_unit(
         "score rollouts",
-        f"n_chains={args.n_chains}  max_steps={args.max_steps}  "
-        f"subject_batch={args.subject_batch}  max_subjects={args.max_subjects or 'all'}",
+        f"n_chains={N_CHAINS}  max_steps={MAX_STEPS}  "
+        f"subject_batch={SUBJECT_BATCH}  max_subjects={MAX_SUBJECTS or 'all'}",
     )
     t0 = time.time()
     results = run_rollout_cindex(
         model, cohort,
         device=device, autocast_dtype=autocast_dtype,
-        n_chains=args.n_chains, max_steps=args.max_steps,
-        subject_batch=args.subject_batch, max_subjects=args.max_subjects,
-        bootstrap_resamples=args.bootstrap,
-        progress_every=max(1, (len(cohort.subjects) // args.subject_batch) // 40),
+        n_chains=N_CHAINS, max_steps=MAX_STEPS,
+        subject_batch=SUBJECT_BATCH, max_subjects=MAX_SUBJECTS,
+        bootstrap_resamples=BOOTSTRAP_RESAMPLES,
+        progress_every=max(1, (len(cohort.subjects) // SUBJECT_BATCH) // 40),
     )
     setup.finish_unit("score rollouts", f"elapsed={time.time() - t0:.1f}s")
 
-    name_width = max(len(n) for n in cohort.disease_names)
+    # Leaderboard sort: best-predicted first. NaN C-index (too few events for
+    # a meaningful estimate) falls to the bottom.
+    def _c_sort_key(name: str) -> float:
+        c = results[name].get("c_index")
+        return float(c) if isinstance(c, (int, float)) else float("-inf")
+
+    ordered_names = sorted(cohort.disease_names, key=_c_sort_key, reverse=True)
+    display_width = min(60, max(len(n) for n in cohort.disease_names))
     header = (
-        f"  {'disease':<{name_width}}  {'eligible':>8}  {'events':>6}  {'inc%':>6}  "
+        f"  {'disease':<{display_width}}  {'eligible':>8}  {'events':>6}  {'inc%':>6}  "
         f"{'C (95% CI)':<22}  {'pairs':>9}"
     )
     print("\n" + "═" * len(header))
     print(header)
     print("─" * len(header))
-    for name in cohort.disease_names:
+    for name in ordered_names:
         m = results[name]
         c = m["c_index"]
         if m["c_index_lo"] is not None and m["c_index_hi"] is not None:
             c_str = f"{c:.3f} [{m['c_index_lo']:.3f},{m['c_index_hi']:.3f}]"
         else:
             c_str = f"{c:.4f}" if c is not None else "  nan  "
+        truncated = name if len(name) <= display_width else name[: display_width - 1] + "…"
         print(
-            f"  {name:<{name_width}}  {m['n_eligible']:>8,}  {m['events']:>6,}  "
+            f"  {truncated:<{display_width}}  {m['n_eligible']:>8,}  {m['events']:>6,}  "
             f"{m['incidence_pct']:>5.2f}%  {c_str:<22}  {m['n_pairs']:>9,}"
         )
     print("═" * len(header))
@@ -421,10 +449,10 @@ def main(argv: list[str] | None = None) -> None:
         "run_dir": str(runs_dir),
         "final_model": str(final),
         "horizon_years": HORIZON_DAYS / 365.25,
-        "n_chains": args.n_chains,
-        "max_steps": args.max_steps,
-        "subject_batch": args.subject_batch,
-        "max_subjects": args.max_subjects,
+        "n_chains": N_CHAINS,
+        "max_steps": MAX_STEPS,
+        "subject_batch": SUBJECT_BATCH,
+        "max_subjects": MAX_SUBJECTS,
         "results": {k: v for k, v in results.items() if not k.startswith("_")},
         "summary": summary,
     }, indent=2))

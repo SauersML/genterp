@@ -278,24 +278,51 @@ def _find_etl_cache(etl_dir: Path) -> Path | None:
 class _CohortConceptCache:
     """Parsed view of the ETL's concept_codes + coverage_and_ancestors cache.
 
-    Loaded once and reused for both hand-curated phenotype resolution and
-    SNOMED-disorder sweep enumeration so we don't re-parse the JSON files
-    twice per eval run.
+    Loaded once and reused for hand-curated phenotype resolution and
+    cohort-driven sweep enumeration. ``concept_meta`` is keyed by cid and
+    holds {"code", "domain", "class", "name"}; ``domain`` and ``name`` come
+    from the OMOP concept table (newer ETL caches) and are empty strings
+    when the cache predates that ETL extension — the sweep enumerator
+    treats empty-domain entries as ineligible so old caches degrade safely.
     """
     cid_to_code: dict[int, str]
     code_to_cid: dict[str, int]
+    concept_meta: dict[int, dict[str, str]]
     coverage: dict[int, int]                  # cid → distinct-patient count
     descendants_of: dict[int, set[int]]       # ancestor cid → descendant cids (inclusive of self)
 
 
 def _load_cohort_concept_cache(etl_dir: Path) -> _CohortConceptCache:
-    """Read concept_codes.json + latest coverage_and_ancestors-*.json."""
+    """Read concept_codes.json + latest coverage_and_ancestors-*.json.
+
+    ``concept_codes.json`` is accepted in either the legacy 2-tuple
+    ``[[cid, code], ...]`` or the enriched 5-tuple
+    ``[[cid, code, domain, class, name], ...]`` shape. The legacy shape
+    leaves domain/class/name as empty strings so callers can detect old
+    caches and skip the domain-filtered sweep (without breaking the
+    curated DEFAULT_DISEASES path, which doesn't need domain info).
+    """
     cache_dir = _find_etl_cache(etl_dir)
     if cache_dir is None:
         raise SystemExit(f"no ETL cache dir under {etl_dir}/cache — run aou_etl.py first")
 
-    cc_pairs = json.loads((cache_dir / "concept_codes.json").read_text())
-    cid_to_code = {int(cid): str(code) for cid, code in cc_pairs}
+    raw: list[list[object]] = json.loads((cache_dir / "concept_codes.json").read_text())
+    cid_to_code: dict[int, str] = {}
+    concept_meta: dict[int, dict[str, str]] = {}
+    for entry in raw:
+        row = list(entry)
+        cid = int(row[0])  # type: ignore[arg-type]
+        code = str(row[1])
+        cid_to_code[cid] = code
+        if len(row) >= 5:
+            concept_meta[cid] = {
+                "code": code,
+                "domain": str(row[2]) if row[2] is not None else "",
+                "class": str(row[3]) if row[3] is not None else "",
+                "name": str(row[4]) if row[4] is not None else "",
+            }
+        else:
+            concept_meta[cid] = {"code": code, "domain": "", "class": "", "name": ""}
     code_to_cid = {code: cid for cid, code in cid_to_code.items()}
 
     ca_files = sorted(cache_dir.glob("coverage_and_ancestors-*.json"),
@@ -316,69 +343,66 @@ def _load_cohort_concept_cache(etl_dir: Path) -> _CohortConceptCache:
     return _CohortConceptCache(
         cid_to_code=cid_to_code,
         code_to_cid=code_to_cid,
+        concept_meta=concept_meta,
         coverage=coverage,
         descendants_of=descendants_of,
     )
 
 
-# SNOMED "Disorder" root — every clinically-meaningful disease concept is
-# an IS-A descendant of this in the SNOMED hierarchy. Used as the default
-# anchor for ``build_snomed_disorder_phenotypes``.
-SNOMED_DISORDER_ROOT_CODE = "SNOMED/64572001"
-
-# Conservative defaults for sweep eval. Min cohort coverage filters out
-# diseases too rare to score; max phenotypes caps the leaderboard length
-# so the per-eval cost stays bounded. Both can be overridden at the call.
-DEFAULT_SWEEP_MIN_COHORT_COVERAGE = 1_000
-DEFAULT_SWEEP_MAX_PHENOTYPES = 500
+DEFAULT_SWEEP_TOP_N = 50
 
 
-def build_snomed_disorder_phenotypes(
+def build_cohort_condition_phenotypes(
     etl_dir: Path,
     *,
-    min_cohort_coverage: int = DEFAULT_SWEEP_MIN_COHORT_COVERAGE,
-    max_phenotypes: int | None = DEFAULT_SWEEP_MAX_PHENOTYPES,
-    root_code: str = SNOMED_DISORDER_ROOT_CODE,
-    exclude_root_codes: Iterable[str] = (),
+    top_n: int = DEFAULT_SWEEP_TOP_N,
     min_occurrences: int = 2,
     min_gap_days: float = 30.0,
 ) -> list[DiseasePhenotype]:
-    """Enumerate every SNOMED disorder with enough cohort coverage to evaluate.
+    """Top-N OMOP Condition concepts by cohort coverage.
 
-    Walks the ETL's cached coverage_and_ancestors. For each IS-A descendant
-    of ``root_code`` whose distinct-patient coverage clears
-    ``min_cohort_coverage``, emits a ``DiseasePhenotype`` keyed by that SNOMED
-    concept. Ranked by coverage descending and truncated at ``max_phenotypes``
-    so the leaderboard stays measurable (each disease still needs enough
-    *post-landmark* events to clear the C-index summary threshold).
+    Two-part definition, both rigorous:
 
-    Useful for sweep-style eval — instead of measuring 11 hand-picked
-    phenotypes you discover which slices of disease the model actually
-    predicts well, and which are noise-floor. Curated DEFAULT_DISEASES is
-    untouched and remains the path used by training's in-loop eval.
+      * **"Is a disease"**: OHDSI's standardized vocabulary classifier
+        ``domain_id == "Condition"``. Every concept in the OMOP concept
+        table is assigned a domain by the OHDSI vocabulary team; Condition
+        is the domain for diseases/disorders. This is the canonical
+        OHDSI-defined disease filter — no hierarchy inference.
+      * **"Top-N"**: rank by distinct-patient cohort coverage and take the
+        first ``top_n``. Picks the diseases the cohort actually exhibits in
+        sufficient numbers to score, in one number, no other thresholds.
+
+    Requires the ETL to have been re-run with the enriched concept_codes
+    schema that includes ``domain_id``; older caches surface a warning and
+    return an empty list (the curated DEFAULT_DISEASES path is unaffected).
+
+    Descendant atom sets come from the existing ``concept_ancestor`` closure
+    — identical mechanism to the curated path, just a different seed list.
     """
     cache = _load_cohort_concept_cache(etl_dir)
-    root_cid = cache.code_to_cid.get(root_code)
-    if root_cid is None:
-        raise SystemExit(f"sweep root {root_code} not in cohort vocab")
-    exclude_cids = {cache.code_to_cid[c] for c in exclude_root_codes if c in cache.code_to_cid}
-    exclude_cids.add(root_cid)  # don't evaluate the root itself
 
-    candidates = [
-        cid for cid in cache.descendants_of.get(root_cid, set())
-        if cid not in exclude_cids and cache.coverage.get(cid, 0) >= min_cohort_coverage
-    ]
-    candidates.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
-    if max_phenotypes is not None:
-        candidates = candidates[:max_phenotypes]
+    condition_cids = [cid for cid, meta in cache.concept_meta.items() if meta["domain"] == "Condition"]
+    if not condition_cids:
+        any_domain_populated = any(meta["domain"] for meta in cache.concept_meta.values())
+        if not any_domain_populated:
+            print(
+                "  [sweep] concept metadata missing in ETL cache "
+                "(domain/class/name absent); re-run aou_etl.py to populate."
+            )
+        return []
+
+    condition_cids.sort(key=lambda cid: cache.coverage.get(cid, 0), reverse=True)
+    selected = condition_cids[:top_n]
 
     phenotypes: list[DiseasePhenotype] = []
-    for cid in candidates:
+    for cid in selected:
         code = cache.cid_to_code.get(cid)
         if code is None:
             continue
+        meta = cache.concept_meta.get(cid, {})
+        name = meta.get("name") or code
         phenotypes.append(DiseasePhenotype(
-            name=code,  # SNOMED/<cid>; concept_name isn't in the ETL cache yet
+            name=name,
             root_code=code,
             min_occurrences=min_occurrences,
             min_gap_days=min_gap_days,
@@ -397,8 +421,9 @@ def _resolve_disease_atom_sets(
 
     If ``phenotypes`` is None, falls back to the hand-curated DEFAULT_DISEASES
     list so existing callers (training-loop eval) keep their stable schema.
-    Pass an explicit list to evaluate a different cohort — e.g., the SNOMED
-    sweep produced by :func:`build_snomed_disorder_phenotypes`.
+    Pass an explicit list to evaluate a different cohort — e.g., the
+    coverage-driven sweep produced by
+    :func:`build_cohort_condition_phenotypes`.
     """
     if phenotypes is None:
         phenotypes = list(DEFAULT_DISEASES)
@@ -473,6 +498,8 @@ def _build_outcome_table(
     subjects: list[SubjectIndex],
     phenotypes: list[DiseasePhenotype],
     atom_sets: list[set[int]],
+    *,
+    n_atoms_total: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """For each (subject, disease) return:
        time_to_event : days from this subject's landmark to first qualifying
@@ -483,6 +510,11 @@ def _build_outcome_table(
        prior_case   : True if any pre-landmark event hits the set (excluded).
        sex_eligible : True unless this disease is sex-restricted and the
                         subject's sex doesn't match.
+
+    Vectorized via a global ``atom_in_disease`` boolean lookup of shape
+    (n_atoms_total, n_diseases). The per-subject hot path becomes one
+    fancy-index gather instead of n_diseases × np.isin calls — order-of-
+    magnitude faster when n_diseases is in the hundreds (sweep eval).
     """
     n_s = len(subjects)
     n_d = len(phenotypes)
@@ -490,45 +522,84 @@ def _build_outcome_table(
     observed = np.zeros((n_s, n_d), dtype=bool)
     prior_case = np.zeros((n_s, n_d), dtype=bool)
     sex_eligible = np.ones((n_s, n_d), dtype=bool)
-    set_arrays = [np.asarray(sorted(s), dtype=np.int64) for s in atom_sets]
+
+    # Global atom → disease membership table. Sized to the model's atom
+    # vocab (max atom id seen across all disease sets, + 1) when
+    # n_atoms_total isn't given so it works without external info.
+    if n_atoms_total is None:
+        max_atom = 0
+        for atom_set in atom_sets:
+            if atom_set:
+                max_atom = max(max_atom, max(atom_set))
+        n_atoms_total = max_atom + 1
+    atom_in_disease = np.zeros((n_atoms_total, n_d), dtype=bool)
+    for d_idx, atom_set in enumerate(atom_sets):
+        if atom_set:
+            atoms_arr = np.fromiter(atom_set, dtype=np.int64, count=len(atom_set))
+            atom_in_disease[atoms_arr, d_idx] = True
+
+    pheno_min_occ = np.asarray([p.min_occurrences for p in phenotypes], dtype=np.int64)
+    pheno_min_gap = np.asarray([p.min_gap_days for p in phenotypes], dtype=np.float64)
+    pheno_sex_m = np.asarray([p.sex == "M" for p in phenotypes], dtype=bool)
+    pheno_sex_f = np.asarray([p.sex == "F" for p in phenotypes], dtype=bool)
+
     for i, s in enumerate(subjects):
-        # Per-disease sex eligibility — independent of any event data.
-        for d_idx, pheno in enumerate(phenotypes):
-            if pheno.sex == "M" and s.sex != SEX_MALE_CODE:
-                sex_eligible[i, d_idx] = False
-            elif pheno.sex == "F" and s.sex != SEX_FEMALE_CODE:
-                sex_eligible[i, d_idx] = False
+        # Vectorized sex eligibility — one boolean op per gender instead of
+        # a per-disease loop.
+        if s.sex != SEX_MALE_CODE:
+            sex_eligible[i] &= ~pheno_sex_m
+        if s.sex != SEX_FEMALE_CODE:
+            sex_eligible[i] &= ~pheno_sex_f
+
         n_rows = s.end - s.start + 1
         atoms = events.atom.slice(s.start, n_rows).to_numpy()
         times = events.time_seconds.slice(s.start, n_rows).to_numpy()
         ages_days = (times - s.birth_seconds) / 86400.0
         landmark = s.landmark_age_days
-        pre_mask = ages_days < landmark
-        post_mask = ages_days >= landmark
-        pre_atoms = atoms[pre_mask]
-        post_atoms = atoms[post_mask]
-        post_ages = ages_days[post_mask]
         horizon_age = min(s.censor_age_days, landmark + HORIZON_DAYS)
-        for d_idx, atom_arr in enumerate(set_arrays):
-            pheno = phenotypes[d_idx]
-            if np.isin(pre_atoms, atom_arr).any():
-                prior_case[i, d_idx] = True
-                time_to_event[i, d_idx] = horizon_age - landmark
-                observed[i, d_idx] = False
-                continue
-            in_set_post = np.isin(post_atoms, atom_arr) & (post_ages <= horizon_age)
-            if not in_set_post.any():
-                observed[i, d_idx] = False
-                time_to_event[i, d_idx] = horizon_age - landmark
-                continue
-            hit_ages = np.sort(post_ages[in_set_post])
-            case_age = _first_qualifying_age(hit_ages, pheno.min_occurrences, pheno.min_gap_days)
+
+        pre_mask = ages_days < landmark
+        post_in_window_mask = (ages_days >= landmark) & (ages_days <= horizon_age)
+
+        pre_atoms = atoms[pre_mask].astype(np.int64, copy=False)
+        # Clip atom ids to the lookup table range so out-of-vocab atoms (PAD
+        # or stale) become out-of-range index 0 (which is False everywhere).
+        pre_atoms = pre_atoms[(pre_atoms >= 0) & (pre_atoms < n_atoms_total)]
+        if pre_atoms.size > 0:
+            prior_case[i] = atom_in_disease[pre_atoms].any(axis=0)
+
+        # Default — no qualifying post-landmark event: censor at horizon.
+        time_to_event[i] = horizon_age - landmark
+        # For prior cases the loss-of-eligibility convention is the same:
+        # observed=False, time = horizon - landmark. Already covered.
+
+        post_atoms = atoms[post_in_window_mask].astype(np.int64, copy=False)
+        post_ages_arr = ages_days[post_in_window_mask]
+        in_range = (post_atoms >= 0) & (post_atoms < n_atoms_total)
+        post_atoms = post_atoms[in_range]
+        post_ages_arr = post_ages_arr[in_range]
+
+        if post_atoms.size == 0:
+            continue
+
+        # (n_post_events, n_diseases) bool: which post-window event hits which
+        # disease atom set. One gather, no per-disease isin.
+        post_hits = atom_in_disease[post_atoms]
+        if not post_hits.any():
+            continue
+
+        # Per-disease post-processing — only loop over diseases that had at
+        # least one hit for this subject, and only inspect their hit ages.
+        for d_idx in np.flatnonzero(post_hits.any(axis=0)):
+            if prior_case[i, d_idx]:
+                continue  # excluded — keep the censor-at-horizon default
+            hit_ages = np.sort(post_ages_arr[post_hits[:, d_idx]])
+            case_age = _first_qualifying_age(
+                hit_ages, int(pheno_min_occ[d_idx]), float(pheno_min_gap[d_idx])
+            )
             if case_age is not None:
                 observed[i, d_idx] = True
                 time_to_event[i, d_idx] = case_age - landmark
-            else:
-                observed[i, d_idx] = False
-                time_to_event[i, d_idx] = horizon_age - landmark
     return time_to_event, observed, prior_case, sex_eligible
 
 
@@ -665,31 +736,48 @@ def prepare_cindex_cohort(
     batch_size: int = EVAL_BATCH_SIZE,
     num_workers: int = DATALOADER_WORKERS,
     pin_memory: bool = False,
+    phenotypes: list[DiseasePhenotype] | None = None,
 ) -> CindexCohort:
+    """Build the eval cohort, outcome table, and disease atom membership.
+
+    ``phenotypes`` defaults to the hand-curated :data:`DEFAULT_DISEASES`. Pass
+    an explicit list (e.g. from :func:`build_cohort_condition_phenotypes`) to
+    score against a different, broader phenotype set — the rest of the
+    pipeline (outcome table, atom membership, risk scoring) is identical.
+    """
     if events is None:
         events = EventStore.from_parquet(etl_dir / "events.parquet")
     subjects = _build_subject_index(events, etl_dir)
-    phenotypes, atom_sets, phenotype_info = _resolve_disease_atom_sets(vocab, etl_dir)
+    resolved, atom_sets, phenotype_info = _resolve_disease_atom_sets(
+        vocab, etl_dir, phenotypes=phenotypes, verbose=phenotypes is None,
+    )
     if not subjects:
         raise SystemExit("no eligible test subjects after filters")
-    if not phenotypes:
+    if not resolved:
         raise SystemExit("no disease phenotypes resolved (no SNOMED descendants in cohort)")
 
-    print("  resolved disease phenotypes (SNOMED root + cohort-descendant atoms; ≥occ rule):")
-    for pheno in phenotypes:
-        info = phenotype_info[pheno.name]
-        head = " | ".join(info["sample_codes"][:3])
-        sex_tag = f" sex={pheno.sex}" if pheno.sex else ""
-        rule = f"≥{pheno.min_occurrences} hits ≥{int(pheno.min_gap_days)}d apart"
-        print(
-            f"    {pheno.name:30s} root={pheno.root_code:18s} "
-            f"descendants={info['n_descendant_cids']:>4}  atoms={info['n_atoms']:>4}  "
-            f"{rule:24s}{sex_tag}  e.g. {head}"
-        )
+    # Only enumerate the per-phenotype resolution table when the cohort is
+    # small enough to be readable. Hundreds of swept conditions would flood
+    # the terminal; for those callers can introspect phenotype_info directly.
+    if phenotypes is None or len(resolved) <= 30:
+        print("  resolved disease phenotypes (root + cohort-descendant atoms; ≥occ rule):")
+        for pheno in resolved:
+            info = phenotype_info[pheno.name]
+            head = " | ".join(info["sample_codes"][:3])
+            sex_tag = f" sex={pheno.sex}" if pheno.sex else ""
+            rule = f"≥{pheno.min_occurrences} hits ≥{int(pheno.min_gap_days)}d apart"
+            print(
+                f"    {pheno.name:30s} root={pheno.root_code:18s} "
+                f"descendants={info['n_descendant_cids']:>4}  atoms={info['n_atoms']:>4}  "
+                f"{rule:24s}{sex_tag}  e.g. {head}"
+            )
+    else:
+        print(f"  resolved {len(resolved):,} phenotypes (sweep mode — per-disease detail suppressed)")
 
     time_to_event, observed, prior_case, sex_eligible = _build_outcome_table(
-        events, subjects, phenotypes, atom_sets
+        events, subjects, resolved, atom_sets, n_atoms_total=len(vocab),
     )
+    phenotypes = resolved
     gaps_days = np.asarray([s.gap_to_landmark_days for s in subjects], dtype=np.float64)
     landmarks = np.asarray([s.landmark_age_days / 365.25 for s in subjects], dtype=np.float64)
     landmark_summary = {
@@ -883,11 +971,29 @@ def main(argv: list[str] | None = None) -> None:
     vocab = AtomVocab(dict(json.loads((etl_dir / "vocab.json").read_text())))
     setup.finish_unit("load vocab", f"atoms={len(vocab):,}")
 
-    setup.start_unit("build cindex cohort", "per-subject landmark + outcome table")
-    cohort = prepare_cindex_cohort(etl_dir, vocab, pin_memory=runtime.dataloader_pin_memory)
+    setup.start_unit(
+        "build cindex cohort",
+        f"OHDSI domain==Condition + top-{DEFAULT_SWEEP_TOP_N} by cohort coverage",
+    )
+    sweep_phenotypes = build_cohort_condition_phenotypes(etl_dir, top_n=DEFAULT_SWEEP_TOP_N)
+    cohort_mode: str
+    if sweep_phenotypes:
+        cohort_mode = f"sweep (top-{DEFAULT_SWEEP_TOP_N})"
+        cohort = prepare_cindex_cohort(
+            etl_dir, vocab,
+            pin_memory=runtime.dataloader_pin_memory,
+            phenotypes=sweep_phenotypes,
+        )
+    else:
+        cohort_mode = "curated DEFAULT_DISEASES (legacy ETL cache — re-run aou_etl.py for sweep)"
+        cohort = prepare_cindex_cohort(
+            etl_dir, vocab,
+            pin_memory=runtime.dataloader_pin_memory,
+        )
     setup.finish_unit(
         "build cindex cohort",
-        f"subjects={len(cohort.subjects):,} diseases={len(cohort.disease_names)} "
+        f"mode={cohort_mode}  subjects={len(cohort.subjects):,}  "
+        f"diseases={len(cohort.disease_names)}  "
         f"landmark_mean={cohort.landmark_summary['mean_years']:.1f}y",
     )
 
@@ -900,16 +1006,24 @@ def main(argv: list[str] | None = None) -> None:
     )
     setup.finish_unit("score cumulative incidence (mark-specific hazard)", f"subjects_scored={len(cohort.subjects):,}")
 
-    name_width = max(len(n) for n in cohort.disease_names)
+    # Leaderboard view: sort by C-index descending so best-predicted come
+    # first. Diseases with too few events for a meaningful C drop to the
+    # bottom (NaN sort-key, treated as -inf).
+    def _c_sort_key(name: str) -> float:
+        c = results[name].get("c_index")
+        return float(c) if isinstance(c, (int, float)) else float("-inf")
+
+    ordered_names = sorted(cohort.disease_names, key=_c_sort_key, reverse=True)
+    display_width = min(60, max(len(n) for n in cohort.disease_names))
     header = (
-        f"  {'disease':<{name_width}}  {'root':>14}  {'sex':>3}  {'set':>5}  "
-        f"{'prior':>6}  {'sex_ex':>6}  {'eligible':>8}  {'events':>6}  {'inc%':>6}  "
+        f"  {'disease':<{display_width}}  {'root':>14}  {'sex':>3}  {'set':>5}  "
+        f"{'eligible':>8}  {'events':>6}  {'inc%':>6}  "
         f"{'C (95% CI)':<22}  {'pairs':>9}"
     )
     print("\n" + "═" * len(header))
     print(header)
     print("─" * len(header))
-    for name in cohort.disease_names:
+    for name in ordered_names:
         m = results[name]
         info = cohort.phenotype_info[name]
         c = m["c_index"]
@@ -917,9 +1031,10 @@ def main(argv: list[str] | None = None) -> None:
         if m["c_index_lo"] is not None and m["c_index_hi"] is not None:
             c_str = f"{c:.3f} [{m['c_index_lo']:.3f},{m['c_index_hi']:.3f}]"
         sex_tag = info["sex_restriction"] or "-"
+        truncated = name if len(name) <= display_width else name[: display_width - 1] + "…"
         print(
-            f"  {name:<{name_width}}  {info['root_code']:>14}  {sex_tag:>3}  {info['n_atoms']:>5}  "
-            f"{m['prior_cases']:>6,}  {m['sex_excluded']:>6,}  {m['n_eligible']:>8,}  "
+            f"  {truncated:<{display_width}}  {info['root_code']:>14}  {sex_tag:>3}  {info['n_atoms']:>5}  "
+            f"{m['n_eligible']:>8,}  "
             f"{m['events']:>6,}  {m['incidence_pct']:>5.2f}%  {c_str:<22}  {m['n_pairs']:>9,}"
         )
     print("═" * len(header))
