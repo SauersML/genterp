@@ -117,7 +117,12 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
     print(f"  loaded codes : {len(cid_to_code):,} concept ids")
 
     cov_anc = json.loads(ca_path.read_text())
-    proper_ancestors_of: dict[int, set[int]] = defaultdict(set)
+    # Track min-hops per (descendant, ancestor) so we can cap per-atom at the
+    # CLOSEST ancestors (most specific = most informative). The raw transitive
+    # closure has up to 4676 ancestors for the deepest atom, and AtomEmbedding.
+    # effective_weight materializes a (n_atoms, max_anc, dim) tensor every
+    # forward — at max_anc=4676 that's 400 GB. Cap aggressively.
+    proper_ancestors_of: dict[int, dict[int, int]] = defaultdict(dict)
     for entry in cov_anc.get("ancestors", []):
         desc_cid = int(entry[0])
         for anc_pair in entry[1]:
@@ -127,17 +132,22 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
                 # represented by embed.embedding; ancestor_embedding only
                 # carries the *additive* hierarchy beyond the leaf.
                 continue
-            proper_ancestors_of[desc_cid].add(anc_cid)
+            existing = proper_ancestors_of[desc_cid].get(anc_cid)
+            if existing is None or hops < existing:
+                proper_ancestors_of[desc_cid][anc_cid] = hops
     print(f"  loaded ancestors: {len(proper_ancestors_of):,} concepts with ≥1 proper ancestor")
 
-    # For each atom, gather source codes that map to it; union their ancestors.
+    # For each atom, union ancestors from all source codes that collapse to it,
+    # keeping the min hops across source codes (most specific seen anywhere).
     codes_per_atom: dict[int, list[str]] = defaultdict(list)
     for code, atom in code_to_atom.items():
         codes_per_atom[int(atom)].append(code)
 
-    ancestor_cids_per_atom: list[set[int]] = [set() for _ in range(n_atoms)]
+    MAX_ANC_PER_ATOM = 16  # SNOMED IS-A chains are typically 5–12 deep; 16 is comfortable
+    capped_anc_per_atom: list[list[int]] = [[] for _ in range(n_atoms)]
+    raw_max_anc = 0
     for atom_id, codes in codes_per_atom.items():
-        ancs: set[int] = set()
+        ancs: dict[int, int] = {}
         for code in codes:
             cid = code_to_cid.get(code)
             if cid is None:
@@ -145,27 +155,38 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
                 # cid because they're not in OMOP concept; they have no
                 # ancestors. Fine — they fall through with empty ancs.
                 continue
-            ancs |= proper_ancestors_of.get(cid, set())
-        ancestor_cids_per_atom[atom_id] = ancs
+            for anc_cid, hops in proper_ancestors_of.get(cid, {}).items():
+                existing = ancs.get(anc_cid)
+                if existing is None or hops < existing:
+                    ancs[anc_cid] = hops
+        raw_max_anc = max(raw_max_anc, len(ancs))
+        # Sort by hops ASC (closest first), then by cid for deterministic ordering
+        # across rebuilds. Keep top-K.
+        sorted_ancs = sorted(ancs.items(), key=lambda kv: (kv[1], kv[0]))[:MAX_ANC_PER_ATOM]
+        capped_anc_per_atom[atom_id] = [cid for cid, _ in sorted_ancs]
+    print(f"  raw max ancestors per atom: {raw_max_anc:,} (uncapped)")
+    print(f"  capped to closest {MAX_ANC_PER_ATOM} per atom")
 
-    # Assign node ids: id 0 = pad, then deterministic sorted-cid order so
-    # repeated builds produce the same mapping (warm-start friendly).
-    all_anc_cids = sorted({c for s in ancestor_cids_per_atom for c in s})
-    cid_to_node = {c: i + 1 for i, c in enumerate(all_anc_cids)}
-    n_ancestor_rows = len(all_anc_cids)
-    print(f"  distinct ancestor nodes: {n_ancestor_rows:,}")
+    # Only keep node ids for ancestors that actually appear after capping.
+    # This dramatically reduces ancestor_embedding parameter count vs the
+    # raw transitive closure (most deep ancestors fall out of the top-16).
+    used_anc_cids = sorted({cid for ancs in capped_anc_per_atom for cid in ancs})
+    cid_to_node = {c: i + 1 for i, c in enumerate(used_anc_cids)}
+    n_ancestor_rows = len(used_anc_cids)
+    print(f"  distinct ancestor nodes (used after cap): {n_ancestor_rows:,}")
 
-    max_anc = max((len(s) for s in ancestor_cids_per_atom), default=0)
-    print(f"  max ancestors per atom : {max_anc}")
+    max_anc = max((len(s) for s in capped_anc_per_atom), default=0)
+    print(f"  max ancestors per atom (after cap) : {max_anc}")
     if max_anc == 0:
         # Degenerate but valid: emit an empty hierarchy and let the model run
         # in flat mode.
         ancestor_ids = np.zeros((n_atoms, 0), dtype=np.int64)
     else:
         ancestor_ids = np.zeros((n_atoms, max_anc), dtype=np.int64)
-        for atom_id, ancs in enumerate(ancestor_cids_per_atom):
-            for i, cid in enumerate(sorted(ancs)):
+        for atom_id, ancs in enumerate(capped_anc_per_atom):
+            for i, cid in enumerate(ancs):
                 ancestor_ids[atom_id, i] = cid_to_node[cid]
+    all_anc_cids = used_anc_cids
 
     node_to_cid = np.asarray(all_anc_cids, dtype=np.int64)
     tmp = output.with_suffix(output.suffix + ".tmp")
@@ -184,7 +205,7 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
     tmp.replace(output)
     print(f"  wrote {output}")
 
-    nonzero_atoms = int(sum(1 for s in ancestor_cids_per_atom if s))
+    nonzero_atoms = int(sum(1 for ancs in capped_anc_per_atom if ancs))
     return {
         "n_atoms": n_atoms,
         "atoms_with_ancestors": nonzero_atoms,
