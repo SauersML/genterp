@@ -633,23 +633,35 @@ def _compute_disease_risks(
     horizon_days: float,
     n_grid: int,
 ) -> torch.Tensor:
-    """Per-disease ranking score = Λ_A / Λ_total.
+    """Per-disease ranking score = Λ_A / Λ_total^α with α = 0.5 (sqrt).
 
-    Previously returned 1 - exp(-Λ_A), which approximates "P(first event
-    after landmark is disease A, within horizon)". That formula multiplies
-    p(A|h,t) by the patient's total event rate λ_total(t), structurally
-    penalizing high-utilization patients on chronic-disease prediction:
-    their P(first event = HTN diagnosis) is microscopic because hundreds
-    of routine events queue up first, even though they are biologically
-    highest-risk. Symmetric inverse problem: utilization-driven symptom
-    codes (pharyngitis, vomiting) ranked artificially high because their
-    high λ_total correlated with their high coding-frequency outcomes.
+    Three formulations have been tried here; this is the empirical compromise:
 
-    Λ_A / Λ_total = rate-weighted mean of p(A | h, t) over the horizon.
-    Cancels the per-patient rate factor; ranks on disease-affinity alone.
-    Bounded in (0, 1], same compute as before (one extra trapezoidal
-    integration of h_total(t) and a divide). C-index ranking is invariant
-    to monotonic transforms, so dropping the 1-exp(-) is harmless.
+    1. score = 1 - exp(-Λ_A) (original): approximates P(first event is A
+       within horizon). Multiplies p(A|h,t) by patient rate λ_total(t).
+       The rate factor is a CONFOUND for chronic conditions (high-rate
+       patients have hundreds of routine events queue up before the next
+       diagnosis code) but also a SIGNAL for utilization-driven outcomes
+       (glaucoma checkup, allergy follow-up — patients who get coded are
+       those who visit doctors).
+
+    2. score = Λ_A / Λ_total (pure ratio, attempted in 043f3e7): cancels
+       the rate factor entirely. Cleanly removes the chronic-disease
+       confound but ALSO removes the utilization signal for the codes
+       where it was a real predictor. Net effect on this model: mean
+       C-index dropped from ~0.50 to ~0.47 because the softmax-competition
+       inversion (p(A|h) is LOW for high-utilization patients due to
+       mark-mass split across 42k atoms) is no longer masked by the rate
+       factor. Anti-predictive for several diseases.
+
+    3. score = Λ_A / sqrt(Λ_total) (current, α=0.5): geometric mean of
+       the two. Partial rate weighting keeps the utilization signal for
+       codes where it's real, partial normalization dampens the
+       chronic-disease confound. Hedge under uncertainty about
+       per-disease utilization-vs-signal balance.
+
+    Same compute cost as either alternative. C-index invariant to monotonic
+    transforms so the choice only matters for cross-patient ranking magnitudes.
     """
     device = h_last.device
     B, D = h_last.shape
@@ -720,8 +732,9 @@ def _compute_disease_risks(
     ).sum(dim=1).clamp(min=1e-12)  # (B,)
 
     cum_hazard_set = cum_hazard_per_atom @ set_membership.t().float()  # (B, D)
-    score_per_set = cum_hazard_set / cum_hazard_total.unsqueeze(-1)
-    score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1.0, neginf=0.0)
+    # α = 0.5: partial rate normalization. See docstring for the trade-off.
+    score_per_set = cum_hazard_set / cum_hazard_total.sqrt().unsqueeze(-1)
+    score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1e8, neginf=0.0)
     return score_per_set
 
 
