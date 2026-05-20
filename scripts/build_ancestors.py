@@ -32,8 +32,7 @@ Idempotent: if the output exists and was produced from the current vocab.json
 + cache snapshot, exits without rewriting.
 
 CLI:
-  python -m scripts.build_ancestors            # full
-  python -m scripts.build_ancestors --tiny     # tiny
+  python -m scripts.build_ancestors            # reads ~/genterp/etl
 """
 
 from __future__ import annotations
@@ -191,19 +190,13 @@ def build_ancestors(etl_dir: Path, output: Path) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # parse_known_args (not parse_args) so run.sh can forward "$@" uniformly
+    # to all entrypoints — flags meant for aou_etl / train (e.g. --tiny) just
+    # pass through without crashing here.
     parser = argparse.ArgumentParser(description="Build ETL ancestors.npz for hierarchical embeddings.")
-    # --tiny is accepted (and ignored) for arg-parity with aou_etl.py / train.py
-    # so run.sh can forward "$@" uniformly. The underlying ETL artifacts live
-    # at ~/genterp/etl in both tiny and full mode (only the BQ cache key has a
-    # tiny suffix); pointing at etl-tiny/ here would read from a non-existent
-    # directory and crash the build.
-    parser.add_argument("--tiny", action="store_true", help="(accepted; etl dir is unchanged — see aou_etl.py).")
-    parser.add_argument("--etl-dir", type=Path, default=None, help="Override ETL directory.")
-    parser.add_argument("--output", type=Path, default=None, help="Override output path.")
-    args = parser.parse_args(argv)
-
-    etl_dir = args.etl_dir or (Path.home() / "genterp" / "etl")
-    output = args.output or (etl_dir / "ancestors.npz")
+    parser.parse_known_args(argv)
+    etl_dir = Path.home() / "genterp" / "etl"
+    output = etl_dir / "ancestors.npz"
     summary = build_ancestors(etl_dir, output)
     print(
         "  summary: "
