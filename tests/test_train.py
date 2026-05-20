@@ -226,35 +226,80 @@ def _tiny_genterp_model(n_atoms: int) -> GenterpForCausalLM:
     return GenterpForCausalLM(GenterpHFConfig(genterp_cfg=cfg_dict))
 
 
-def test_load_state_dict_drops_shape_mismatched_params(capsys):
+def test_load_state_dict_partial_prefix_copy_on_vocab_growth(capsys):
     """Vocab-grown checkpoint loads into a larger model without raising; the
-    shape-mismatched (vocab-sized) params keep their fresh init and the rest
-    of the weights copy in cleanly."""
-    old = _tiny_genterp_model(n_atoms=4)
-    new = _tiny_genterp_model(n_atoms=10)
+    vocab-shaped params get a partial-prefix copy (existing atoms keep their
+    trained vectors, new atoms keep their fresh init) and the rest of the
+    weights copy in cleanly.
 
-    # Snapshot a shape-compatible param so we can confirm it actually loaded.
+    Critical for the death + demographics ETL change: those add new atoms to
+    the vocab, but the existing 27k atoms' trained embeddings must survive
+    the resume. The prior behavior dropped ALL embedding rows on any shape
+    mismatch — destroying every step of training. The partial-prefix path
+    preserves the prefix and only the new atoms reset.
+    """
+    n_old, n_new = 4, 10
+    old = _tiny_genterp_model(n_atoms=n_old)
+    new = _tiny_genterp_model(n_atoms=n_new)
+
     norm_key = "model.norm.weight"
-    assert norm_key in new.state_dict(), "test depends on this param existing"
+    emb_key = "model.embed.embedding.weight"
+    assert norm_key in new.state_dict() and emb_key in new.state_dict()
+
+    # Set known values so we can verify per-row preservation.
     with torch.no_grad():
         old.state_dict()[norm_key].fill_(0.42)
-    snapshot_new_emb = new.state_dict()["model.embed.embedding.weight"].clone()
+        # Sentinel: row 0..n_old-1 set to row-index values so we can verify
+        # they survive the partial copy.
+        for i in range(n_old):
+            old.state_dict()[emb_key][i].fill_(float(i) + 1.0)
 
+    snapshot_new_tail = new.state_dict()[emb_key][n_old:].clone()
     result = new.load_state_dict(old.state_dict(), strict=True)
 
-    # Embedding (vocab-sized) keeps its fresh init.
-    assert torch.equal(
-        new.state_dict()["model.embed.embedding.weight"], snapshot_new_emb
-    ), "embedding must keep fresh init when vocab grew"
-    # Shape-compatible param did load.
+    # Vocab prefix: copied from checkpoint.
+    for i in range(n_old):
+        assert torch.allclose(
+            new.state_dict()[emb_key][i],
+            torch.full_like(new.state_dict()[emb_key][i], float(i) + 1.0),
+        ), f"row {i} should have been copied from checkpoint"
+    # Vocab suffix (new atoms): kept their fresh init.
+    assert torch.equal(new.state_dict()[emb_key][n_old:], snapshot_new_tail)
+    # Shape-compatible param did load normally.
     assert torch.allclose(
         new.state_dict()[norm_key], torch.full_like(new.state_dict()[norm_key], 0.42)
-    ), "shape-compatible param must be copied from checkpoint"
-    # Missing keys reported include at least the vocab-shaped params.
-    missing = set(result.missing_keys)
-    assert "model.embed.embedding.weight" in missing
+    )
+    # The partial-prefix-copied key is in the filtered set passed to load,
+    # so it's NOT in missing_keys. (Only dimensionally-incompatible keys
+    # would be reported as missing.)
+    assert emb_key not in set(result.missing_keys)
     captured = capsys.readouterr().out
-    assert "[warm-start] dropping" in captured
+    assert "[warm-start]" in captured
+    assert "prefix-copied" in captured
+
+
+def test_load_state_dict_partial_prefix_copy_on_vocab_shrink(capsys):
+    """Shrinking vocab (rare but possible if a CDR refresh removes concepts)
+    also takes the prefix-copy path: copy the first min(old, new) rows."""
+    n_old, n_new = 10, 4
+    old = _tiny_genterp_model(n_atoms=n_old)
+    new = _tiny_genterp_model(n_atoms=n_new)
+
+    emb_key = "model.embed.embedding.weight"
+    with torch.no_grad():
+        for i in range(n_old):
+            old.state_dict()[emb_key][i].fill_(float(i) + 1.0)
+
+    new.load_state_dict(old.state_dict(), strict=True)
+
+    # Only the first 4 rows are kept; row 4..9 are gone.
+    for i in range(n_new):
+        assert torch.allclose(
+            new.state_dict()[emb_key][i],
+            torch.full_like(new.state_dict()[emb_key][i], float(i) + 1.0),
+        )
+    captured = capsys.readouterr().out
+    assert "prefix-copied" in captured
 
 
 def test_load_state_dict_preserves_strict_when_shapes_match(tmp_path: Path):

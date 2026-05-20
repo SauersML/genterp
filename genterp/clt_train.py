@@ -19,7 +19,7 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 
 from genterp.data import CohortDataset, EventStore, collate
 from genterp.progress import ProgressLogger, count_parameters
-from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
+from genterp.runtime import GIB, TorchRuntime, accelerator_label, configure_torch_runtime
 from genterp.train import (
     GenterpForCausalLM,
     atomic_write_json,
@@ -491,12 +491,32 @@ def train_clt(
     return last_metrics
 
 
+def _cuda_total_memory(runtime: TorchRuntime) -> int | None:
+    if runtime.device.type != "cuda":
+        return None
+    try:
+        return int(torch.cuda.get_device_properties(runtime.device).total_memory)
+    except (AssertionError, AttributeError, RuntimeError, ValueError):
+        return None
+
+
 def _default_activation_batch_tokens(runtime: TorchRuntime) -> int:
     if runtime.device.type == "cuda":
+        total_memory = _cuda_total_memory(runtime)
+        if total_memory is None or total_memory < 8 * GIB:
+            return 256
+        if total_memory < 14 * GIB:
+            return 512
+        if total_memory < 24 * GIB:
+            return 1024
+        if total_memory < 48 * GIB:
+            return 2048
+        if total_memory < 80 * GIB:
+            return 4096
         return 8192
     if runtime.device.type == "mps":
-        return 2048
-    return 1024
+        return 512
+    return 256
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

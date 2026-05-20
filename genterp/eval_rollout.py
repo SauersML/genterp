@@ -58,7 +58,6 @@ from genterp.decode import decode_init, decode_step
 from genterp.eval_cindex import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_SWEEP_TOP_N,
-    HORIZON_DAYS,
     MIN_EVENTS_FOR_C_SUMMARY,
     CindexCohort,
     _bootstrap_c,
@@ -79,6 +78,13 @@ MAX_STEPS = 80
 SUBJECT_BATCH = 4
 MAX_SUBJECTS = 0       # 0 = all eligible
 BOOTSTRAP_RESAMPLES = 500
+# Multi-horizon snapshots. Each rollout chain runs to the longest horizon
+# and records disease hits cumulatively for each shorter horizon along the
+# way. Tells us how the model's discrimination scales with prediction
+# window — flat across horizons means general model strength; degrading
+# with horizon means the simulator drifts; improving with horizon means
+# the early steps are noisy.
+HORIZON_YEARS: tuple[float, ...] = (1.0, 3.0, 5.0, 10.0)
 # Legacy public names kept as aliases so external callers don't break.
 DEFAULT_N_CHAINS = N_CHAINS
 DEFAULT_MAX_STEPS = MAX_STEPS
@@ -129,12 +135,17 @@ def _rollout_subject_batch(
     *,
     n_chains: int,
     max_steps: int,
-    horizon_days: float,
+    horizon_offsets_days: tuple[float, ...],
     atom_to_disease: torch.Tensor,
     autocast_dtype: torch.dtype | None,
     device: torch.device,
 ) -> torch.Tensor:
-    """Run KV-cached rollouts for one subject mini-batch. Returns risk (B, n_diseases).
+    """Run KV-cached rollouts for one subject mini-batch.
+
+    Returns risk shape ``(B, n_horizons, n_diseases)`` — risk per disease at
+    each of the supplied prediction-window lengths. The chain runs to the
+    longest horizon; intermediate snapshots are captured cumulatively along
+    the way, so the per-step cost is the same as a single-horizon rollout.
 
     One full prefix forward populates the KV cache; subsequent steps are
     single-query decodes that append one (k, v) per layer per step. Cost
@@ -143,6 +154,9 @@ def _rollout_subject_batch(
     inner = model.model
     B = int(batch["event_atoms"].shape[0])
     n_diseases = atom_to_disease.shape[1]
+    n_horizons = len(horizon_offsets_days)
+    if n_horizons == 0:
+        raise ValueError("horizon_offsets_days must contain at least one offset")
 
     expanded = _expand_to_chains(batch, n_chains, device)
     BC = B * n_chains
@@ -150,8 +164,19 @@ def _rollout_subject_batch(
     landmark_age = expanded["event_ages"].gather(
         1, (expanded["length"].clamp(min=1) - 1).unsqueeze(1)
     ).squeeze(1)
-    horizon_age = landmark_age + float(horizon_days)
-    disease_hit = torch.zeros(BC, n_diseases, dtype=torch.bool, device=device)
+    # Sort horizon offsets so the LAST one is the rollout limit and earlier
+    # ones are intermediate snapshots. Use the original index order to
+    # restore the caller's horizon order in the returned tensor.
+    sorted_offsets = sorted(enumerate(horizon_offsets_days), key=lambda iv: iv[1])
+    sort_idx = torch.tensor([i for i, _ in sorted_offsets], device=device, dtype=torch.long)
+    offsets_sorted = torch.tensor(
+        [v for _, v in sorted_offsets], device=device, dtype=landmark_age.dtype,
+    )
+    max_horizon_age = landmark_age + float(offsets_sorted[-1].item())
+    # (n_horizons, BC): per-chain absolute age at each horizon boundary.
+    horizon_ages = landmark_age.unsqueeze(0) + offsets_sorted.unsqueeze(1)
+
+    disease_hit = torch.zeros(n_horizons, BC, n_diseases, dtype=torch.bool, device=device)
     finished = torch.zeros(BC, dtype=torch.bool, device=device)
     current_age = landmark_age.clone()
 
@@ -172,26 +197,35 @@ def _rollout_subject_batch(
         new_age = current_age + delta_t
 
         alive = ~finished
-        in_horizon = alive & (new_age <= horizon_age)
+        # Mask for "in the longest-horizon window" — chains past this stop.
+        in_max_horizon = alive & (new_age <= max_horizon_age)
 
-        # Credit disease hits for events landing strictly within the horizon.
-        hit_rows = in_horizon.nonzero(as_tuple=True)[0]
-        if hit_rows.numel() > 0:
-            hits = atom_to_disease[mark[hit_rows]]
-            disease_hit[hit_rows] = disease_hit[hit_rows] | hits
+        # Per-horizon "this event lands inside this snapshot's window."
+        # (n_horizons, BC): bool. Vectorized — no Python loop over horizons.
+        in_horizon_h = in_max_horizon.unsqueeze(0) & (new_age.unsqueeze(0) <= horizon_ages)
 
-        # Advance only chains that placed the event inside the horizon. Past-
-        # horizon chains stop drawing new events; their cache stops growing in
-        # the "valid" sense even though we still append a row per step (the
-        # appended K/V are masked out by attention via valid_length).
+        # Per-event disease membership.
+        # mark may carry junk values for dead chains but we mask them out via
+        # advance_mask below; gather all rows uniformly.
+        event_hits = atom_to_disease[mark]  # (BC, n_diseases) bool
+        # Broadcast to (n_horizons, BC, n_diseases) and AND with horizon mask.
+        gated_hits = event_hits.unsqueeze(0) & in_horizon_h.unsqueeze(-1)
+        disease_hit = disease_hit | gated_hits
+
         with ac_ctx:
-            h_last = decode_step(inner, cache, mark, new_age, advance_mask=in_horizon)
-        # Only advance current_age for chains that just placed a real event.
-        current_age = torch.where(in_horizon, new_age, current_age)
-        finished = finished | (new_age > horizon_age)
+            h_last = decode_step(inner, cache, mark, new_age, advance_mask=in_max_horizon)
+        current_age = torch.where(in_max_horizon, new_age, current_age)
+        finished = finished | (new_age > max_horizon_age)
 
-    risk = disease_hit.view(B, n_chains, n_diseases).float().mean(dim=1)
-    return risk
+    # Mean over chains → risk per (subject, horizon, disease)
+    risk_sorted = (
+        disease_hit.view(n_horizons, B, n_chains, n_diseases).float().mean(dim=2)
+    )  # (n_horizons, B, n_diseases) in SORTED horizon order
+    risk_sorted = risk_sorted.transpose(0, 1)  # (B, n_horizons_sorted, n_diseases)
+    # Restore caller's original horizon order.
+    inverse = torch.empty_like(sort_idx)
+    inverse[sort_idx] = torch.arange(n_horizons, device=device, dtype=torch.long)
+    return risk_sorted.index_select(dim=1, index=inverse)
 
 
 @torch.no_grad()
@@ -205,15 +239,17 @@ def score_rollout_risks(
     max_steps: int = DEFAULT_MAX_STEPS,
     subject_batch: int = DEFAULT_SUBJECT_BATCH,
     max_subjects: int = DEFAULT_MAX_SUBJECTS,
+    horizon_years: tuple[float, ...] = HORIZON_YEARS,
     progress_every: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Score every eligible subject via rollouts.
+    """Score every eligible subject via rollouts at each requested horizon.
 
-    Returns ``(risks, used_mask)`` of shapes (n_subjects, n_diseases) and
-    (n_subjects,). When ``max_subjects > 0`` only a longest-history subsample
-    is scored; the unused entries get risk NaN and ``used_mask=False`` and
-    are skipped downstream by run_rollout_cindex.
+    Returns ``(risks, used_mask)`` of shapes ``(n_subjects, n_horizons, n_diseases)``
+    and ``(n_subjects,)``. When ``max_subjects > 0`` only a longest-history
+    subsample is scored; the unused entries get risk NaN and
+    ``used_mask=False`` and are skipped downstream by run_rollout_cindex.
     """
+    horizon_offsets_days = tuple(float(y) * 365.25 for y in horizon_years)
     was_training = model.training
     model.eval()
     try:
@@ -221,7 +257,10 @@ def score_rollout_risks(
         n_atoms_total = int(model.model.cfg.n_atoms)
         atom_to_disease = _build_atom_to_disease(cohort, n_atoms_total, device)
 
-        risks = np.full((n_subjects_total, len(cohort.disease_names)), np.nan, dtype=np.float64)
+        risks = np.full(
+            (n_subjects_total, len(horizon_offsets_days), len(cohort.disease_names)),
+            np.nan, dtype=np.float64,
+        )
         used = np.zeros(n_subjects_total, dtype=bool)
 
         if max_subjects > 0 and max_subjects < n_subjects_total:
@@ -250,7 +289,7 @@ def score_rollout_risks(
                 model, batch_on_device,
                 n_chains=n_chains,
                 max_steps=max_steps,
-                horizon_days=HORIZON_DAYS,
+                horizon_offsets_days=horizon_offsets_days,
                 atom_to_disease=atom_to_disease,
                 autocast_dtype=autocast_dtype,
                 device=device,
@@ -280,51 +319,82 @@ def run_rollout_cindex(
     subject_batch: int = DEFAULT_SUBJECT_BATCH,
     max_subjects: int = DEFAULT_MAX_SUBJECTS,
     bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    horizon_years: tuple[float, ...] = HORIZON_YEARS,
     rng_seed: int = 0,
     progress_every: int = 0,
 ) -> dict[str, dict[str, object]]:
-    """Per-disease Harrell's C from rollout risks.
+    """Per-disease Harrell's C from rollout risks at each requested horizon.
 
-    Same schema as ``eval_cindex.run_cindex`` so callers can swap the two and
-    compare. Subjects with NaN risk (unscored under ``max_subjects``) are
-    excluded from the per-disease eligible cohort.
+    Returns a dict keyed by disease name. Each entry now carries a
+    ``per_horizon`` list of `{horizon_years, c_index, c_index_lo, c_index_hi,
+    n_pairs, events}` so the leaderboard can show e.g. 1y / 3y / 5y / 10y
+    side-by-side. The top-level ``c_index`` / ``n_pairs`` fields still reflect
+    the longest horizon for backwards compatibility with the existing JSON
+    output and downstream tooling.
     """
     risks, used = score_rollout_risks(
         model, cohort,
         device=device, autocast_dtype=autocast_dtype,
         n_chains=n_chains, max_steps=max_steps,
         subject_batch=subject_batch, max_subjects=max_subjects,
+        horizon_years=horizon_years,
         progress_every=progress_every,
     )
 
     rng = np.random.default_rng(rng_seed)
+    horizon_days = np.asarray([y * 365.25 for y in horizon_years], dtype=np.float64)
+    n_horizons = len(horizon_years)
     results: dict[str, dict[str, object]] = {}
     for d_idx, name in enumerate(cohort.disease_names):
         eligible_mask = used & (~cohort.prior_case[:, d_idx]) & cohort.sex_eligible[:, d_idx]
         n_eligible = int(eligible_mask.sum())
-        events_observed = int((cohort.observed[:, d_idx] & eligible_mask).sum())
+        # Outcomes per horizon: an event is "observed within H years" iff the
+        # actual time-to-event is within that window (and observed at all).
+        t_full = cohort.time_to_event[eligible_mask, d_idx]
+        o_full = cohort.observed[eligible_mask, d_idx]
+
+        per_horizon: list[dict[str, object]] = []
+        for h_idx, hy in enumerate(horizon_years):
+            r_h = risks[eligible_mask, h_idx, d_idx]
+            hdays = float(horizon_days[h_idx])
+            # Observed within this horizon: original event + within window.
+            o_h = o_full & (t_full <= hdays)
+            # Time-to-event clipped at horizon for C-index discordance pairing.
+            t_h = np.minimum(t_full, hdays)
+            events_in_h = int(o_h.sum())
+            c_h, n_pairs_h = _harrell_cindex(r_h, t_h, o_h)
+            ci_band = _bootstrap_c(r_h, t_h, o_h, bootstrap_resamples, rng) if bootstrap_resamples > 0 else None
+            per_horizon.append({
+                "horizon_years": float(hy),
+                "events": events_in_h,
+                "c_index": None if math.isnan(c_h) else float(c_h),
+                "n_pairs": int(n_pairs_h),
+                "c_index_lo": ci_band[0] if ci_band else None,
+                "c_index_hi": ci_band[2] if ci_band else None,
+            })
+
+        # Backward-compat top-level fields use the longest horizon.
+        top = per_horizon[-1] if per_horizon else {}
+        events_observed = int(top.get("events", 0))  # type: ignore[arg-type]
         incidence = 100.0 * events_observed / n_eligible if n_eligible else 0.0
-        r = risks[eligible_mask, d_idx]
-        t = cohort.time_to_event[eligible_mask, d_idx]
-        o = cohort.observed[eligible_mask, d_idx]
-        c, n_pairs = _harrell_cindex(r, t, o)
-        ci_band = _bootstrap_c(r, t, o, bootstrap_resamples, rng) if bootstrap_resamples > 0 else None
         results[name] = {
             "n_eligible": n_eligible,
             "prior_cases": int(cohort.prior_case[:, d_idx].sum()),
             "sex_excluded": int((~cohort.sex_eligible[:, d_idx]).sum()),
             "events": events_observed,
             "incidence_pct": incidence,
-            "c_index": None if math.isnan(c) else float(c),
-            "n_pairs": n_pairs,
-            "c_index_lo": ci_band[0] if ci_band else None,
-            "c_index_hi": ci_band[2] if ci_band else None,
-            "bootstrap_resamples": bootstrap_resamples if ci_band else 0,
+            "c_index": top.get("c_index"),
+            "n_pairs": top.get("n_pairs", 0),
+            "c_index_lo": top.get("c_index_lo"),
+            "c_index_hi": top.get("c_index_hi"),
+            "bootstrap_resamples": bootstrap_resamples,
+            "per_horizon": per_horizon,
         }
     valid = [
         float(m["c_index"]) for m in results.values()  # type: ignore[arg-type]
         if m["c_index"] is not None and int(m["events"]) >= MIN_EVENTS_FOR_C_SUMMARY  # type: ignore[arg-type]
     ]
+    _ = n_horizons  # silence unused-name lint; kept for clarity above
     if valid:
         results["__summary__"] = {
             "cindex_mean_well_powered": float(np.mean(valid)),
@@ -415,24 +485,35 @@ def main(argv: list[str] | None = None) -> None:
 
     ordered_names = sorted(cohort.disease_names, key=_c_sort_key, reverse=True)
     display_width = min(60, max(len(n) for n in cohort.disease_names))
+    # One column per horizon, sorted in HORIZON_YEARS order.
+    horizon_cols = [f"C@{int(y) if float(y).is_integer() else y}y" for y in HORIZON_YEARS]
+    horizon_col_width = 7  # "0.5xx" or " nan "
     header = (
         f"  {'disease':<{display_width}}  {'eligible':>8}  {'events':>6}  {'inc%':>6}  "
-        f"{'C (95% CI)':<22}  {'pairs':>9}"
+        + "  ".join(f"{col:>{horizon_col_width}}" for col in horizon_cols)
     )
     print("\n" + "═" * len(header))
     print(header)
     print("─" * len(header))
+
+    def _fmt_c(value: object) -> str:
+        if isinstance(value, (int, float)) and not math.isnan(float(value)):
+            return f"{float(value):.3f}"
+        return "  nan "
+
     for name in ordered_names:
         m = results[name]
-        c = m["c_index"]
-        if m["c_index_lo"] is not None and m["c_index_hi"] is not None:
-            c_str = f"{c:.3f} [{m['c_index_lo']:.3f},{m['c_index_hi']:.3f}]"
-        else:
-            c_str = f"{c:.4f}" if c is not None else "  nan  "
+        horizon_cells = []
+        per_horizon = m.get("per_horizon", []) or []
+        horizon_lookup = {float(h["horizon_years"]): h for h in per_horizon}  # type: ignore[index]
+        for y in HORIZON_YEARS:
+            cell = horizon_lookup.get(float(y), {})
+            horizon_cells.append(f"{_fmt_c(cell.get('c_index')):>{horizon_col_width}}")
         truncated = name if len(name) <= display_width else name[: display_width - 1] + "…"
         print(
             f"  {truncated:<{display_width}}  {m['n_eligible']:>8,}  {m['events']:>6,}  "
-            f"{m['incidence_pct']:>5.2f}%  {c_str:<22}  {m['n_pairs']:>9,}"
+            f"{m['incidence_pct']:>5.2f}%  "
+            + "  ".join(horizon_cells)
         )
     print("═" * len(header))
     summary = results.get("__summary__")
@@ -448,7 +529,7 @@ def main(argv: list[str] | None = None) -> None:
     out_json.write_text(json.dumps({
         "run_dir": str(runs_dir),
         "final_model": str(final),
-        "horizon_years": HORIZON_DAYS / 365.25,
+        "horizon_years": list(HORIZON_YEARS),
         "n_chains": N_CHAINS,
         "max_steps": MAX_STEPS,
         "subject_batch": SUBJECT_BATCH,

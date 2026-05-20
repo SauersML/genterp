@@ -642,7 +642,15 @@ class MarkedTPPHead(nn.Module):
         sigma_k = log_sigma.gather(-1, k.unsqueeze(-1)).squeeze(-1).exp()
         noise = torch.randn(mu_k.shape, generator=generator, device=mu_k.device, dtype=mu_k.dtype)
         delta_t = (mu_k + sigma_k * noise).exp()
-        mark = torch.distributions.Categorical(logits=self.mark_log_probs(hidden, delta_t)).sample()
+        # Training treats PAD as zero-probability mass (mark_noise_probs[0]=0),
+        # so the model is never asked to emit PAD as a real next event.
+        # At inference the unmasked categorical can still draw PAD whenever
+        # the non-PAD logits are all small, which would waste a rollout step
+        # on a non-event. Force PAD to -inf before sampling so chains only
+        # ever extend with real atoms.
+        mark_logits = self.mark_logits(hidden, delta_t).clone()
+        mark_logits[..., 0] = float("-inf")
+        mark = torch.distributions.Categorical(logits=mark_logits).sample()
         return delta_t, mark
 
 

@@ -150,35 +150,60 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         return transformers.modeling_outputs.CausalLMOutput(loss=ld["loss"], logits=ld["loss"].detach().reshape(1))
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Drop shape-mismatched keys so vocab/dim changes don't crash resume.
+        """Warm-load with partial-prefix copy along vocab axis.
 
-        When the ETL vocab grows (e.g. survey answers added => n_atoms jumps
-        from 11k to 27k), the vocab-shaped params can't be copied. HF Trainer
-        passes strict=False but that only ignores MISSING keys, not size
-        mismatches. We filter those out here, log what got dropped, and let
-        the affected tensors keep their fresh-init values. Everything that
-        still fits (attention, MLP, RMSNorm, ...) loads normally so we keep
-        as much trained signal as possible.
+        When the ETL vocab grows (e.g., death and demographics events added
+        → n_atoms jumps from 27k to 27.005k), the vocab-shaped params don't
+        match in shape. Naively dropping them destroys ALL trained
+        embeddings, not just the new atoms. Instead we detect axis-0-only
+        mismatches (vocab axis) and copy the overlapping prefix: existing
+        atoms keep their trained vectors, new atoms keep their fresh init.
+
+        Affected parameters:
+          - embed.embedding.weight       : (n_atoms, dim)
+          - embed.ancestor_embedding.weight : (n_ancestor_rows+1, dim)
+          - value_mod.value_mu / value_sigma / atom_has_mag : (n_atoms,)
+          - tpp.mark_out.weight (tied to embed.embedding.weight) — inherits
+            the partial-prefix copy via the tying.
+
+        Genuinely incompatible mismatches (different dim, different number
+        of attention heads, etc.) still drop and the new tensor keeps its
+        init — same as the prior behavior. HF Trainer's optimizer-state
+        load is gated separately by `reset_training_state_on_resume`, which
+        we set to True whenever any of these axis-0 shapes changed so the
+        Adam moments for the resized parameters are rebuilt cleanly.
         """
         own = super().state_dict()
-        dropped: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+        actions: list[tuple[str, tuple[int, ...], tuple[int, ...], str]] = []
         filtered: dict[str, torch.Tensor] = {}
         for k, v in state_dict.items():
-            if k in own and tuple(own[k].shape) != tuple(v.shape):
-                dropped.append((k, tuple(v.shape), tuple(own[k].shape)))
+            if k not in own:
+                filtered[k] = v
                 continue
-            filtered[k] = v
-        if dropped:
-            preview = ", ".join(f"{k} ckpt{c}→cur{o}" for k, c, o in dropped[:5])
-            if len(dropped) > 5:
-                preview += f", +{len(dropped) - 5} more"
-            print(
-                f"[warm-start] dropping {len(dropped)} shape-mismatched param(s); "
-                f"they will reinitialize: {preview}"
-            )
+            own_v = own[k]
+            if tuple(own_v.shape) == tuple(v.shape):
+                filtered[k] = v
+                continue
+            # Vocab-axis-only mismatch: same ndim, same shape[1:], differ only on axis 0.
+            if (
+                v.ndim == own_v.ndim
+                and tuple(v.shape[1:]) == tuple(own_v.shape[1:])
+            ):
+                n = min(int(v.shape[0]), int(own_v.shape[0]))
+                merged = own_v.detach().clone()
+                merged[:n] = v[:n].to(dtype=own_v.dtype, device=own_v.device)
+                filtered[k] = merged
+                actions.append((k, tuple(v.shape), tuple(own_v.shape), f"prefix-copied[:n={n}]"))
+            else:
+                actions.append((k, tuple(v.shape), tuple(own_v.shape), "dropped (incompatible)"))
+        if actions:
+            preview = ", ".join(f"{k} ckpt{c}→cur{o} [{a}]" for k, c, o, a in actions[:5])
+            if len(actions) > 5:
+                preview += f", +{len(actions) - 5} more"
+            print(f"[warm-start] handled {len(actions)} shape-mismatched param(s): {preview}")
         return super().load_state_dict(
             filtered,
-            strict=False if dropped else strict,
+            strict=False if actions else strict,
             assign=assign,
         )
 

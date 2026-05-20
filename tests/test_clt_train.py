@@ -7,6 +7,7 @@ import torch
 
 from genterp.clt_train import (
     CLTTrainingConfig,
+    _default_activation_batch_tokens,
     iter_activation_chunks,
     latest_clt_artifact,
     load_clt_artifact,
@@ -14,7 +15,7 @@ from genterp.clt_train import (
     warm_start_clt_from_latest,
 )
 from genterp.modeling import Genterp
-from genterp.runtime import TorchRuntime
+from genterp.runtime import GIB, TorchRuntime
 from genterp.transcoder import CLTConfig, CrossLayerTranscoder
 from tests._factories import make_batch, tiny_config
 
@@ -50,6 +51,35 @@ def test_iter_activation_chunks_bounds_tokens_and_preserves_pairs():
     assert [chunk[0].shape[0] for chunk in chunks] == [4, 4, 2]
     assert torch.equal(chunks[0][0], pre_mlp[:4])
     assert torch.equal(chunks[2][1], mlp_out[8:])
+
+
+def test_default_activation_batch_tokens_scales_with_cuda_memory(monkeypatch: pytest.MonkeyPatch):
+    runtime = TorchRuntime(
+        device=torch.device("cuda", 0),
+        cuda_device_count=1,
+        cuda_name="cuda",
+        cuda_capability=(7, 0),
+        per_device_train_batch_size=1,
+        bf16=False,
+        fp16=True,
+        tf32=False,
+        torch_compile=False,
+        torch_compile_backend=None,
+        torch_compile_mode=None,
+        optim="adamw_torch",
+        use_data_parallel=False,
+        dataloader_num_workers=0,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=None,
+        auto_find_batch_size=True,
+    )
+
+    class Props:
+        total_memory = 16 * GIB
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: Props())
+
+    assert _default_activation_batch_tokens(runtime) == 1024
 
 
 def test_train_clt_end_to_end_saves_loadable_artifact(tmp_path: Path):

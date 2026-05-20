@@ -189,29 +189,45 @@ class CrossLayerTranscoder(nn.Module):
         return _JumpReLU.apply(preact, theta, self._bandwidth_like(theta))
 
     def _off_diagonal_contribution(self, features: torch.Tensor) -> torch.Tensor:
-        """Return (n, L, D) — sum of cross-layer writes into each target layer."""
+        """Return (n, L, D) — sum of cross-layer writes into each target layer.
+
+        Iterates over source layers rather than materializing the full
+        ``(n, N_off, F)`` gather. With L=8, F=8192 and an 8K-token chunk that
+        gather alone is ~7.5 GB; the per-source view ``features[:, s, :]`` is
+        ``(n, F)`` and the per-source output stack is ``(num_targets, n, D)``,
+        keeping peak memory bounded so this fits on small GPUs (e.g. V100 16GB).
+        """
         L = self.cfg.n_layers
         n = features.shape[0]
         accum = features.new_zeros(n, L, self.cfg.dim)
         if self._off_s_idx.numel() == 0:
             return accum
 
-        feats_at_s = features.index_select(1, self._off_s_idx)  # (n, N_off, F)
-        if self.off_blocks is not None:
-            # Dense path: (n, N_off, F) ⨯ (N_off, F, D) → (n, N_off, D)
-            out_per_pair = torch.einsum("npf,pfd->npd", feats_at_s, self.off_blocks)
-        else:
-            assert self.off_U is not None and self.off_V is not None
-            # Low-rank path: (feats @ U) @ V[s].
-            tmp = torch.einsum("npf,pfr->npr", feats_at_s, self.off_U)         # (n, N_off, r)
-            v_per_pair = self.off_V.index_select(0, self._off_s_idx)           # (N_off, r, D)
-            out_per_pair = torch.einsum("npr,prd->npd", tmp, v_per_pair)        # (n, N_off, D)
+        s_idx = self._off_s_idx
+        t_idx = self._off_t_idx
 
-        # Under autocast, the matmul ops above downcast to fp16/bf16 while
-        # accum keeps the dtype of `features` (which is fp32 — the JumpReLU
-        # custom autograd Function isn't autocast-aware and returns fp32).
-        # index_add_ requires matching dtypes; cast the source to match accum.
-        accum.index_add_(1, self._off_t_idx, out_per_pair.to(accum.dtype))
+        for s in range(L):
+            pair_mask = (s_idx == s)
+            if not bool(pair_mask.any()):
+                continue
+            pair_ids = pair_mask.nonzero(as_tuple=False).flatten()
+            targets = t_idx.index_select(0, pair_ids)            # (num_t,)
+            feats_s = features[:, s, :]                          # (n, F)
+
+            if self.off_blocks is not None:
+                blocks_s = self.off_blocks.index_select(0, pair_ids)   # (num_t, F, D)
+                out_s = torch.matmul(feats_s.unsqueeze(0), blocks_s)   # (num_t, n, D)
+            else:
+                assert self.off_U is not None and self.off_V is not None
+                U_s = self.off_U.index_select(0, pair_ids)             # (num_t, F, r)
+                tmp = torch.matmul(feats_s.unsqueeze(0), U_s)          # (num_t, n, r)
+                out_s = torch.matmul(tmp, self.off_V[s])               # (num_t, n, D)
+
+            # Under autocast the matmul output downcasts; accum keeps the dtype
+            # of `features` (fp32, since the JumpReLU custom autograd Function
+            # isn't autocast-aware). index_add_ requires matching dtypes.
+            out_s = out_s.to(accum.dtype)
+            accum.index_add_(1, targets, out_s.transpose(0, 1))         # (n, num_t, D)
         return accum
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
