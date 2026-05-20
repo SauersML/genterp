@@ -633,12 +633,23 @@ def _compute_disease_risks(
     horizon_days: float,
     n_grid: int,
 ) -> torch.Tensor:
-    """Cumulative incidence per disease SET via mark-specific hazard.
+    """Per-disease ranking score = Λ_A / Λ_total.
 
-    Math: sum per-atom cumulative hazards across each disease's atom set and
-    exponentiate once (1 - exp(-Σ_a Λ_a)). Same answer as integrating the
-    set-level mark hazard and bounded in [0, 1]. Implemented as one matmul
-    so cost is independent of disease count.
+    Previously returned 1 - exp(-Λ_A), which approximates "P(first event
+    after landmark is disease A, within horizon)". That formula multiplies
+    p(A|h,t) by the patient's total event rate λ_total(t), structurally
+    penalizing high-utilization patients on chronic-disease prediction:
+    their P(first event = HTN diagnosis) is microscopic because hundreds
+    of routine events queue up first, even though they are biologically
+    highest-risk. Symmetric inverse problem: utilization-driven symptom
+    codes (pharyngitis, vomiting) ranked artificially high because their
+    high λ_total correlated with their high coding-frequency outcomes.
+
+    Λ_A / Λ_total = rate-weighted mean of p(A | h, t) over the horizon.
+    Cancels the per-patient rate factor; ranks on disease-affinity alone.
+    Bounded in (0, 1], same compute as before (one extra trapezoidal
+    integration of h_total(t) and a divide). C-index ranking is invariant
+    to monotonic transforms, so dropping the 1-exp(-) is harmless.
     """
     device = h_last.device
     B, D = h_last.shape
@@ -681,24 +692,34 @@ def _compute_disease_risks(
     log_mark_flat = mark_lp.index_select(-1, flat_atoms_t).view(B, G, -1)
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
-    # Belt-and-suspenders: nan_to_num catches NaN (which clamp does NOT),
-    # then clamp bounds finite extremes. A destabilized value head used to
-    # push lambda → +inf → NaN integral → NaN risks → the custom C-index
-    # silently scored those as "comparable but never concordant" → C ≈ 0
-    # (fake "perfectly inverted" predictions). sksurv + this guard mean
-    # broken models now produce constant risks → tied pairs → C ≈ 0.5
-    # (honest "no signal").
+    # Belt-and-suspenders NaN/Inf bounds before exp. A destabilized value
+    # head used to push lambda → +inf → NaN integral → NaN risks; sksurv
+    # + this guard mean broken models produce constant risks (C ≈ 0.5)
+    # instead of fake-inverted (C ≈ 0). See _harrell_cindex docstring.
     log_lambda_per_atom = torch.nan_to_num(
         log_lambda_per_atom, nan=-30.0, posinf=20.0, neginf=-30.0,
     ).clamp(min=-30.0, max=20.0)
     lambda_per_atom = log_lambda_per_atom.exp()
-    dgrid = torch.diff(grid, dim=-1).unsqueeze(-1)
+    dgrid = torch.diff(grid, dim=-1)
+    dgrid_unsq = dgrid.unsqueeze(-1)
     avg = 0.5 * (lambda_per_atom[:, :-1] + lambda_per_atom[:, 1:])
-    cum_hazard_per_atom = (avg * dgrid).sum(dim=1).clamp(min=0.0)
+    cum_hazard_per_atom = (avg * dgrid_unsq).sum(dim=1).clamp(min=0.0)  # (B, A)
 
-    cum_hazard_set = cum_hazard_per_atom @ set_membership.t().float()
-    cum_hazard_set = torch.nan_to_num(cum_hazard_set, nan=0.0, posinf=50.0, neginf=0.0)
-    return 1.0 - (-cum_hazard_set).exp()
+    # Λ_total(τ) for the same grid — same integration, no per-atom dimension.
+    # Used to normalize out the patient's event rate so chronic-disease
+    # ranking isn't biased against high-utilization patients.
+    log_hazard_total_safe = torch.nan_to_num(
+        log_hazard_total, nan=-30.0, posinf=20.0, neginf=-30.0,
+    ).clamp(min=-30.0, max=20.0)
+    hazard_total = log_hazard_total_safe.exp()  # (B, G)
+    cum_hazard_total = (
+        0.5 * (hazard_total[:, :-1] + hazard_total[:, 1:]) * dgrid
+    ).sum(dim=1).clamp(min=1e-12)  # (B,)
+
+    cum_hazard_set = cum_hazard_per_atom @ set_membership.t().float()  # (B, D)
+    score_per_set = cum_hazard_set / cum_hazard_total.unsqueeze(-1)
+    score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1.0, neginf=0.0)
+    return score_per_set
 
 
 def _harrell_cindex(risks: np.ndarray, time_to_event: np.ndarray, observed: np.ndarray) -> tuple[float, int]:
