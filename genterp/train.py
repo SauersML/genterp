@@ -671,29 +671,43 @@ def runtime_state(runtime: TorchRuntime) -> dict[str, object]:
     }
 
 
-def checkpoint_ancestor_rows(path: str | Path) -> int | None:
+_ANCESTOR_ROWS_UNREADABLE = -1   # couldn't sniff the checkpoint at all
+_ANCESTOR_ROWS_ABSENT = 0        # checkpoint sniffed fine; the parameter just isn't there
+
+
+def checkpoint_ancestor_rows(path: str | Path) -> int:
     """How many rows did the checkpoint's ``embed.ancestor_embedding`` have?
 
-    1 means flat mode (placeholder); >1 means hierarchical was active. Returned
-    by sniffing the safetensors header (no full weight load). Used to decide
-    whether activating ancestors in the current run is a config change that
-    requires rebuilding optimizer state.
+    ``>=1`` means the parameter is present with that many rows (1 = placeholder
+    aka flat mode, >1 = hierarchical was active). ``_ANCESTOR_ROWS_ABSENT``
+    (0) means the safetensors file was readable but the parameter is missing
+    entirely — a pre-hierarchical checkpoint, saved before the
+    ancestor_embedding module existed. ``_ANCESTOR_ROWS_UNREADABLE`` (-1)
+    means we couldn't sniff at all (no safetensors lib, no model file, etc.).
+
+    The distinction matters for the optimizer-state reset decision: a
+    pre-hierarchical checkpoint has FEWER parameters than the current model
+    (no ancestor_embedding.weight) and so the saved optimizer parameter
+    groups don't match the live ones — the load must reset. An unreadable
+    sniff can't tell us either way, so we conservatively assume the live
+    state and don't reset on its account.
     """
     try:
         from safetensors import safe_open  # type: ignore[import-not-found]
     except ModuleNotFoundError:
-        return None
+        return _ANCESTOR_ROWS_UNREADABLE
     weights = Path(path) / "model.safetensors"
     if not weights.is_file():
-        return None
+        return _ANCESTOR_ROWS_UNREADABLE
     try:
         with safe_open(str(weights), framework="pt") as f:  # type: ignore[no-untyped-call]
-            for key in ("model.embed.ancestor_embedding.weight",):
-                if key in f.keys():
-                    return int(f.get_slice(key).get_shape()[0])
+            key = "model.embed.ancestor_embedding.weight"
+            keys = set(f.keys())
+            if key in keys:
+                return int(f.get_slice(key).get_shape()[0])
+            return _ANCESTOR_ROWS_ABSENT
     except (OSError, ValueError):
-        return None
-    return None
+        return _ANCESTOR_ROWS_UNREADABLE
 
 
 def write_runtime_state(path: str | Path, runtime: TorchRuntime) -> None:
@@ -1005,15 +1019,27 @@ def main(argv: list[str] | None = None) -> None:
     hardware_changed = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
     ckpt_n_atoms = checkpoint_n_atoms(resume_checkpoint) if resume_checkpoint else None
     vocab_changed = ckpt_n_atoms is not None and ckpt_n_atoms != cfg.n_atoms
-    # Detect ancestor-table activation: if the ETL now has an ancestors file
-    # but the checkpoint was saved with the flat placeholder (or vice versa),
-    # the embed.ancestor_embedding parameter has a new shape on this run and
-    # the saved Adam moments for it are unusable. Treat it like a vocab change
-    # — load whatever weights still fit, rebuild optimizer state.
-    ckpt_ancestor_rows = checkpoint_ancestor_rows(resume_checkpoint) if resume_checkpoint else None
+    # Detect model-graph or shape change for ancestor_embedding. Three cases:
+    #   ABSENT       : pre-hierarchical checkpoint. The current model has the
+    #                  ancestor_embedding parameter; the saved optimizer state
+    #                  doesn't. Loading optimizer state would raise
+    #                  "parameter group that doesn't match the size of
+    #                  optimizer's group". Must reset.
+    #   row count mismatch : checkpoint had ancestor_embedding but with a
+    #                        different number of rows (vocab grew via
+    #                        scripts.build_ancestors). Param shape changed,
+    #                        Adam moments unusable. Must reset.
+    #   row count match    : everything aligns. Resume cleanly.
+    #   UNREADABLE   : conservative no-op; assume safe.
+    ckpt_ancestor_rows = (
+        checkpoint_ancestor_rows(resume_checkpoint)
+        if resume_checkpoint else _ANCESTOR_ROWS_UNREADABLE
+    )
     target_ancestor_rows = target_n_ancestor_rows + 1
-    ancestors_changed = (
-        ckpt_ancestor_rows is not None and ckpt_ancestor_rows != target_ancestor_rows
+    ancestors_changed = bool(
+        resume_checkpoint
+        and ckpt_ancestor_rows != _ANCESTOR_ROWS_UNREADABLE
+        and ckpt_ancestor_rows != target_ancestor_rows
     )
     # Any shape-axis change in the model invalidates the optimizer state (Adam
     # moments are per-parameter and per-shape). Force a state reset so we

@@ -333,6 +333,50 @@ def test_checkpoint_n_atoms_reads_config(tmp_path: Path):
     assert checkpoint_n_atoms(missing) is None
 
 
+def test_checkpoint_ancestor_rows_distinguishes_absent_from_unreadable(tmp_path: Path):
+    """checkpoint_ancestor_rows must distinguish three cases:
+      - parameter present  → returns row count (>=1)
+      - safetensors readable but parameter ABSENT → returns 0 sentinel
+      - safetensors not readable at all → returns -1 sentinel
+
+    The ABSENT vs UNREADABLE distinction is what fixes the pre-hierarchical
+    checkpoint resume crash: ABSENT means the live model has an
+    ancestor_embedding parameter the checkpoint's optimizer state doesn't,
+    so optimizer state must be rebuilt; UNREADABLE means we can't tell and
+    should be conservative.
+    """
+    from safetensors.torch import save_file
+    from genterp.train import (
+        _ANCESTOR_ROWS_ABSENT,
+        _ANCESTOR_ROWS_UNREADABLE,
+        checkpoint_ancestor_rows,
+    )
+
+    # Case 1: parameter present with 5 rows.
+    present = tmp_path / "ckpt-present"
+    present.mkdir()
+    save_file(
+        {"model.embed.ancestor_embedding.weight": torch.zeros(5, 8)},
+        str(present / "model.safetensors"),
+    )
+    assert checkpoint_ancestor_rows(present) == 5
+
+    # Case 2: safetensors readable, parameter absent — the
+    # pre-hierarchical checkpoint case that triggered the crash.
+    absent = tmp_path / "ckpt-absent"
+    absent.mkdir()
+    save_file(
+        {"model.embed.embedding.weight": torch.zeros(10, 8)},  # vocab only
+        str(absent / "model.safetensors"),
+    )
+    assert checkpoint_ancestor_rows(absent) == _ANCESTOR_ROWS_ABSENT
+
+    # Case 3: no safetensors file at all → unreadable.
+    unreadable = tmp_path / "ckpt-unreadable"
+    unreadable.mkdir()
+    assert checkpoint_ancestor_rows(unreadable) == _ANCESTOR_ROWS_UNREADABLE
+
+
 def test_trainer_keeps_lengths_on_host_for_attention_control_flow(tmp_path: Path):
     runtime = TorchRuntime(
         device=torch.device("meta"),
