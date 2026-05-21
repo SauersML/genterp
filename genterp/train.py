@@ -566,6 +566,50 @@ class GenterpTrainer(transformers.Trainer):
         if runtime is not None and runtime.device.type == "cuda" and not runtime.use_data_parallel:
             self.args._n_gpu = 1
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Sanitize NaN/Inf gradients right after backward, before the trainer
+        applies ``clip_grad_norm_``.
+
+        ``torch.nn.utils.clip_grad_norm_`` computes the global norm across all
+        parameters and divides each gradient by that norm. If *any* parameter
+        has a single NaN/Inf entry in its gradient, the global norm is NaN,
+        the division produces NaN gradients across *every* parameter, and the
+        next ``optimizer.step()`` writes NaN into the corresponding weight
+        rows. This is the suspected mechanism by which the model accumulated
+        NaN parameter rows over training — value-head Student-t blowup or
+        full-vocab exact-mark logits producing one bad gradient is enough to
+        contaminate the whole model.
+
+        Fix: after backward, scan param.grad for NaN/Inf. Zero those entries
+        (the rest of the gradient stays valid). The optimizer applies a
+        smaller-than-intended update for that step instead of poisoning the
+        weights. Log when it fires so we can correlate with training metric
+        spikes. Cheap: one boolean reduction per parameter tensor.
+        """
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        dirty_count = 0
+        dirty_tensors: list[str] = []
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                bad = torch.isnan(p.grad).any() | torch.isinf(p.grad).any()
+                if bool(bad):
+                    n_bad = int((torch.isnan(p.grad) | torch.isinf(p.grad)).sum().item())
+                    p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    dirty_count += n_bad
+                    dirty_tensors.append(f"{name}({n_bad})")
+        if dirty_count > 0:
+            preview = ", ".join(dirty_tensors[:5])
+            if len(dirty_tensors) > 5:
+                preview += f", +{len(dirty_tensors) - 5} more"
+            print(
+                f"[training_step] sanitized {dirty_count:,} NaN/Inf grad entries "
+                f"across {len(dirty_tensors)} tensors at step={self.state.global_step}: {preview}",
+                flush=True,
+            )
+        return loss
+
     def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False, **kwargs):
         """Compute the rich Genterp loss dict; stash component NLLs for `log()` to surface.
 
