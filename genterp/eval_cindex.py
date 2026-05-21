@@ -682,6 +682,23 @@ def _compute_disease_risks(
     if B == 0:
         return torch.zeros((0, set_membership.shape[0]), dtype=torch.float32, device=device), diag
 
+    # The transformer can produce NaN h_last on eval inputs when training
+    # has destabilized the model (e.g., aux losses + window-policy shift
+    # blow up Adam moments → catastrophic weight updates → NaN forward).
+    # When that happens, the old code's nan_to_num inside the hazard
+    # pipeline gave the false impression of a working eval — it sanitized
+    # log_sigma/mu/log_w on the time side but propagated NaN through the
+    # mark side, where everything saturated at the lower clamp and produced
+    # a bit-identical-but-meaningless result. Detect NaN here, log how bad
+    # it is, and replace with zeros so downstream computations don't poison
+    # the rest of the batch. The C-index won't be useful in this regime
+    # but at least the eval surfaces "model is broken" rather than freezing
+    # at a deceptively stable number.
+    nan_h_frac = float(torch.isnan(h_last).float().mean().item())
+    diag["h_last_nan_frac"] = nan_h_frac
+    if nan_h_frac > 0.0:
+        h_last = torch.nan_to_num(h_last, nan=0.0, posinf=0.0, neginf=0.0)
+
     # All hazard arithmetic in fp64 — the bf16/fp32 underflow that fed the
     # original saturation trap doesn't happen here.
     h_last_d = h_last.double()
@@ -740,7 +757,14 @@ def _compute_disease_risks(
     mark_lp_f = tpp.mark_log_probs(h_expanded.float(), dt_expanded)
     # Index *before* the fp64 cast — the full mark logits over the whole
     # vocab (V≈42k) at fp64 is ~128MB per batch and we only need ~5k
-    # disease atoms. Index in fp32, then cast the small result.
+    # disease atoms. Index in fp32, then cast the small result. Sanitize
+    # NaN before the cast — the mark head can produce NaN if h_last had
+    # NaN before our entry-point clean (a few entries can slip through
+    # the float→nan_to_num replacement) or if mark_features overflows;
+    # either way, log-softmax of NaN propagates as NaN, then index→NaN,
+    # then log_lambda saturates to the floor with no model signal.
+    diag["mark_lp_nan_frac"] = float(torch.isnan(mark_lp_f).float().mean().item())
+    mark_lp_f = torch.nan_to_num(mark_lp_f, nan=-50.0, posinf=0.0, neginf=-50.0)
     log_mark_flat = mark_lp_f.index_select(-1, flat_atoms_t).view(B, G, -1).double()
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
@@ -776,8 +800,12 @@ def _compute_disease_risks(
     # weight-invariant — exactly the 0.4757 stuck-mean symptom.
     if diag["score_std"] < 1e-12 or diag["log_hazard_floor_frac"] > 0.5:
         landmark_dt = gap_to_landmark_days.clamp(min=1.0).float()
-        landmark_mark_lp = tpp.mark_log_probs(h_last.float(), landmark_dt).double()
-        landmark_mark_p = landmark_mark_lp.exp()
+        landmark_mark_lp = tpp.mark_log_probs(h_last.float(), landmark_dt)
+        # Same NaN guard as the primary path. Without this, a NaN h_last
+        # poisons the fallback too and produces zero-score everywhere
+        # (the C-index collapses to 0.5 across all diseases).
+        landmark_mark_lp = torch.nan_to_num(landmark_mark_lp, nan=-50.0, posinf=0.0, neginf=-50.0)
+        landmark_mark_p = landmark_mark_lp.exp().double()
         landmark_per_atom = landmark_mark_p.index_select(-1, flat_atoms_t)
         score_per_set = landmark_per_atom @ set_membership.t().double()
         score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1e8, neginf=0.0)
@@ -1059,6 +1087,8 @@ def _score_risks(
         f"[cindex-saturation] batches={len(diag_accum.get('B', []))} "
         f"subjects={total_subjects} fallback_batches={fallback_batches} "
         f"{sig_str} | "
+        f"h_last_nan_frac[{_summary('h_last_nan_frac')}] "
+        f"mark_lp_nan_frac[{_summary('mark_lp_nan_frac')}] "
         f"log_sigma_min[{_summary('log_sigma_min')}] log_sigma_max[{_summary('log_sigma_max')}] "
         f"|mu|_max[{_summary('mu_abs_max')}] "
         f"log_hazard[{_summary('log_hazard_min')}→{_summary('log_hazard_max')}] "
