@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import sys
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
@@ -33,6 +34,7 @@ from genterp.data import AtomVocab, CohortDataset, EventStore, collate
 from genterp.modeling import Genterp, GenterpConfig
 from genterp.progress import ProgressLogger, count_parameters
 from genterp.runtime import TorchRuntime, accelerator_label, configure_torch_runtime
+from genterp.vocab import validate_atom_registry
 
 
 _PROC = psutil.Process()
@@ -93,6 +95,7 @@ def _install_crash_diagnostics() -> None:
 RUNTIME_STATE_FILE = "genterp_runtime.json"
 FINAL_POINTER_FILE = "final_checkpoint.json"
 ANCESTORS_FILE = "ancestors.npz"
+ATOM_REGISTRY_FILE = "atom_registry.json"
 CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 # Model is undertrained at 50K (loss still dropping fast late in training);
 # Chinchilla-style scaling on this token budget argues for substantially
@@ -100,7 +103,13 @@ CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
 # stable phase stretches with longer runs and the decay phase still has
 # enough room to polish.
 MAX_STEPS = 200_000
-WARMUP_STEPS = 500
+# 1% warmup is the conservative default for pretraining-scale runs under
+# mixed precision: too short a warmup has been a recurring source of early-
+# step loss spikes (large residual branches × under-warmed Adam moments ×
+# narrow fp16 range). bf16 is more forgiving but the upside of extra warmup
+# is a tiny LR underrun at the start vs. the much larger downside if a
+# single spike wipes the run.
+WARMUP_STEPS = max(MAX_STEPS // 100, 500)
 WSD_DECAY_STEPS = MAX_STEPS // 10
 LOGGING_STEPS = 50
 EVAL_STEPS = 2_000
@@ -150,39 +159,63 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
     # dedup on disk and re-tie on load.
     _tied_weights_keys = {"model.tpp.mark_out.weight": "model.embed.embedding.weight"}
     all_tied_weights_keys = _tied_weights_keys
+    _vocab_axis_keys = {
+        "model.embed.embedding.weight",
+        "model.tpp.mark_out.weight",
+        "model.value_mod.value_mu",
+        "model.value_mod.value_sigma",
+        "model.value_mod.atom_has_mag",
+    }
 
     def __init__(self, config: GenterpHFConfig):
         super().__init__(config)
         self.model = Genterp(GenterpConfig(**config.genterp_cfg))
+        self._atom_id_remap: list[tuple[int, int]] | None = None
+        self._atom_id_remap_summary = ""
+
+    def configure_atom_registry_remap(
+        self,
+        checkpoint_registry: dict[str, int] | None,
+        current_registry: dict[str, int] | None,
+    ) -> None:
+        """Tell ``load_state_dict`` how to map vocab rows by canonical atom code."""
+        self._atom_id_remap = None
+        self._atom_id_remap_summary = ""
+        if checkpoint_registry is None or current_registry is None:
+            return
+        validate_atom_registry(checkpoint_registry)
+        validate_atom_registry(current_registry)
+        if checkpoint_registry == current_registry:
+            return
+        shared_codes = sorted(set(checkpoint_registry) & set(current_registry))
+        remap = [(0, 0)]
+        remap.extend((checkpoint_registry[code], current_registry[code]) for code in shared_codes)
+        self._atom_id_remap = remap
+        self._atom_id_remap_summary = (
+            f"shared_codes={len(shared_codes):,} "
+            f"ckpt_atoms={len(checkpoint_registry):,} current_atoms={len(current_registry):,}"
+        )
 
     def forward(self, **batch: torch.Tensor) -> transformers.modeling_outputs.CausalLMOutput:
         ld = self.model.loss(**batch)
         return transformers.modeling_outputs.CausalLMOutput(loss=ld["loss"], logits=ld["loss"].detach().reshape(1))
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Warm-load with partial-prefix copy along vocab axis.
+        """Warm-load vocab-shaped tensors by canonical atom code, never prefix order."""
+        ancestor_key = "model.embed.ancestor_ids"
+        if ancestor_key in state_dict:
+            ancestor_ids = state_dict[ancestor_key]
+            if (
+                torch.is_tensor(ancestor_ids)
+                and ancestor_ids.ndim == 2
+                and int(ancestor_ids.shape[0]) == self.model.embed.embedding.num_embeddings
+                and (
+                    ancestor_ids.numel() == 0
+                    or int(ancestor_ids.max().item()) < self.model.embed.ancestor_embedding.num_embeddings
+                )
+            ):
+                self.model.embed.set_ancestor_ids(ancestor_ids)
 
-        When the ETL vocab grows (e.g., death and demographics events added
-        → n_atoms jumps from 27k to 27.005k), the vocab-shaped params don't
-        match in shape. Naively dropping them destroys ALL trained
-        embeddings, not just the new atoms. Instead we detect axis-0-only
-        mismatches (vocab axis) and copy the overlapping prefix: existing
-        atoms keep their trained vectors, new atoms keep their fresh init.
-
-        Affected parameters:
-          - embed.embedding.weight       : (n_atoms, dim)
-          - embed.ancestor_embedding.weight : (n_ancestor_rows+1, dim)
-          - value_mod.value_mu / value_sigma / atom_has_mag : (n_atoms,)
-          - tpp.mark_out.weight (tied to embed.embedding.weight) — inherits
-            the partial-prefix copy via the tying.
-
-        Genuinely incompatible mismatches (different dim, different number
-        of attention heads, etc.) still drop and the new tensor keeps its
-        init — same as the prior behavior. HF Trainer's optimizer-state
-        load is gated separately by `reset_training_state_on_resume`, which
-        we set to True whenever any of these axis-0 shapes changed so the
-        Adam moments for the resized parameters are rebuilt cleanly.
-        """
         own = super().state_dict()
         actions: list[tuple[str, tuple[int, ...], tuple[int, ...], str]] = []
         filtered: dict[str, torch.Tensor] = {}
@@ -191,12 +224,27 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
                 filtered[k] = v
                 continue
             own_v = own[k]
+            if (
+                self._atom_id_remap is not None
+                and k in self._vocab_axis_keys
+                and v.ndim == own_v.ndim
+                and tuple(v.shape[1:]) == tuple(own_v.shape[1:])
+            ):
+                merged = own_v.detach().clone()
+                copied = 0
+                for old_id, new_id in self._atom_id_remap:
+                    if old_id < int(v.shape[0]) and new_id < int(own_v.shape[0]):
+                        merged[new_id] = v[old_id].to(dtype=own_v.dtype, device=own_v.device)
+                        copied += 1
+                filtered[k] = merged
+                actions.append((k, tuple(v.shape), tuple(own_v.shape), f"registry-remapped[rows={copied}]"))
+                continue
             if tuple(own_v.shape) == tuple(v.shape):
                 filtered[k] = v
                 continue
-            # Vocab-axis-only mismatch: same ndim, same shape[1:], differ only on axis 0.
             if (
-                v.ndim == own_v.ndim
+                k in self._vocab_axis_keys
+                and v.ndim == own_v.ndim
                 and tuple(v.shape[1:]) == tuple(own_v.shape[1:])
             ):
                 n = min(int(v.shape[0]), int(own_v.shape[0]))
@@ -204,6 +252,8 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
                 merged[:n] = v[:n].to(dtype=own_v.dtype, device=own_v.device)
                 filtered[k] = merged
                 actions.append((k, tuple(v.shape), tuple(own_v.shape), f"prefix-copied[:n={n}]"))
+            elif k in self._vocab_axis_keys:
+                actions.append((k, tuple(v.shape), tuple(own_v.shape), "dropped (no atom registry remap)"))
             else:
                 actions.append((k, tuple(v.shape), tuple(own_v.shape), "dropped (incompatible)"))
         if actions:
@@ -211,6 +261,8 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
             if len(actions) > 5:
                 preview += f", +{len(actions) - 5} more"
             print(f"[warm-start] handled {len(actions)} shape-mismatched param(s): {preview}")
+            if self._atom_id_remap_summary:
+                print(f"[warm-start] atom registry remap: {self._atom_id_remap_summary}")
         return super().load_state_dict(
             filtered,
             strict=False if actions else strict,
@@ -219,13 +271,16 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
 
 
 class RuntimeStateCallback(transformers.TrainerCallback):
-    def __init__(self, runtime: TorchRuntime):
+    def __init__(self, runtime: TorchRuntime, atom_registry: dict[str, int] | None = None):
         self.runtime = runtime
+        self.atom_registry = atom_registry
 
     def on_save(self, args, state, control, **kwargs):
         logger = ProgressLogger("trainer_save", total_units=1)
         logger.start_unit("write checkpoint runtime profile", f"checkpoint=checkpoint-{state.global_step}")
-        write_runtime_state(Path(args.output_dir) / f"checkpoint-{state.global_step}", self.runtime)
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        write_runtime_state(checkpoint_dir, self.runtime)
+        write_atom_registry_snapshot(checkpoint_dir, self.atom_registry)
         logger.finish_unit("write checkpoint runtime profile", f"global_step={state.global_step:,}")
         return control
 
@@ -244,32 +299,59 @@ class VerboseTrainerProgressCallback(transformers.TrainerCallback):
             "learning_rate",
             "grad_norm",
             "time_nll",
+            "time_modeled_nll",
             "mark_nll",
+            "sampled_mark_nll",
+            "exact_mark_nll",
+            "mark_z_loss",
+            "weighted_mark_z_loss",
             "value_nll",
+            "value_loss_weight",
             "value_nll_max",
             "value_z_abs_max",
             "value_z_clip_pct",
             "censor_nll",
+            "censor_loss_weight",
             "n_real",
+            "n_time",
             "n_censor",
             "n_mag",
+            "cum_n_real",
+            "cum_n_time",
+            "cum_n_censor",
+            "cum_n_mag",
+            "cum_n_subject",
+            "cum_transitions",
+            "effective_event_epochs",
+            "real_tokens_per_hour",
+            "transitions_per_hour",
             "real_per_subject",
+            "time_per_real",
             "censor_per_subject",
             "mag_per_real",
             "eval_runtime",
             "eval_samples_per_second",
             "eval_steps_per_second",
             "eval_time_nll",
+            "eval_time_modeled_nll",
             "eval_mark_nll",
+            "eval_sampled_mark_nll",
+            "eval_exact_mark_nll",
+            "eval_mark_z_loss",
+            "eval_weighted_mark_z_loss",
             "eval_value_nll",
+            "eval_value_loss_weight",
             "eval_value_nll_max",
             "eval_value_z_abs_max",
             "eval_value_z_clip_pct",
             "eval_censor_nll",
+            "eval_censor_loss_weight",
             "eval_n_real",
+            "eval_n_time",
             "eval_n_censor",
             "eval_n_mag",
             "eval_real_per_subject",
+            "eval_time_per_real",
             "eval_censor_per_subject",
             "eval_mag_per_real",
             "epoch",
@@ -375,6 +457,14 @@ class GenterpTrainer(transformers.Trainer):
         # full eval pass) reports the mean component NLL over its tokens.
         self._loss_accum_train: dict[str, list[torch.Tensor]] = {}
         self._loss_accum_eval: dict[str, list[torch.Tensor]] = {}
+        self._train_count_totals = {
+            "n_real": 0.0,
+            "n_time": 0.0,
+            "n_censor": 0.0,
+            "n_mag": 0.0,
+            "n_subject": 0.0,
+        }
+        self._token_clock_start = time.monotonic()
         # Lazy-imported cohort artifact for periodic C-index scoring; mixed into
         # eval metrics every `cindex_every_n_evals` calls to evaluation_loop so
         # the C-index curves end up in trainer_state.json alongside eval_loss.
@@ -398,13 +488,21 @@ class GenterpTrainer(transformers.Trainer):
         bucket = self._loss_accum_train if model.training else self._loss_accum_eval
         for key in (
             "time_nll",
+            "time_modeled_nll",
             "mark_nll",
+            "sampled_mark_nll",
+            "exact_mark_nll",
+            "mark_z_loss",
+            "weighted_mark_z_loss",
             "value_nll",
+            "value_loss_weight",
             "value_nll_max",
             "value_z_abs_max",
             "value_z_clipped",
             "censor_nll",
+            "censor_loss_weight",
             "n_real",
+            "n_time",
             "n_censor",
             "n_mag",
             "n_subject",
@@ -419,22 +517,56 @@ class GenterpTrainer(transformers.Trainer):
             return loss, outputs
         return loss
 
-    def _drain_loss_bucket(self, bucket: dict[str, list[torch.Tensor]], prefix: str = "") -> dict[str, float]:
+    def _drain_loss_bucket(
+        self,
+        bucket: dict[str, list[torch.Tensor]],
+        prefix: str = "",
+        *,
+        update_train_totals: bool = False,
+    ) -> dict[str, float]:
         out: dict[str, float] = {}
+        count_sums: dict[str, float] = {}
         for key, values in bucket.items():
             if not values:
                 continue
             stacked = torch.stack(values)
             reducer = torch.max if key.endswith("_max") else torch.mean
             out[f"{prefix}{key}"] = float(reducer(stacked).cpu().item())
+            if key in self._train_count_totals:
+                count_sums[key] = float(stacked.sum().cpu().item())
+        if update_train_totals:
+            for key, value in count_sums.items():
+                self._train_count_totals[key] += value
+            self._add_cumulative_token_metrics(out)
         self._add_derived_metrics(out, prefix)
         bucket.clear()
         return out
+
+    def _add_cumulative_token_metrics(self, logs: dict[str, float]) -> None:
+        elapsed_hours = max((time.monotonic() - self._token_clock_start) / 3600.0, 1e-9)
+        n_real = self._train_count_totals["n_real"]
+        n_time = self._train_count_totals["n_time"]
+        n_censor = self._train_count_totals["n_censor"]
+        n_mag = self._train_count_totals["n_mag"]
+        n_subject = self._train_count_totals["n_subject"]
+        transitions = n_real + n_censor
+        logs["cum_n_real"] = n_real
+        logs["cum_n_time"] = n_time
+        logs["cum_n_censor"] = n_censor
+        logs["cum_n_mag"] = n_mag
+        logs["cum_n_subject"] = n_subject
+        logs["cum_transitions"] = transitions
+        logs["real_tokens_per_hour"] = n_real / elapsed_hours
+        logs["transitions_per_hour"] = transitions / elapsed_hours
+        token_budget = getattr(self.train_dataset, "event_token_budget", None)
+        if token_budget:
+            logs["effective_event_epochs"] = n_real / float(token_budget)
 
     @staticmethod
     def _add_derived_metrics(logs: dict[str, float], prefix: str = "") -> None:
         n_subject = logs.get(f"{prefix}n_subject", 0.0)
         n_real = logs.get(f"{prefix}n_real", 0.0)
+        n_time = logs.get(f"{prefix}n_time", 0.0)
         n_censor = logs.get(f"{prefix}n_censor", 0.0)
         n_mag = logs.get(f"{prefix}n_mag", 0.0)
         n_clipped = logs.get(f"{prefix}value_z_clipped", 0.0)
@@ -443,6 +575,7 @@ class GenterpTrainer(transformers.Trainer):
             logs[f"{prefix}censor_per_subject"] = n_censor / n_subject
         if n_real > 0:
             logs[f"{prefix}mag_per_real"] = n_mag / n_real
+            logs[f"{prefix}time_per_real"] = n_time / n_real
         if n_mag > 0:
             logs[f"{prefix}value_z_clip_pct"] = 100.0 * n_clipped / n_mag
 
@@ -457,7 +590,7 @@ class GenterpTrainer(transformers.Trainer):
         if is_eval:
             logs.update(self._drain_loss_bucket(self._loss_accum_eval, prefix="eval_"))
         else:
-            logs.update(self._drain_loss_bucket(self._loss_accum_train))
+            logs.update(self._drain_loss_bucket(self._loss_accum_train, update_train_totals=True))
         return super().log(logs, *args, **kwargs)
 
     def _get_train_sampler(self, train_dataset=None) -> torch.utils.data.Sampler | None:
@@ -592,8 +725,22 @@ class GenterpTrainer(transformers.Trainer):
                 else None
             )
             device = self.runtime.device if self.runtime is not None else next(self.model.parameters()).device
+            # Use the actively-trained model from accelerator-wrapped reference,
+            # not self.model which can be a stale snapshot in some HF Trainer +
+            # accelerator configurations. The C-index eval was returning
+            # bit-identical results across thousands of training steps because
+            # self.model was a frozen reference disconnected from the param
+            # tensors actually being updated by optimizer.step.
+            wrapped = getattr(self, "model_wrapped", None)
+            if wrapped is not None and hasattr(self, "accelerator"):
+                try:
+                    live_model = self.accelerator.unwrap_model(wrapped)
+                except Exception:
+                    live_model = self.model
+            else:
+                live_model = self.model
             cindex_results = run_cindex(
-                self.model, self._cindex_cohort,
+                live_model, self._cindex_cohort,
                 device=device, autocast_dtype=autocast_dtype,
             )
             c_values: list[float] = []
@@ -777,6 +924,39 @@ def atomic_write_json(path: str | Path, data: dict[str, object]) -> None:
     tmp.replace(path)
 
 
+def load_atom_registry(path: str | Path) -> dict[str, int] | None:
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        registry = {str(code): int(atom) for code, atom in json.loads(path.read_text()).items()}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    validate_atom_registry(registry)
+    return registry
+
+
+def write_atom_registry_snapshot(path: str | Path, registry: dict[str, int] | None) -> None:
+    if registry is None:
+        return
+    validate_atom_registry(registry)
+    atomic_write_json(Path(path) / ATOM_REGISTRY_FILE, registry)
+
+
+def load_model_state_from_dir(model: GenterpForCausalLM, path: str | Path) -> None:
+    path = Path(path)
+    safetensors_path = path / "model.safetensors"
+    pytorch_path = path / "pytorch_model.bin"
+    if safetensors_path.is_file():
+        from safetensors.torch import load_file
+        state_dict = load_file(str(safetensors_path), device="cpu")
+    elif pytorch_path.is_file():
+        state_dict = torch.load(pytorch_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(f"no model weights found under {path}")
+    model.load_state_dict(state_dict, strict=False)
+
+
 def model_dir_is_complete(path: str | Path) -> bool:
     path = Path(path)
     return path.is_dir() and (path / "config.json").is_file() and (
@@ -795,7 +975,12 @@ def checkpoint_is_complete(path: str | Path) -> bool:
     )
 
 
-def save_final_model(trainer: transformers.Trainer, output_dir: str | Path, runtime: TorchRuntime) -> None:
+def save_final_model(
+    trainer: transformers.Trainer,
+    output_dir: str | Path,
+    runtime: TorchRuntime,
+    atom_registry: dict[str, int] | None = None,
+) -> None:
     logger = ProgressLogger("final_save", total_units=5)
     output_dir = Path(output_dir)
     final_name = f"final-{trainer.state.global_step}-{uuid.uuid4().hex[:12]}"
@@ -812,6 +997,7 @@ def save_final_model(trainer: transformers.Trainer, output_dir: str | Path, runt
 
     logger.start_unit("write runtime profile beside final model", f"tmp_dir={tmp_dir}")
     write_runtime_state(tmp_dir, runtime)
+    write_atom_registry_snapshot(tmp_dir, atom_registry)
     logger.finish_unit("write runtime profile beside final model", f"tmp_dir={tmp_dir}")
 
     logger.start_unit("publish final model directory atomically", f"from={tmp_dir} to={final_dir}")
@@ -845,6 +1031,28 @@ def _load_ancestors(path: Path) -> tuple[torch.Tensor, int] | None:
     ancestor_ids = torch.from_numpy(np.asarray(data["ancestor_ids"], dtype=np.int64))
     n_ancestor_rows = int(np.asarray(data["n_ancestor_rows"]).item())
     return ancestor_ids, n_ancestor_rows
+
+
+def ensure_loaded_ancestors(model: GenterpForCausalLM, etl_dir: Path) -> str:
+    """Ensure a hierarchical model has its per-atom ancestor lookup attached."""
+    embed = model.model.embed
+    if embed.has_ancestors() or model.model.cfg.n_ancestor_rows <= 0:
+        return "checkpoint"
+    path = etl_dir / ANCESTORS_FILE
+    loaded = _load_ancestors(path)
+    if loaded is None:
+        raise FileNotFoundError(
+            f"model config expects n_ancestor_rows={model.model.cfg.n_ancestor_rows}, "
+            f"but checkpoint has no ancestor_ids and {path} is missing"
+        )
+    ancestor_ids, n_ancestor_rows = loaded
+    if n_ancestor_rows != model.model.cfg.n_ancestor_rows:
+        raise ValueError(
+            f"{path} has n_ancestor_rows={n_ancestor_rows}, "
+            f"but model config expects {model.model.cfg.n_ancestor_rows}"
+        )
+    embed.set_ancestor_ids(ancestor_ids)
+    return str(path)
 
 
 def _load_value_stats(path: Path, vocab: AtomVocab) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -885,6 +1093,22 @@ def build_training_args(output_dir: str | Path, runtime: TorchRuntime) -> dict[s
         "per_device_train_batch_size": runtime.per_device_train_batch_size,
         "per_device_eval_batch_size": runtime.per_device_train_batch_size,
         "learning_rate": 3e-4,
+        # Pretraining-style optimizer hardening:
+        #   • adam_beta2 = 0.95 (vs HF default 0.999) — Adam's second-moment
+        #     EMA half-life at β₂ = 0.999 is ~700 steps, so noisy gradients
+        #     from sampled-softmax mark loss or rare-atom value tokens leak
+        #     into the variance estimate for hundreds of steps. β₂ = 0.95
+        #     halves in ~14 steps, recovering faster from outlier batches.
+        #   • weight_decay = 0.05 — AdamW-style decoupled decay at a
+        #     pretraining-typical magnitude; ties the unused mark-out bias-
+        #     free linear back to zero and keeps the residual stream's
+        #     RMSNorm scales from drifting unboundedly.
+        #   • max_grad_norm = 1.0 — explicit, since HF's default is 1.0 but
+        #     we want to make the contract visible.
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.95,
+        "weight_decay": 0.05,
+        "max_grad_norm": 1.0,
         "warmup_steps": WARMUP_STEPS,
         "max_steps": MAX_STEPS,
         "lr_scheduler_type": "warmup_stable_decay",
@@ -949,7 +1173,7 @@ def main(argv: list[str] | None = None) -> None:
     tiny = args.tiny
 
     _install_crash_diagnostics()
-    setup = ProgressLogger("train_setup", total_units=16)
+    setup = ProgressLogger("train_setup", total_units=17)
     setup.start_unit("configure torch runtime", "selecting accelerator, precision, optimizer, and dataloader settings")
     runtime = configure_torch_runtime()
     setup.finish_unit(
@@ -968,6 +1192,17 @@ def main(argv: list[str] | None = None) -> None:
     vocab = AtomVocab(dict(json.loads((etl / "vocab.json").read_text())))
     setup.finish_unit("load vocabulary", f"atoms={len(vocab):,} mapped_codes={len(vocab.code_to_atom):,}")
 
+    setup.start_unit("load atom registry", f"path={etl / ATOM_REGISTRY_FILE}")
+    current_atom_registry = load_atom_registry(etl / ATOM_REGISTRY_FILE)
+    if current_atom_registry is None:
+        raise FileNotFoundError(
+            f"{etl / ATOM_REGISTRY_FILE} is required; rerun scripts/aou_etl.py to build stable atom ids"
+        )
+    setup.finish_unit(
+        "load atom registry",
+        f"registry_atoms={len(current_atom_registry):,} max_id={max(current_atom_registry.values(), default=0):,}",
+    )
+
     setup.start_unit(
         "load events parquet (shared)",
         "single decompressed copy reused by train + eval — prevents the ~20GB×2 OOM",
@@ -978,14 +1213,20 @@ def main(argv: list[str] | None = None) -> None:
         f"rows={event_store.num_rows:,} chunks={event_store.num_chunks} {_rss_str()}",
     )
 
-    setup.start_unit("build training dataset", "split=train; events shared from event_store")
-    train_dataset = CohortDataset(etl, split="train", events=event_store)
+    setup.start_unit("build training dataset", "split=train; random windows over long histories")
+    train_dataset = CohortDataset(
+        etl,
+        split="train",
+        events=event_store,
+        window_policy="random",
+        last_window_fraction=0.1,
+    )
     setup.finish_unit("build training dataset", f"subjects={len(train_dataset):,} {_rss_str()}")
 
-    setup.start_unit("build evaluation dataset", "split=test; events shared from event_store")
-    eval_full = CohortDataset(etl, split="test", events=event_store)
+    setup.start_unit("build evaluation dataset", "split=validation; deterministic last windows")
+    eval_full = CohortDataset(etl, split="validation", events=event_store, window_policy="last")
     # Each in-loop eval pass scores a deterministic random subsample of the
-    # held-out test cohort. Random (not longest-first) so the slice is
+    # held-out validation cohort. Random (not longest-first) so the slice is
     # representative — longest-first biased the eval toward heavy utilizers
     # whose compressed risk profile suppressed measurable C-index.
     if len(eval_full) > EVAL_SUBSAMPLE_SIZE:
@@ -1026,9 +1267,20 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("inspect checkpoints", f"output_dir={output_dir}")
     resume_checkpoint = latest_checkpoint(output_dir)
+    warm_start_path = final_model_path(output_dir) if resume_checkpoint is None else None
+    source_checkpoint_for_registry = resume_checkpoint or warm_start_path
+    checkpoint_atom_registry = (
+        load_atom_registry(Path(source_checkpoint_for_registry) / ATOM_REGISTRY_FILE)
+        if source_checkpoint_for_registry is not None else None
+    )
     hardware_changed = resume_checkpoint is not None and not checkpoint_matches_runtime(resume_checkpoint, runtime)
     ckpt_n_atoms = checkpoint_n_atoms(resume_checkpoint) if resume_checkpoint else None
     vocab_changed = ckpt_n_atoms is not None and ckpt_n_atoms != cfg.n_atoms
+    registry_changed = bool(
+        source_checkpoint_for_registry is not None
+        and checkpoint_atom_registry is not None
+        and checkpoint_atom_registry != current_atom_registry
+    )
     # Detect model-graph or shape change for ancestor_embedding. Three cases:
     #   ABSENT       : pre-hierarchical checkpoint. The current model has the
     #                  ancestor_embedding parameter; the saved optimizer state
@@ -1055,35 +1307,45 @@ def main(argv: list[str] | None = None) -> None:
     # moments are per-parameter and per-shape). Force a state reset so we
     # rebuild fresh moments around the partially-loaded weights.
     reset_training_state = bool(
-        resume_checkpoint and (hardware_changed or vocab_changed or ancestors_changed)
+        resume_checkpoint and (hardware_changed or vocab_changed or registry_changed or ancestors_changed)
     )
-    warm_start_path = final_model_path(output_dir) if resume_checkpoint is None else None
     setup.finish_unit(
         "inspect checkpoints",
         f"resume_checkpoint={resume_checkpoint} warm_start_path={warm_start_path} "
         f"reset_training_state={reset_training_state} hardware_changed={hardware_changed} "
         f"vocab_changed={vocab_changed} (ckpt_n_atoms={ckpt_n_atoms} cur_n_atoms={cfg.n_atoms}) "
+        f"registry_changed={registry_changed} "
         f"ancestors_changed={ancestors_changed} (ckpt_anc_rows={ckpt_ancestor_rows} cur_anc_rows={target_ancestor_rows})",
     )
 
     setup.start_unit("load or initialize model", "preferring resume checkpoint, then previous final model, then fresh init")
+    model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))
+    model.configure_atom_registry_remap(checkpoint_atom_registry, current_atom_registry)
     if warm_start_path is not None:
-        # ignore_mismatched_sizes lets transformers fall through vocab-shaped
-        # tensors (embedding / mark_out / value_mod buffers) that don't match;
-        # they keep their fresh init while everything else loads.
-        model = GenterpForCausalLM.from_pretrained(warm_start_path, ignore_mismatched_sizes=True)
+        load_model_state_from_dir(model, warm_start_path)
         model_source = f"warm_start={warm_start_path}"
     else:
-        model = GenterpForCausalLM(GenterpHFConfig(genterp_cfg=asdict(cfg)))
         model_source = "fresh_init" if resume_checkpoint is None else f"resume_weights_from={resume_checkpoint}"
     if reset_training_state:
-        reason = "hardware profile changed" if hardware_changed else f"vocab changed ({ckpt_n_atoms} → {cfg.n_atoms} atoms)"
+        if hardware_changed:
+            reason = "hardware profile changed"
+        elif registry_changed:
+            reason = "atom registry changed"
+        elif ancestors_changed:
+            reason = "ancestor table shape changed"
+        else:
+            reason = f"vocab changed ({ckpt_n_atoms} -> {cfg.n_atoms} atoms)"
         print(f"genterp train {reason}; resuming model weights (partial) and rebuilding optimizer state")
     setup.finish_unit("load or initialize model", f"{model_source} params={count_parameters(model):,}")
 
     setup.start_unit("configure mark negative sampler", "frequency-weighted atom negatives from training events")
-    model.model.tpp.set_mark_noise_distribution(torch.from_numpy(train_dataset.atom_counts(model.model.cfg.n_atoms)))
-    setup.finish_unit("configure mark negative sampler", f"negatives={model.model.cfg.sampled_mark_negatives:,}")
+    train_atom_counts = train_dataset.atom_counts(model.model.cfg.n_atoms)
+    model.model.tpp.set_mark_noise_distribution(torch.from_numpy(train_atom_counts))
+    setup.finish_unit(
+        "configure mark negative sampler",
+        f"negatives={model.model.cfg.sampled_mark_negatives:,} "
+        f"train_event_token_budget={int(train_atom_counts.sum()):,}",
+    )
 
     setup.start_unit("load value modulation stats", f"path={etl / 'value_stats.json'}")
     mu, sigma, has_mag = _load_value_stats(etl / "value_stats.json", vocab)
@@ -1149,6 +1411,7 @@ def main(argv: list[str] | None = None) -> None:
             pin_memory=runtime.dataloader_pin_memory,
             phenotypes=sweep_phenotypes,
             max_subjects=CINDEX_MAX_SUBJECTS_IN_LOOP,
+            split="validation",
         )
         setup.finish_unit(
             "prepare C-index cohort",
@@ -1172,7 +1435,7 @@ def main(argv: list[str] | None = None) -> None:
         reset_training_state_on_resume=reset_training_state,
         cindex_cohort=cindex_cohort,
         cindex_every_n_evals=1,
-        callbacks=[RuntimeStateCallback(runtime), VerboseTrainerProgressCallback()],
+        callbacks=[RuntimeStateCallback(runtime, current_atom_registry), VerboseTrainerProgressCallback()],
     )
     setup.finish_unit("instantiate Trainer", "trainer ready")
 
@@ -1181,7 +1444,7 @@ def main(argv: list[str] | None = None) -> None:
     setup.finish_unit("run training loop", f"global_step={trainer.state.global_step:,}")
 
     setup.start_unit("save final model", f"output_dir={output_dir}")
-    save_final_model(trainer, output_dir, runtime)
+    save_final_model(trainer, output_dir, runtime, current_atom_registry)
     setup.finish_unit("save final model", f"global_step={trainer.state.global_step:,}")
 
 
