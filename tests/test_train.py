@@ -7,6 +7,7 @@ import torch
 import transformers
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
+from genterp.data import AtomVocab
 from genterp.runtime import TorchRuntime
 from genterp.train import (
     EVAL_STEPS,
@@ -24,7 +25,9 @@ from genterp.train import (
     checkpoint_runtime_state,
     final_model_path,
     gradient_checkpointing_enabled,
+    infer_atom_registry_from_vocab,
     latest_checkpoint,
+    load_model_state_from_dir,
     model_dir_is_complete,
     save_final_model,
     write_runtime_state,
@@ -155,6 +158,14 @@ def test_runtime_state_detects_hardware_profile_change(tmp_path: Path):
     assert not checkpoint_matches_runtime(tmp_path, _runtime(bf16=False, fp16=False, optim="adamw_torch"))
 
 
+def test_legacy_vocab_infers_atom_registry_for_resume():
+    vocab = AtomVocab({"A": 2, "B": 2, "C": 1, "missing": 0})
+
+    registry = infer_atom_registry_from_vocab(vocab)
+
+    assert registry == {"C": 1, "A": 2}
+
+
 def test_training_args_use_wsd_and_cuda_gradient_checkpointing(tmp_path: Path):
     runtime = _runtime()
     args = build_training_args(tmp_path, runtime)
@@ -212,7 +223,12 @@ def test_trainer_skips_incompatible_optimizer_and_scaler_state(tmp_path: Path, m
     trainer._load_scaler(str(tmp_path))
 
 
-def _tiny_genterp_model(n_atoms: int, *, n_ancestor_rows: int = 0) -> GenterpForCausalLM:
+def _tiny_genterp_model(
+    n_atoms: int,
+    *,
+    n_ancestor_rows: int = 0,
+    n_ancestor_cols: int = 0,
+) -> GenterpForCausalLM:
     cfg_dict = {
         "n_atoms": n_atoms,
         "dim": 16,
@@ -223,6 +239,7 @@ def _tiny_genterp_model(n_atoms: int, *, n_ancestor_rows: int = 0) -> GenterpFor
         "n_time_mix": 2,
         "time_phi_dim": 4,
         "n_ancestor_rows": n_ancestor_rows,
+        "n_ancestor_cols": n_ancestor_cols,
     }
     return GenterpForCausalLM(GenterpHFConfig(genterp_cfg=cfg_dict))
 
@@ -311,6 +328,27 @@ def test_ancestor_ids_persist_and_load_with_checkpoint_state():
     assert torch.equal(loaded.model.embed.ancestor_ids.cpu(), ancestor_ids)
 
 
+def test_missing_ancestor_ids_keeps_current_table_for_old_checkpoints():
+    model = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 1] = 3
+    model.model.embed.set_ancestor_ids(ancestor_ids)
+
+    old_state = {
+        key: value
+        for key, value in model.state_dict().items()
+        if key != "model.embed.ancestor_ids"
+    }
+    loaded = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3, n_ancestor_cols=2)
+    loaded.model.embed.set_ancestor_ids(ancestor_ids)
+
+    result = loaded.load_state_dict(old_state, strict=True)
+
+    assert result.missing_keys == []
+    assert torch.equal(loaded.model.embed.ancestor_ids.cpu(), ancestor_ids)
+
+
 def test_ancestor_ids_round_trip_through_save_pretrained(tmp_path: Path):
     model = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
     ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
@@ -324,6 +362,45 @@ def test_ancestor_ids_round_trip_through_save_pretrained(tmp_path: Path):
     assert loaded.config.genterp_cfg["n_ancestor_cols"] == 2
     assert loaded.model.embed.has_ancestors()
     assert torch.equal(loaded.model.embed.ancestor_ids.cpu(), ancestor_ids)
+
+
+def test_old_checkpoint_without_ancestor_ids_loads_into_current_hierarchy():
+    old = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    old_state = old.state_dict()
+    old_state.pop("model.embed.ancestor_ids")
+
+    current = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3, n_ancestor_cols=2)
+    ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 1] = 3
+    current.model.embed.set_ancestor_ids(ancestor_ids)
+
+    result = current.load_state_dict(old_state, strict=True)
+
+    assert result.missing_keys == []
+    assert current.model.embed.has_ancestors()
+    assert torch.equal(current.model.embed.ancestor_ids.cpu(), ancestor_ids)
+
+
+def test_warm_start_final_without_ancestor_ids_keeps_current_hierarchy(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    old = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    old_state = {k: v.detach().clone() for k, v in old.state_dict().items()}
+    old_state.pop("model.embed.ancestor_ids")
+    old_state = {key: value.detach().clone() for key, value in old_state.items()}
+    save_file(old_state, str(tmp_path / "model.safetensors"))
+
+    current = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3, n_ancestor_cols=2)
+    ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 1] = 3
+    current.model.embed.set_ancestor_ids(ancestor_ids)
+
+    load_model_state_from_dir(current, tmp_path)
+
+    assert current.model.embed.has_ancestors()
+    assert torch.equal(current.model.embed.ancestor_ids.cpu(), ancestor_ids)
 
 
 def test_checkpoint_n_atoms_reads_config(tmp_path: Path):

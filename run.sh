@@ -66,7 +66,7 @@ else
 fi
 finish_run_unit "report git checkout"
 
-# Loud confirmation of what the running source actually is, post-reset. If the
+# Loud confirmation of what the running source actually is. If the
 # "VERSION_TAG" line from aou_etl.main() ever shows a different commit/sha
 # than what's printed here, the workspace is running stale code.
 HEAD_NOW="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"

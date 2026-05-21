@@ -1195,6 +1195,26 @@ def marked_tpp_value_loss(
         n_bag_predictors = hidden.new_tensor(0, dtype=torch.long)
     weighted_bag_nll = float(bag_loss_weight) * bag_nll
 
+    # Emit per-subject loss + token counts during eval so the trainer can
+    # stratify metrics by group (sex, age band, etc.) without a second
+    # forward pass. Computed always (cheap: scatter_add over per-token NLLs)
+    # but only logged when ``model.training`` is False.
+    B = real_mask.shape[0]
+    device = hidden.device
+    b_grid_global = torch.arange(B, device=device).unsqueeze(1).expand_as(real_mask)
+    b_idx_real_time_global = b_grid_global[any_mask][real_any]
+    b_idx_mark_global = b_grid_global[real_mask]
+    per_subject_time_sum = hidden.new_zeros(B, dtype=torch.float32).scatter_add_(
+        0,
+        b_idx_real_time_global,
+        (-real_time_lp).detach().float(),
+    )
+    per_subject_real_count = hidden.new_zeros(B, dtype=torch.float32).scatter_add_(
+        0,
+        b_idx_mark_global,
+        torch.ones(mark_target.numel(), device=device, dtype=torch.float32),
+    )
+
     if per_subject_norm:
         # Subject-weighted total: avoid event-weighted aggregation that lets
         # heavy utilizers (4096-event windows) dominate the gradient. For each
@@ -1286,4 +1306,6 @@ def marked_tpp_value_loss(
         "weighted_bag_nll": weighted_bag_nll,
         "n_bag_predictors": n_bag_predictors,
         "n_subject": hidden.new_tensor(hidden.shape[0]),
+        "per_subject_time_sum": per_subject_time_sum,
+        "per_subject_real_count": per_subject_real_count,
     }

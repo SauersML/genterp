@@ -111,6 +111,17 @@ def test_bag_loss_opt_in_does_not_change_baseline_total():
     assert int(with_groups["n_bag_predictors"].item()) == 0
 
 
+def test_bag_loss_adds_no_parameters():
+    base = Genterp(GenterpConfig(n_atoms=16, dim=16, n_heads=2, n_layers=1))
+    bag = Genterp(GenterpConfig(n_atoms=16, dim=16, n_heads=2, n_layers=1, bag_loss_weight=0.5))
+
+    base_state = base.state_dict()
+    bag_state = bag.state_dict()
+
+    assert base_state.keys() == bag_state.keys()
+    assert {k: tuple(v.shape) for k, v in base_state.items()} == {k: tuple(v.shape) for k, v in bag_state.items()}
+
+
 def test_bag_loss_engages_when_weight_positive():
     cfg = GenterpConfig(
         n_atoms=128,

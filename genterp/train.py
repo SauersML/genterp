@@ -95,6 +95,37 @@ FINAL_POINTER_FILE = "final_checkpoint.json"
 ANCESTORS_FILE = "ancestors.npz"
 ATOM_REGISTRY_FILE = "atom_registry.json"
 CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)$")
+
+
+def _peek_ancestor_ids_cols(ckpt_dir: Path) -> int:
+    """Return the ``max_anc`` width of the saved ``ancestor_ids`` buffer, or 0.
+
+    Used by ``GenterpForCausalLM.from_pretrained`` to backfill the
+    ``n_ancestor_cols`` config field on pre-field checkpoints. Reads only the
+    safetensors metadata so the cost is a single short open, not a full load.
+    Returns 0 when the buffer is absent or the file is missing/unreadable —
+    callers then fall back to whatever the config carries.
+    """
+    safetensors_path = ckpt_dir / "model.safetensors"
+    if safetensors_path.is_file():
+        try:
+            from safetensors import safe_open
+            with safe_open(str(safetensors_path), framework="pt") as f:
+                if "model.embed.ancestor_ids" in f.keys():
+                    shape = f.get_slice("model.embed.ancestor_ids").get_shape()
+                    return int(shape[1]) if len(shape) >= 2 else 0
+        except Exception:
+            return 0
+    bin_path = ckpt_dir / "pytorch_model.bin"
+    if bin_path.is_file():
+        try:
+            state = torch.load(bin_path, map_location="cpu")
+            ids = state.get("model.embed.ancestor_ids")
+            if ids is not None and ids.ndim == 2:
+                return int(ids.shape[1])
+        except Exception:
+            return 0
+    return 0
 # Model is undertrained at 50K (loss still dropping fast late in training);
 # Chinchilla-style scaling on this token budget argues for substantially
 # more steps. The WSD scheduler's decay tail is set to 10% of total so the
@@ -171,6 +202,33 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         "model.value_mod.atom_has_mag",
     }
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        """Backfill ``n_ancestor_cols`` from the saved ``ancestor_ids`` buffer.
+
+        Checkpoints written before the ``n_ancestor_cols`` field existed have
+        ``ancestor_ids`` saved at width ``W > 0`` but no record of W in
+        ``config.json``. Loading them naively constructs the model with width
+        0, so HF's pre-load shape check rejects the mismatch. Peek at the
+        on-disk shape and patch the config before construction. New
+        checkpoints (config carries ``n_ancestor_cols``) skip this branch.
+        """
+        if kwargs.get("config") is None:
+            config, _ = cls.config_class.from_pretrained(
+                pretrained_model_name_or_path,
+                return_unused_kwargs=True,
+            )
+            kwargs["config"] = config
+        else:
+            config = kwargs["config"]
+        cfg_dict = dict(getattr(config, "genterp_cfg", {}) or {})
+        if cfg_dict.get("n_ancestor_cols", 0) == 0:
+            saved_cols = _peek_ancestor_ids_cols(Path(pretrained_model_name_or_path))
+            if saved_cols > 0:
+                cfg_dict["n_ancestor_cols"] = saved_cols
+                config.genterp_cfg = cfg_dict
+        return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
     def __init__(self, config: GenterpHFConfig):
         super().__init__(config)
         self.model = Genterp(GenterpConfig(**config.genterp_cfg))
@@ -231,6 +289,8 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
         own = super().state_dict()
         actions: list[tuple[str, tuple[int, ...], tuple[int, ...], str]] = []
         filtered: dict[str, torch.Tensor] = {}
+        if ancestor_key not in state_dict and ancestor_key in own:
+            filtered[ancestor_key] = own[ancestor_key]
         for k, v in state_dict.items():
             if k not in own:
                 filtered[k] = v
@@ -271,6 +331,8 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
                 actions.append((k, tuple(v.shape), tuple(own_v.shape), "dropped (no atom registry remap)"))
             else:
                 actions.append((k, tuple(v.shape), tuple(own_v.shape), "dropped (incompatible)"))
+        if ancestor_key not in state_dict and ancestor_key in own:
+            filtered[ancestor_key] = own[ancestor_key].detach().clone()
         if actions:
             preview = ", ".join(f"{k} ckpt{c}→cur{o} [{a}]" for k, c, o, a in actions[:5])
             if len(actions) > 5:
@@ -445,6 +507,10 @@ class GenterpTrainer(transformers.Trainer):
         # full eval pass) reports the mean component NLL over its tokens.
         self._loss_accum_train: dict[str, list[torch.Tensor]] = {}
         self._loss_accum_eval: dict[str, list[torch.Tensor]] = {}
+        # Group-stratified eval: per-batch we stash (group_key -> (loss_sum,
+        # subject_count)) so worst-group eval loss can be reported alongside
+        # the global mean. Pure measurement; the loss itself is unaffected.
+        self._group_eval_accum: dict[str, tuple[float, float]] = {}
         # Lazy-imported cohort artifact for periodic C-index scoring; mixed into
         # eval metrics every `cindex_every_n_evals` calls to evaluation_loop so
         # the C-index curves end up in trainer_state.json alongside eval_loss.
@@ -465,6 +531,8 @@ class GenterpTrainer(transformers.Trainer):
         """
         inner = model.model if hasattr(model, "model") else model
         ld = inner.loss(**inputs)
+        if not model.training:
+            self._record_group_stratified(inputs, ld)
         bucket = self._loss_accum_train if model.training else self._loss_accum_eval
         for key in (
             "time_nll",
@@ -488,6 +556,92 @@ class GenterpTrainer(transformers.Trainer):
             outputs = transformers.modeling_outputs.CausalLMOutput(loss=loss, logits=loss.detach().reshape(1))
             return loss, outputs
         return loss
+
+    @staticmethod
+    def _age_band(age_days: float) -> str:
+        years = age_days / 365.25
+        if years < 18.0:
+            return "age_<18"
+        if years < 40.0:
+            return "age_18_40"
+        if years < 65.0:
+            return "age_40_65"
+        if years < 80.0:
+            return "age_65_80"
+        return "age_80+"
+
+    @staticmethod
+    def _utilization_decile(n_events: int) -> str:
+        # Per-window event count, log-spaced bins. Matches how heavy utilizers
+        # accumulate in a 4096-cap window: clinically meaningful boundaries
+        # without depending on a calibrated decile table at eval time.
+        if n_events <= 64:
+            return "util_p0_64"
+        if n_events <= 256:
+            return "util_p64_256"
+        if n_events <= 1024:
+            return "util_p256_1024"
+        if n_events <= 3000:
+            return "util_p1024_3000"
+        return "util_p3000+"
+
+    def _record_group_stratified(self, inputs: Mapping[str, torch.Tensor], ld: Mapping[str, torch.Tensor]) -> None:
+        """Bucket per-subject losses by sex / age band / utilization decile."""
+        per_subject_sum = ld.get("per_subject_time_sum")
+        per_subject_count = ld.get("per_subject_real_count")
+        if per_subject_sum is None or per_subject_count is None:
+            return
+        sums = per_subject_sum.detach().float().cpu()
+        counts = per_subject_count.detach().float().cpu()
+        sex = inputs.get("sex")
+        sex_arr = sex.detach().cpu().tolist() if sex is not None else [-1] * sums.numel()
+        length = inputs.get("length")
+        length_arr = length.detach().cpu().tolist() if length is not None else [int(counts[i].item()) for i in range(sums.numel())]
+        landmark = inputs.get("landmark_age")
+        if landmark is not None:
+            landmark_arr = landmark.detach().cpu().tolist()
+        else:
+            event_ages = inputs.get("event_ages")
+            event_pad = inputs.get("event_pad")
+            if event_ages is not None and event_pad is not None:
+                last_age = []
+                for i in range(sums.numel()):
+                    real_idx = (~event_pad[i]).nonzero(as_tuple=False)
+                    last_age.append(float(event_ages[i, int(real_idx[-1].item())].item()) if real_idx.numel() else 0.0)
+                landmark_arr = last_age
+            else:
+                landmark_arr = [0.0] * sums.numel()
+        for i in range(sums.numel()):
+            if counts[i].item() <= 0:
+                continue
+            mean_loss = float((sums[i] / counts[i]).item())
+            for group_key in (
+                "sex_male" if int(sex_arr[i]) == 1 else "sex_female" if int(sex_arr[i]) == 0 else "sex_unknown",
+                self._age_band(float(landmark_arr[i])),
+                self._utilization_decile(int(length_arr[i])),
+            ):
+                acc = self._group_eval_accum.setdefault(group_key, (0.0, 0.0))
+                self._group_eval_accum[group_key] = (acc[0] + mean_loss, acc[1] + 1.0)
+
+    def _drain_group_eval(self, prefix: str = "eval_") -> dict[str, float]:
+        out: dict[str, float] = {}
+        if not self._group_eval_accum:
+            return out
+        worst_value = float("-inf")
+        worst_key = ""
+        for group_key, (loss_sum, n) in self._group_eval_accum.items():
+            if n <= 0:
+                continue
+            mean = loss_sum / n
+            out[f"{prefix}group_{group_key}_time_nll"] = mean
+            out[f"{prefix}group_{group_key}_n"] = n
+            if mean > worst_value:
+                worst_value = mean
+                worst_key = group_key
+        if worst_key:
+            out[f"{prefix}worst_group_time_nll"] = worst_value
+        self._group_eval_accum.clear()
+        return out
 
     def _drain_loss_bucket(self, bucket: dict[str, list[torch.Tensor]], prefix: str = "") -> dict[str, float]:
         out: dict[str, float] = {}
@@ -526,6 +680,7 @@ class GenterpTrainer(transformers.Trainer):
         is_eval = any(k.startswith("eval_") for k in logs)
         if is_eval:
             logs.update(self._drain_loss_bucket(self._loss_accum_eval, prefix="eval_"))
+            logs.update(self._drain_group_eval(prefix="eval_"))
         else:
             logs.update(self._drain_loss_bucket(self._loss_accum_train))
         return super().log(logs, *args, **kwargs)
@@ -873,6 +1028,26 @@ def load_atom_registry(path: str | Path) -> dict[str, int] | None:
     return registry
 
 
+def infer_atom_registry_from_vocab(vocab: AtomVocab) -> dict[str, int]:
+    """Best-effort registry for legacy ETL outputs that only have vocab.json.
+
+    Old ETL artifacts persisted ``code -> atom_id`` but not the canonical
+    target code. For same-shape legacy resumes, this is enough: model tensors
+    load normally by exact shape and no registry remap is needed. We still
+    synthesize one representative code per atom so newly saved checkpoints
+    carry an atom_registry.json from this point forward.
+    """
+    by_atom: dict[int, list[str]] = {}
+    for code, atom_id in vocab.code_to_atom.items():
+        atom = int(atom_id)
+        if atom <= 0:
+            continue
+        by_atom.setdefault(atom, []).append(str(code))
+    registry = {sorted(codes)[0]: atom for atom, codes in by_atom.items()}
+    validate_atom_registry(registry)
+    return registry
+
+
 def write_atom_registry_snapshot(path: str | Path, registry: dict[str, int] | None) -> None:
     if registry is None:
         return
@@ -1133,14 +1308,14 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("load atom registry", f"path={etl / ATOM_REGISTRY_FILE}")
     current_atom_registry = load_atom_registry(etl / ATOM_REGISTRY_FILE)
+    registry_source = str(etl / ATOM_REGISTRY_FILE)
     if current_atom_registry is None:
-        raise FileNotFoundError(
-            f"{etl / ATOM_REGISTRY_FILE} is required; rerun scripts/aou_etl.py to build stable atom ids"
-        )
+        current_atom_registry = infer_atom_registry_from_vocab(vocab)
+        registry_source = "legacy vocab.json inference"
     n_atoms = max(current_atom_registry.values(), default=0) + 1
     setup.finish_unit(
         "load atom registry",
-        f"registry_atoms={len(current_atom_registry):,} max_id={n_atoms - 1:,}",
+        f"registry_atoms={len(current_atom_registry):,} max_id={n_atoms - 1:,} source={registry_source}",
     )
 
     setup.start_unit(

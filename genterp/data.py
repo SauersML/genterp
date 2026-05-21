@@ -30,6 +30,7 @@ WindowPolicy = Literal["last", "random", "mixed"]
 
 # Role enum mirrors ``scripts/aou_etl.py``. Kept in sync by hand because
 # importing the ETL script at training time would drag BigQuery deps in.
+ROLE_UNKNOWN = 255  # sentinel for events.parquet predating the role column
 ROLE_DEMOGRAPHIC_RACE = 10
 ROLE_DEMOGRAPHIC_ETHNICITY = 11
 STATIC_ROLES = frozenset({ROLE_DEMOGRAPHIC_RACE, ROLE_DEMOGRAPHIC_ETHNICITY})
@@ -213,17 +214,30 @@ class EventStore:
         value_table = pf.read(columns=["value"])
         value = value_table.column("value").cast(pa.float32())
         del value_table
-        role_table = pf.read(columns=["role"])
-        role_wide = role_table.column("role")
-        _assert_arrow_integer_range(
-            role_wide,
-            name="role",
-            min_value=0,
-            max_value=np.iinfo(np.uint8).max,
-        )
-        role = role_wide.cast(pa.uint8())
-        del role_wide
-        del role_table
+        # role column is optional. Older events.parquet files (built before
+        # the role enum landed in scripts/aou_etl.py) don't have it. When
+        # absent we synthesize a sentinel ROLE_UNKNOWN array and the
+        # downstream static/event split falls back to the delta_days
+        # heuristic. This preserves warm-start: no ETL re-pull needed when
+        # only the role column was added.
+        schema_field_names = set(pf.schema_arrow.names)
+        if "role" in schema_field_names:
+            role_table = pf.read(columns=["role"])
+            role_wide = role_table.column("role")
+            _assert_arrow_integer_range(
+                role_wide,
+                name="role",
+                min_value=0,
+                max_value=np.iinfo(np.uint8).max,
+            )
+            role = role_wide.cast(pa.uint8())
+            del role_wide
+            del role_table
+        else:
+            n_rows_pre = int(atom.length())
+            role_np = np.full(n_rows_pre, ROLE_UNKNOWN, dtype=np.uint8)
+            role = pa.chunked_array([pa.array(role_np, type=pa.uint8())])
+            del role_np
         n_rows = int(atom.length())
         logger.finish_unit("read events parquet (shared)", f"rows={n_rows:,}")
         logger.start_unit(
@@ -258,6 +272,7 @@ class CohortDataset(Dataset):
         max_windows_per_subject: int = 1,
         same_time_shuffle: bool = False,
         event_drop_prob: float = 0.0,
+        temporal_ood: bool | None = None,
     ):
         if window_policy not in ("last", "random", "mixed"):
             raise ValueError("window_policy must be 'last', 'random', or 'mixed'")
@@ -290,7 +305,41 @@ class CohortDataset(Dataset):
                 )
             subjects = subjects.filter(pl.col("split") == split)
             if subjects.height == 0:
-                raise ValueError(f"no subjects in split={split!r}")
+                # Legacy subjects.parquet from the pre-validation-split era only
+                # has 'train'/'test' labels. Resuming a previous run against an
+                # older ETL output would crash here when asked for split=
+                # 'validation'. Fall back to re-deriving splits from subject_id
+                # using the current split_for_subject() rule. The deterministic
+                # hash means subjects keep their old train/test buckets — the
+                # validation bucket is carved out of the old train pool only.
+                from scripts.aou_etl import split_for_subject as _split_for_subject  # noqa: PLC0415
+                full_subjects = pl.read_parquet(data_dir / "subjects.parquet").sort("subject_id")
+                derived = (
+                    full_subjects
+                    .with_columns(
+                        pl.col("subject_id").map_elements(_split_for_subject, return_dtype=pl.Utf8).alias("_derived_split")
+                    )
+                    .filter(pl.col("_derived_split") == split)
+                    .drop("_derived_split")
+                )
+                if derived.height == 0:
+                    raise ValueError(f"no subjects in split={split!r}")
+                subjects = derived
+                logger.log(
+                    "fallback: derived split from subject_id (legacy subjects.parquet)",
+                    f"derived_subjects={subjects.height:,}",
+                )
+        if temporal_ood is not None:
+            if "temporal_ood" not in subjects.columns:
+                # Legacy subjects.parquet without the OOD flag: cannot honor
+                # a temporal_ood filter. Surface the gap explicitly rather
+                # than silently returning the wrong cohort.
+                raise ValueError(
+                    "subjects.parquet has no 'temporal_ood' column; rerun aou_etl to materialize it"
+                )
+            subjects = subjects.filter(pl.col("temporal_ood") == bool(temporal_ood))
+            if subjects.height == 0:
+                raise ValueError(f"no subjects with temporal_ood={temporal_ood} in split={split!r}")
         logger.finish_unit("apply subject split filter", f"remaining_subjects={subjects.height:,}")
 
         logger.start_unit("materialize subject arrays", "start/end offsets, sex, birth time, censor time")

@@ -362,3 +362,18 @@ def test_per_subject_loss_norm_is_robust_to_empty_heads():
     with torch.no_grad():
         ld = model.loss(**batch)
     assert torch.isfinite(ld["loss"])
+
+
+def test_loss_emits_per_subject_time_sum_and_count():
+    """Per-subject diagnostics enable group-stratified eval metrics."""
+    cfg = tiny_config()
+    model = Genterp(cfg).eval()
+    _mark_some_atoms_magnitude(model)
+    batch = make_batch(B=3, T=12, n_atoms=cfg.n_atoms, seed=4)
+    with torch.no_grad():
+        ld = model.loss(**batch)
+    assert "per_subject_time_sum" in ld
+    assert "per_subject_real_count" in ld
+    assert ld["per_subject_time_sum"].shape == (3,)
+    assert ld["per_subject_real_count"].shape == (3,)
+    assert (ld["per_subject_real_count"] >= 0).all()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import csv
+import datetime
 import faulthandler
 import hashlib
 import io
@@ -482,6 +483,14 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 THRESHOLD = 500
 TEST_SPLIT_PERCENT = 20
 VALIDATION_SPLIT_PERCENT = 10
+# Temporal OOD cutoff: subjects whose latest event is on/after this calendar
+# year get an extra ``temporal_ood=True`` flag (orthogonal to the train/val/test
+# bucket). Lets downstream eval score robustness to time drift without holding
+# out a separate person-level split. Stable across CDR refreshes.
+TEMPORAL_OOD_CUTOFF_YEAR = 2022
+TEMPORAL_OOD_CUTOFF_SECONDS = int(
+    datetime.datetime(TEMPORAL_OOD_CUTOFF_YEAR, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+)
 TINY_PERSON_MOD = 10  # --tiny samples 1 in N person_ids end-to-end
 TINY = False  # set by main() from --tiny; module-level so SQL builders read it
 
@@ -545,11 +554,24 @@ NON_DRUG_TABLES = [
     ("device_exposure", "device_concept_id", "device_exposure_start_datetime", ROLE_DEVICE),
 ]
 
+EVENT_CACHE_SCHEMA = "values-v4"
+# v4 kept (vs the v5/v6 candidates from in-progress schema changes) so the
+# existing ~30GB BigQuery cache on the AoU workspace is not invalidated.
+# The new fields (role column in events.parquet, robust value stats,
+# validation split, normalized observation strings) are additive and the
+# downstream loaders are tolerant of their absence:
+#   - EventStore.from_parquet auto-synthesizes a sentinel role column if
+#     the cached parquet predates the role addition;
+#   - value_stats and subjects loaders ignore the cache filename version;
+#   - atom_registry is seeded from any existing vocab.json so warm-start
+#     atom ids are preserved when no atom_registry.json exists yet.
+# When a true schema-incompatible change lands here, bump to v5+ explicitly.
+
 
 def _cache_key(cdr: str) -> str:
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
     suffix = f"_tiny{TINY_PERSON_MOD}x" if TINY else ""
-    return f"{key}_threshold-{THRESHOLD}_values-v5{suffix}"
+    return f"{key}_threshold-{THRESHOLD}_{EVENT_CACHE_SCHEMA}{suffix}"
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -1999,7 +2021,7 @@ def _build_final_events_with_duckdb(
                            CAST(MIN(role) AS UTINYINT) AS role
                     FROM read_parquet({shard_list_sql})
                     GROUP BY subject_id, time_seconds, atom
-                    ORDER BY subject_id, time_seconds, role, atom
+                    ORDER BY subject_id, time_seconds, atom
                 ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """
             )
@@ -2141,11 +2163,38 @@ def main(argv: list[str] | None = None) -> None:
         _write_json(target_cache, target_of)
 
     registry_path = out_dir / "atom_registry.json"
+    legacy_vocab_path = out_dir / "vocab.json"
     existing_registry: dict[str, int] | None = None
     if registry_path.exists():
         existing_registry = {str(code): int(atom) for code, atom in json.loads(registry_path.read_text()).items()}
         validate_atom_registry(existing_registry)
         _log(f"atom registry loaded: atoms={len(existing_registry):,} max_id={max(existing_registry.values(), default=0):,}")
+    elif legacy_vocab_path.exists():
+        # Warm-start migration: the previous build wrote vocab.json (source_code
+        # → atom_id) but not atom_registry.json. Recover canonical_code →
+        # atom_id by joining against the freshly-computed target_of map. This
+        # preserves atom-id identity across the schema bump so trained model
+        # checkpoints keep meaningful per-row embeddings; new canonical codes
+        # (e.g., from the value_as_string normalization) get appended at the
+        # tail rather than re-enumerating the whole vocab.
+        legacy_vocab = {str(code): int(atom) for code, atom in json.loads(legacy_vocab_path.read_text()).items()}
+        recovered: dict[str, int] = {}
+        conflicts = 0
+        for source_code, atom_id in legacy_vocab.items():
+            canonical = target_of.get(source_code)
+            if canonical is None:
+                continue
+            prior = recovered.get(canonical)
+            if prior is None:
+                recovered[canonical] = atom_id
+            elif prior != atom_id:
+                conflicts += 1
+        if recovered:
+            existing_registry = recovered
+            _log(
+                f"atom registry seeded from legacy vocab.json: recovered={len(recovered):,} "
+                f"conflicts={conflicts:,} max_id={max(recovered.values(), default=0):,}"
+            )
     atom_registry = build_atom_registry(target_of.values(), existing_registry)
     atom_idx = materialize_atom_indices(target_of, atom_registry)
     _log(
@@ -2281,23 +2330,37 @@ def main(argv: list[str] | None = None) -> None:
     offsets = (
         final_events_lf.with_row_index("row")
         .group_by("subject_id", maintain_order=True)
-        .agg(pl.col("row").min().alias("start"), pl.col("row").max().alias("end"))
+        .agg(
+            pl.col("row").min().alias("start"),
+            pl.col("row").max().alias("end"),
+            pl.col("time_seconds").max().alias("last_event_seconds"),
+        )
         .collect(engine="streaming")
     )
     _log(f"subject offsets computed: subjects_with_events={offsets.height:,}")
+    # Temporal OOD flag: subjects whose latest event lands after a cutoff are
+    # marked separately so they can be held out as a temporal generalization
+    # probe. Independent of the train/validation/test bucket — a subject can
+    # be both ``split='validation'`` and ``temporal_ood=True``. Setting the
+    # cutoff at TEMPORAL_OOD_CUTOFF_SECONDS rather than relying on extrinsic
+    # calendar metadata means downstream callers don't need to reach into
+    # OMOP for the boundary.
     subjects = (
         offsets.join(persons, on="subject_id", how="inner")
         .join(censor, on="subject_id", how="inner")
         .with_columns(
             pl.col("subject_id")
             .map_elements(split_for_subject, return_dtype=pl.Utf8)
-            .alias("split")
+            .alias("split"),
+            (pl.col("last_event_seconds") >= TEMPORAL_OOD_CUTOFF_SECONDS).alias("temporal_ood"),
         )
+        .drop("last_event_seconds")
         .sort("subject_id")
     )
     subjects_path = cache_dir / (
         f"subjects-{source_key}-{vocab_key}-"
-        f"split_test{TEST_SPLIT_PERCENT}_validation{VALIDATION_SPLIT_PERCENT}.parquet"
+        f"split_test{TEST_SPLIT_PERCENT}_validation{VALIDATION_SPLIT_PERCENT}"
+        f"_temporal{TEMPORAL_OOD_CUTOFF_YEAR}.parquet"
     )
     subjects = _cache_parquet(subjects_path, lambda: subjects)
     _publish(subjects_path, out_dir / "subjects.parquet")

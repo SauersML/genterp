@@ -105,3 +105,92 @@ def test_cohort_dataset_raises_when_subjects_lack_split_column(tmp_path):
 
     with pytest.raises(ValueError, match="no 'split' column"):
         CohortDataset(tmp_path, split="train")
+
+
+def test_cohort_dataset_validation_falls_back_to_derived_split_for_legacy_subjects(tmp_path):
+    """Pre-validation-era subjects.parquet (only train/test) still resumes for split='validation'."""
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3, 4, 5],
+            "time_seconds": [0, 0, 0, 0, 0],
+            "atom": [1, 1, 1, 1, 1],
+            "value": [None, None, None, None, None],
+            "role": [10, 10, 10, 10, 10],
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    # Find a subject_id that the new split rule maps to 'validation'.
+    from scripts.aou_etl import split_for_subject
+    val_ids = [sid for sid in range(1, 1000) if split_for_subject(sid) == "validation"][:3]
+    train_ids = [sid for sid in range(1, 1000) if split_for_subject(sid) == "train"][:3]
+    legacy_ids = val_ids + train_ids
+    pl.DataFrame(
+        {
+            "subject_id": legacy_ids,
+            "start": list(range(len(legacy_ids))),
+            "end": list(range(len(legacy_ids))),
+            "sex": [0] * len(legacy_ids),
+            "birth_seconds": [0] * len(legacy_ids),
+            "censor_seconds": [86400] * len(legacy_ids),
+            # Legacy: only 'train' / 'test' labels exist.
+            "split": ["train"] * len(legacy_ids),
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+
+    # Fresh subjects.parquet must have validation events.parquet → the fallback
+    # carves a validation bucket out of subject_ids deterministically.
+    ds = CohortDataset(tmp_path, split="validation")
+    assert len(ds) == len(val_ids)
+
+
+def test_cohort_dataset_filters_temporal_ood(tmp_path):
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "time_seconds": [0, 0, 0],
+            "atom": [1, 1, 1],
+            "value": [None, None, None],
+            "role": [10, 10, 10],
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [1, 2, 3],
+            "start": [0, 1, 2],
+            "end": [0, 1, 2],
+            "sex": [0, 1, 0],
+            "birth_seconds": [0, 0, 0],
+            "censor_seconds": [86400, 86400, 86400],
+            "split": ["train", "train", "train"],
+            "temporal_ood": [True, False, True],
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+
+    ood = CohortDataset(tmp_path, split="train", temporal_ood=True)
+    in_dist = CohortDataset(tmp_path, split="train", temporal_ood=False)
+    assert len(ood) == 2
+    assert len(in_dist) == 1
+
+
+def test_cohort_dataset_raises_when_temporal_ood_requested_but_missing(tmp_path):
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "time_seconds": [0],
+            "atom": [1],
+            "value": [None],
+            "role": [10],
+        }
+    ).write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame(
+        {
+            "subject_id": [1],
+            "start": [0],
+            "end": [0],
+            "sex": [0],
+            "birth_seconds": [0],
+            "censor_seconds": [86400],
+            "split": ["train"],
+        }
+    ).write_parquet(tmp_path / "subjects.parquet")
+    with pytest.raises(ValueError, match="temporal_ood"):
+        CohortDataset(tmp_path, split="train", temporal_ood=True)
