@@ -397,7 +397,13 @@ class CohortDataset(Dataset):
             times = self.event_times.slice(int(start), length).to_numpy()
             roles = self.event_roles.slice(int(start), length).to_numpy()
             delta_days = (times - float(birth)) / 86400.0
-            event_atoms = atoms[(~np.isin(roles, static_role_list)) & (delta_days >= 0.0) & (atoms != PAD_ATOM)]
+            # Same role-vs-delta_days fallback as __getitem__: pre-role
+            # events.parquet files use the legacy heuristic.
+            if roles.size and bool((roles == ROLE_UNKNOWN).all()):
+                non_static_mask = delta_days > 0.5
+            else:
+                non_static_mask = ~np.isin(roles, static_role_list)
+            event_atoms = atoms[non_static_mask & (delta_days >= 0.0) & (atoms != PAD_ATOM)]
             if event_atoms.size:
                 counts += np.bincount(event_atoms, minlength=n_atoms)[:n_atoms]
         counts[PAD_ATOM] = 0.0
@@ -422,7 +428,14 @@ class CohortDataset(Dataset):
         delta_days = (times - birth) / 86400.0
         real_atom = atoms != PAD_ATOM
 
-        is_static = np.isin(roles, list(STATIC_ROLES))
+        # When events.parquet predates the role column, roles are all
+        # ROLE_UNKNOWN — fall back to the legacy delta_days <= 0.5 heuristic
+        # so static (demographic) tokens still get routed to the static
+        # prefix instead of the event stream.
+        if roles.size and bool((roles == ROLE_UNKNOWN).all()):
+            is_static = delta_days <= 0.5
+        else:
+            is_static = np.isin(roles, list(STATIC_ROLES))
         static_idx = np.where(is_static & real_atom)[0]
         event_idx_all = np.where((~is_static) & (delta_days >= 0.0) & real_atom)[0]
         event_idx = _select_window(
