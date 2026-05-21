@@ -55,16 +55,58 @@ find "$SCRIPT_DIR" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/nul
 find "$SCRIPT_DIR" -type f -name '*.pyc' -delete 2>/dev/null || true
 finish_run_unit "wipe stale bytecode caches"
 
-# Report the checkout, but never mutate it. This script runs from a development
-# workspace, so fetching/resetting here can destroy local work and violates the
-# repo workflow.
-log_run "START report git checkout"
-if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "[run.sh] current HEAD: $(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)" >&2
+# Self-update: ff-merge from origin/main, then re-exec the refreshed script
+# so every invocation runs the latest committed code. Workflow:
+#   1. If there are uncommitted local edits or untracked files we care about,
+#      skip the update entirely (loud log) so working state is never lost.
+#      Set GENTERP_RUN_FORCE_UPDATE=1 to override (use git reset --hard).
+#   2. Otherwise git fetch + ff-only merge. ff-only refuses to rewrite history
+#      so a diverged local branch errors out instead of silently losing work.
+#   3. On success, re-exec the refreshed run.sh so the rest of the run uses
+#      the new code. GENTERP_REEXEC guard prevents infinite re-exec loops.
+log_run "START self-update from git origin/main"
+if [ -z "${GENTERP_REEXEC:-}" ] && git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  CURRENT_HEAD="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "[run.sh] current HEAD before update: $CURRENT_HEAD" >&2
+  WT_DIRTY=""
+  if ! git -C "$SCRIPT_DIR" diff --quiet 2>/dev/null; then
+    WT_DIRTY="unstaged"
+  fi
+  if ! git -C "$SCRIPT_DIR" diff --cached --quiet 2>/dev/null; then
+    WT_DIRTY="${WT_DIRTY:+$WT_DIRTY,}staged"
+  fi
+  if [ -n "$WT_DIRTY" ] && [ -z "${GENTERP_RUN_FORCE_UPDATE:-}" ]; then
+    echo "[run.sh] working tree has $WT_DIRTY changes; skipping self-update to preserve them" >&2
+    echo "[run.sh] commit/stash the changes (or set GENTERP_RUN_FORCE_UPDATE=1) to enable self-update" >&2
+  elif ! git -C "$SCRIPT_DIR" fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main'; then
+    echo "[run.sh] WARNING: git fetch origin main failed; continuing with current checkout" >&2
+  else
+    TARGET="$(git -C "$SCRIPT_DIR" rev-parse --short origin/main 2>/dev/null || echo unknown)"
+    if [ "$CURRENT_HEAD" = "$TARGET" ]; then
+      echo "[run.sh] already at origin/main ($TARGET); no re-exec needed" >&2
+    elif [ -n "${GENTERP_RUN_FORCE_UPDATE:-}" ]; then
+      echo "[run.sh] resetting $CURRENT_HEAD -> $TARGET (origin/main) [force]" >&2
+      if ! git -C "$SCRIPT_DIR" reset --hard origin/main; then
+        echo "[run.sh] FATAL: git reset --hard origin/main failed" >&2
+        exit 1
+      fi
+      finish_run_unit "self-update succeeded (force); re-executing refreshed run.sh at $TARGET"
+      export GENTERP_REEXEC=1
+      exec bash "$0" "$@"
+    elif git -C "$SCRIPT_DIR" merge --ff-only --quiet origin/main; then
+      echo "[run.sh] fast-forwarded $CURRENT_HEAD -> $TARGET (origin/main)" >&2
+      finish_run_unit "self-update succeeded; re-executing refreshed run.sh at $TARGET"
+      export GENTERP_REEXEC=1
+      exec bash "$0" "$@"
+    else
+      echo "[run.sh] local branch diverged from origin/main ($CURRENT_HEAD vs $TARGET); fast-forward refused" >&2
+      echo "[run.sh] rebase or reset locally, then re-run (or set GENTERP_RUN_FORCE_UPDATE=1 to hard-reset)" >&2
+    fi
+  fi
 else
-  echo "[run.sh] non-git checkout" >&2
+  echo "[run.sh] $(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown) (re-exec or non-git)" >&2
 fi
-finish_run_unit "report git checkout"
+finish_run_unit "self-update check complete"
 
 # Loud confirmation of what the running source actually is. If the
 # "VERSION_TAG" line from aou_etl.main() ever shows a different commit/sha

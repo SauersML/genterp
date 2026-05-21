@@ -2260,18 +2260,26 @@ def main(argv: list[str] | None = None) -> None:
         # value head sees the same z-scores it was trained on; delete
         # value_stats.json by hand to force a recompute with the new robust
         # median+MAD when starting fresh or after retraining the value head.
-        prev_count = 0
+        # Load existing stats too — downstream summarize step references
+        # ``stats`` for the magnitude_atoms log line; leaving it unbound
+        # raises UnboundLocalError before the trainer step ever launches.
         try:
-            prev_count = len(json.loads(published_stats.read_text()))
-        except (OSError, json.JSONDecodeError):
-            prev_count = 0
+            stats = {
+                str(code): {
+                    "mu": float(entry["mu"]),
+                    "sigma": float(entry["sigma"]),
+                }
+                for code, entry in json.loads(published_stats.read_text()).items()
+            }
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            stats = {}
         _log(
-            f"value_stats.json already published with {prev_count:,} entries at {published_stats}; "
+            f"value_stats.json already published with {len(stats):,} entries at {published_stats}; "
             f"preserving for warm-start (delete to force recompute)"
         )
         _WORK.finish_unit(
             "compute per-atom value stats",
-            f"preserved existing magnitude-bearing atoms={prev_count:,} vocab_key={vocab_key}",
+            f"preserved existing magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}",
         )
     else:
         stats = _cached_value_stats(all_events_path, atom_idx, cache_dir, source_key, vocab_key)
