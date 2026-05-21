@@ -2249,9 +2249,34 @@ def main(argv: list[str] | None = None) -> None:
         "DuckDB train-split median + 1.4826·MAD per code (HAVING n>=THRESHOLD) with global shrinkage; spills to disk under PRAGMA memory_limit",
     )
     vocab_key = _stable_json_fingerprint(atom_idx)
-    stats = _cached_value_stats(all_events_path, atom_idx, cache_dir, source_key, vocab_key)
-    _write_json(out_dir / "value_stats.json", stats)
-    _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
+    published_stats = out_dir / "value_stats.json"
+    if published_stats.exists():
+        # Warm-start safety: published value_stats.json is what the trainer
+        # reads to set value_mod.value_mu / value_sigma buffers at startup.
+        # Overwriting it after the value-head has been trained against a
+        # specific (mu, sigma) per code shifts the model's input distribution
+        # by 4-10x for skewed labs (glucose, creatinine), guaranteeing a
+        # painful loss spike. Preserve the existing file so the trained
+        # value head sees the same z-scores it was trained on; delete
+        # value_stats.json by hand to force a recompute with the new robust
+        # median+MAD when starting fresh or after retraining the value head.
+        prev_count = 0
+        try:
+            prev_count = len(json.loads(published_stats.read_text()))
+        except (OSError, json.JSONDecodeError):
+            prev_count = 0
+        _log(
+            f"value_stats.json already published with {prev_count:,} entries at {published_stats}; "
+            f"preserving for warm-start (delete to force recompute)"
+        )
+        _WORK.finish_unit(
+            "compute per-atom value stats",
+            f"preserved existing magnitude-bearing atoms={prev_count:,} vocab_key={vocab_key}",
+        )
+    else:
+        stats = _cached_value_stats(all_events_path, atom_idx, cache_dir, source_key, vocab_key)
+        _write_json(published_stats, stats)
+        _WORK.finish_unit("compute per-atom value stats", f"magnitude-bearing atoms={len(stats):,} vocab_key={vocab_key}")
 
     # Free polars LazyFrame state before the big DuckDB op so we don't carry
     # polars working memory through the sort. The downstream offsets step opens

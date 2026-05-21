@@ -237,9 +237,19 @@ class Block(nn.Module):
         n_layers: int,
         mlp_mult: int = 4,
         dropout: float = 0.0,
+        residual_scale: float | None = None,
     ):
         super().__init__()
-        self.res_scale = (2 * max(int(n_layers), 1)) ** -0.5
+        # residual_scale=None preserves legacy behavior (no scaling, ≡ 1.0) so
+        # checkpoints trained before the depth-scaled residual landed continue
+        # producing the same forward outputs after the upgrade. Set to a
+        # number (e.g., (2*n_layers)**-0.5) on fresh runs to opt into the
+        # depth-stable residual scheme.
+        self.res_scale = (
+            float(residual_scale)
+            if residual_scale is not None
+            else 1.0
+        )
         self.norm1 = RMSNorm(dim)
         self.attn = CausalRoPEAttention(dim, heads, rope, dropout)
         self.norm2 = RMSNorm(dim)
@@ -262,10 +272,18 @@ class Block(nn.Module):
 class _MAB(nn.Module):
     """Multihead attention block, set-style (no positional encoding)."""
 
-    def __init__(self, dim: int, heads: int, residual_blocks: int, mlp_mult: int = 4):
+    def __init__(self, dim: int, heads: int, residual_blocks: int, mlp_mult: int = 4, residual_scale: float | None = None):
         super().__init__()
         self.heads = heads
-        self.res_scale = (2 * max(int(residual_blocks), 1)) ** -0.5
+        # Same legacy-default semantics as ``Block``: ``residual_scale=None``
+        # means "no scaling" (≡ 1.0) so warm-started checkpoints continue
+        # producing the same forward outputs as before the depth-scaled
+        # residual scheme was added. Opt in by passing a number.
+        self.res_scale = (
+            float(residual_scale)
+            if residual_scale is not None
+            else 1.0
+        )
         self.norm_q = RMSNorm(dim)
         self.norm_kv = RMSNorm(dim)
         self.q_proj = nn.Linear(dim, dim, bias=False)
