@@ -766,13 +766,15 @@ def _compute_disease_risks(
     diag["score_std"] = float(score_per_set.std().item())
     diag["score_mean"] = float(score_per_set.mean().item())
 
-    # Fallback: if the hazard pipeline collapsed (score variance is
-    # effectively zero across this batch), the C-index would just rank
-    # by `gap_days` and produce a weight-invariant output. Switch to
-    # mark-marginal scoring at the landmark — uses the mark head + embed
-    # directly, which are trained even when the TPP head is degenerate
-    # under a distribution shift.
-    if diag["score_std"] < 1e-12:
+    # Fallback: trigger if EITHER (a) score variance collapsed (the
+    # hazard pipeline degenerated into a constant) OR (b) the hazard
+    # clamp fired for >50% of the (B, G) grid (the TPP integral is in
+    # the saturated regime and any apparent variance comes from grid
+    # arithmetic / gap_days noise, not from the model). Without (b)
+    # we'd miss the case where TPP collapse produces scores that vary
+    # by subject (via gap_days) but the ranking is still
+    # weight-invariant — exactly the 0.4757 stuck-mean symptom.
+    if diag["score_std"] < 1e-12 or diag["log_hazard_floor_frac"] > 0.5:
         landmark_dt = gap_to_landmark_days.clamp(min=1.0).float()
         landmark_mark_lp = tpp.mark_log_probs(h_last.float(), landmark_dt).double()
         landmark_mark_p = landmark_mark_lp.exp()
