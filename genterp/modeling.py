@@ -929,12 +929,31 @@ class Genterp(nn.Module):
         K = self.cfg.k_static_summary
         device = event_ages.device
 
-        sex_context = self.sex_embedding(sex.long()).unsqueeze(1)
-        static_context = torch.cat([sex_context, self._embed(static_atoms)], dim=1)
+        # Per-layer NaN guards. When training destabilizes (e.g., a value-head
+        # blow-up under the Student-t NLL × clipped z_target × extreme mu has
+        # been observed pushing log_sigma to a clamp boundary and producing
+        # gradient spikes large enough that Adam takes a catastrophic step,
+        # leaving some weight rows in a degenerate state), specific input
+        # combinations trigger NaN in one of the intermediate tensors. The
+        # NaN then propagates through every downstream layer and the eval
+        # comes out uniformly NaN → 0.5 C-index. Guards replace NaN/Inf with
+        # 0.0 at each stage and, only when in eval mode, log the first layer
+        # to fire so we know the source instead of guessing.
+        nan_layers: list[str] = []
+        def _guard(t: torch.Tensor, label: str) -> torch.Tensor:
+            if torch.isnan(t).any() or torch.isinf(t).any():
+                if not self.training:
+                    nan_layers.append(label)
+                return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            return t
+
+        sex_context = _guard(self.sex_embedding(sex.long()).unsqueeze(1), "sex_embedding")
+        static_emb = _guard(self._embed(static_atoms), "embed[static]")
+        static_context = torch.cat([sex_context, static_emb], dim=1)
         static_context_pad = F.pad(static_pad, (1, 0), value=False)
-        summary = self.static_encoder(static_context, static_context_pad)
-        events = self._embed(event_atoms)
-        events = self.value_mod(events, target_atoms, event_values)
+        summary = _guard(self.static_encoder(static_context, static_context_pad), "static_encoder")
+        events = _guard(self._embed(event_atoms), "embed[event]")
+        events = _guard(self.value_mod(events, target_atoms, event_values), "value_mod")
         x = torch.cat([summary, events], dim=1)
 
         is_static = self._static_mask(B, K, T, device)
@@ -944,16 +963,29 @@ class Genterp(nn.Module):
 
         pre_mlps: list[torch.Tensor] = []
         mlp_outs: list[torch.Tensor] = []
-        for blk in self.blocks:
+        for layer_idx, blk in enumerate(self.blocks):
             if self.gradient_checkpointing and self.training:
                 x, pre_mlp, mlp_out = self._gradient_checkpointing_func(blk, x, angles, event_pad, K, event_lengths)
             else:
                 x, pre_mlp, mlp_out = blk(x, angles, event_pad, K, event_lengths)
+            x = _guard(x, f"block[{layer_idx}]")
             if return_transcoder_acts:
                 pre_mlps.append(pre_mlp[:, K:])
                 mlp_outs.append(mlp_out[:, K:])
 
-        hidden = self.norm(x[:, K:])
+        hidden = _guard(self.norm(x[:, K:]), "norm")
+        if not self.training and nan_layers:
+            # First layer to fire is the root cause; the rest are downstream
+            # propagation (or the inputs already had NaN by the time the
+            # block ran). Print once per forward.
+            first = nan_layers[0]
+            rest = len(nan_layers) - 1
+            print(
+                f"[genterp-forward] NaN detected — first_layer={first} "
+                f"downstream_layers_also_hit={rest} B={B} T={T} "
+                f"event_ages.max={float(event_ages.max().item()) if event_ages.numel() else 0.0:.3g} "
+                f"event_values.absmax={float(event_values.abs().max().item()) if event_values.numel() else 0.0:.3g}"
+            )
         out: dict[str, torch.Tensor] = {"hidden": hidden}
         if return_transcoder_acts:
             out["pre_mlp"] = torch.stack(pre_mlps, dim=1)
