@@ -637,58 +637,80 @@ def _compute_disease_risks(
     set_membership: torch.Tensor,
     horizon_days: float,
     n_grid: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, float]]:
     """Per-disease ranking score = Λ_A / Λ_total^α with α = 0.5 (sqrt).
 
     Three formulations have been tried here; this is the empirical compromise:
 
     1. score = 1 - exp(-Λ_A) (original): approximates P(first event is A
        within horizon). Multiplies p(A|h,t) by patient rate λ_total(t).
-       The rate factor is a CONFOUND for chronic conditions (high-rate
-       patients have hundreds of routine events queue up before the next
-       diagnosis code) but also a SIGNAL for utilization-driven outcomes
-       (glaucoma checkup, allergy follow-up — patients who get coded are
-       those who visit doctors).
+       The rate factor is a CONFOUND for chronic conditions but also a
+       SIGNAL for utilization-driven outcomes.
+    2. score = Λ_A / Λ_total (pure ratio): cancels the rate factor; loses
+       the utilization signal for the codes where it was real.
+    3. score = Λ_A / sqrt(Λ_total) (current, α=0.5): hedge between the two.
 
-    2. score = Λ_A / Λ_total (pure ratio, attempted in 043f3e7): cancels
-       the rate factor entirely. Cleanly removes the chronic-disease
-       confound but ALSO removes the utilization signal for the codes
-       where it was a real predictor. Net effect on this model: mean
-       C-index dropped from ~0.50 to ~0.47 because the softmax-competition
-       inversion (p(A|h) is LOW for high-utilization patients due to
-       mark-mass split across 42k atoms) is no longer masked by the rate
-       factor. Anti-predictive for several diseases.
-
-    3. score = Λ_A / sqrt(Λ_total) (current, α=0.5): geometric mean of
-       the two. Partial rate weighting keeps the utilization signal for
-       codes where it's real, partial normalization dampens the
-       chronic-disease confound. Hedge under uncertainty about
-       per-disease utilization-vs-signal balance.
-
-    Same compute cost as either alternative. C-index invariant to monotonic
-    transforms so the choice only matters for cross-patient ranking magnitudes.
+    Numerics (this was a long-debugged source of bit-identical eval outputs):
+      * All hazard math in fp64. fp32 (and certainly bf16) routinely
+        underflowed `cum_hazard_total` to its floor while the per-subject
+        variation in `cum_hazard_per_atom` had been clamped to the same
+        floor, so risks became deterministic functions of `gap_days` and
+        `set_membership` only — bit-identical across weight updates.
+      * Inner clamps widened to ±200 in log-space (vs the old ±30). At
+        fp64, ±30 was inside the *signal* range — small weight changes
+        landing the hazard near the clamp produced identical clipped
+        outputs. ±200 only catches genuine NaN/Inf from the TPP.
+      * Redundant `log_sigma`/`mu`/`log_w` clamps removed — the model's
+        own `time_params` already clamps `log_sigma` to ±5 and softmaxes
+        `log_w`, so the eval re-clamp was a no-op masquerading as safety.
+      * Saturation telemetry returned alongside scores. The caller
+        aggregates and surfaces it in the per-eval log so degeneracy
+        becomes immediately visible instead of silently producing a
+        weight-invariant 0.4757 mean.
+      * Mark-marginal fallback when the TPP integral degenerates (score
+        std collapses below 1e-15). Falls back to per-atom mark
+        probability at the landmark timestamp — depends on the mark head
+        and embedding (which train fine even when the TPP head has
+        miscalibrated under a distribution shift), so the C-index still
+        moves with weights.
     """
     device = h_last.device
     B, D = h_last.shape
     tpp = model.model.tpp
 
-    grid_low = gap_to_landmark_days.clamp(min=1.0)
+    diag: dict[str, float] = {"B": float(B), "fallback": 0.0}
+    if B == 0:
+        return torch.zeros((0, set_membership.shape[0]), dtype=torch.float32, device=device), diag
+
+    # All hazard arithmetic in fp64 — the bf16/fp32 underflow that fed the
+    # original saturation trap doesn't happen here.
+    h_last_d = h_last.double()
+    gap_d = gap_to_landmark_days.double()
+
+    grid_low = gap_d.clamp(min=1.0)
     grid_high = grid_low + float(horizon_days)
     log_lo = grid_low.log().unsqueeze(-1)
     log_hi = grid_high.log().unsqueeze(-1)
-    alpha = torch.linspace(0.0, 1.0, n_grid, device=device).unsqueeze(0)
+    alpha = torch.linspace(0.0, 1.0, n_grid, device=device, dtype=torch.float64).unsqueeze(0)
     log_grid = log_lo + alpha * (log_hi - log_lo)
     grid = log_grid.exp()
 
-    log_w, mu, log_sigma = tpp.time_params(h_last.float())
-    # Bound log_sigma so a destabilized value head can't push sigma → 0
-    # (inv_sigma → +inf → z → ±inf → z.pow(2) → +inf → log_pdf → -inf
-    # for every mixture, and downstream logsumexp can yield NaN if any
-    # mixture lands at +inf simultaneously). Note: torch.clamp does NOT
-    # sanitize NaN, so we nan_to_num first.
-    log_sigma = torch.nan_to_num(log_sigma, nan=0.0, posinf=10.0, neginf=-10.0).clamp(min=-10.0, max=10.0)
-    mu = torch.nan_to_num(mu, nan=0.0, posinf=20.0, neginf=-20.0)
-    log_w = torch.nan_to_num(log_w, nan=-10.0, posinf=0.0, neginf=-30.0)
+    log_w_f, mu_f, log_sigma_f = tpp.time_params(h_last.float())
+    log_w = log_w_f.double()
+    mu = mu_f.double()
+    log_sigma = log_sigma_f.double()
+    # The model's own time_params already clamps log_sigma ∈ [-5, 5]; no
+    # further clamping here. Only sanitize true NaN/Inf so logsumexp can
+    # proceed without poisoning the batch.
+    log_sigma = torch.nan_to_num(log_sigma, nan=0.0, posinf=5.0, neginf=-5.0)
+    mu = torch.nan_to_num(mu, nan=0.0, posinf=50.0, neginf=-50.0)
+    log_w = torch.nan_to_num(log_w, nan=-50.0, posinf=0.0, neginf=-100.0)
+
+    diag["log_sigma_min"] = float(log_sigma.min().item())
+    diag["log_sigma_max"] = float(log_sigma.max().item())
+    diag["mu_abs_max"] = float(mu.abs().max().item())
+    diag["h_last_norm_mean"] = float(h_last_d.norm(dim=-1).mean().item())
+
     inv_sigma = (-log_sigma).exp()
     log_dt = log_grid.unsqueeze(-1)
     log_w_b = log_w.unsqueeze(1)
@@ -700,47 +722,68 @@ def _compute_disease_risks(
     log_surv_per_mix = _log_ndtr(-z)
     log_p_time = torch.logsumexp(log_w_b + log_pdf, dim=-1)
     log_surv = torch.logsumexp(log_w_b + log_surv_per_mix, dim=-1)
-    log_hazard_total = log_p_time - log_surv.clamp(min=math.log(1e-12))
-    # Bound log_hazard_total ONCE here so both Λ_per_atom and Λ_total
-    # use the same value. Without this, the two clamp paths (one inside
-    # log_h + log_mark, one on log_h alone) can disagree and break the
-    # invariant Σ_m Λ_m ≤ Λ_total, letting the ratio exceed 1. clamp
-    # alone doesn't sanitize NaN, so we nan_to_num first.
+    # Don't clamp log_surv to a tight floor — let fp64 carry the value.
+    log_hazard_total_raw = log_p_time - log_surv
+    diag["log_hazard_min"] = float(log_hazard_total_raw.min().item())
+    diag["log_hazard_max"] = float(log_hazard_total_raw.max().item())
+    diag["log_hazard_nan_frac"] = float(torch.isnan(log_hazard_total_raw).float().mean().item())
+    # ±200 in log-space → exp = [7e-87, 7e86]. fp64 normal range is ±1e308,
+    # so this is well clear of subnormals. Catches NaN/Inf only.
     log_hazard_total = torch.nan_to_num(
-        log_hazard_total, nan=-30.0, posinf=20.0, neginf=-30.0,
-    ).clamp(min=-30.0, max=20.0)
+        log_hazard_total_raw, nan=-200.0, posinf=200.0, neginf=-200.0,
+    ).clamp(min=-200.0, max=200.0)
+    diag["log_hazard_floor_frac"] = float((log_hazard_total <= -199.0).float().mean().item())
 
     G = grid.shape[1]
     h_expanded = h_last.unsqueeze(1).expand(B, G, D).reshape(B * G, D)
-    dt_expanded = grid.reshape(B * G)
-    mark_lp = tpp.mark_log_probs(h_expanded.float(), dt_expanded)
-    log_mark_flat = mark_lp.index_select(-1, flat_atoms_t).view(B, G, -1)
+    dt_expanded = grid.reshape(B * G).float()
+    mark_lp_f = tpp.mark_log_probs(h_expanded.float(), dt_expanded)
+    # Index *before* the fp64 cast — the full mark logits over the whole
+    # vocab (V≈42k) at fp64 is ~128MB per batch and we only need ~5k
+    # disease atoms. Index in fp32, then cast the small result.
+    log_mark_flat = mark_lp_f.index_select(-1, flat_atoms_t).view(B, G, -1).double()
 
     log_lambda_per_atom = log_hazard_total.unsqueeze(-1) + log_mark_flat
-    # log_mark is log-softmax bounded in (-inf, 0], so adding it only
-    # shifts log_lambda down from log_hazard_total. Re-clamp anyway in
-    # case log_mark is -inf for unused atoms after numerical underflow.
     log_lambda_per_atom = torch.nan_to_num(
-        log_lambda_per_atom, nan=-30.0, posinf=20.0, neginf=-30.0,
-    ).clamp(min=-30.0, max=20.0)
+        log_lambda_per_atom, nan=-200.0, posinf=200.0, neginf=-200.0,
+    ).clamp(min=-200.0, max=200.0)
+    diag["log_lambda_floor_frac"] = float((log_lambda_per_atom <= -199.0).float().mean().item())
+
     lambda_per_atom = log_lambda_per_atom.exp()
     dgrid = torch.diff(grid, dim=-1)
     dgrid_unsq = dgrid.unsqueeze(-1)
     avg = 0.5 * (lambda_per_atom[:, :-1] + lambda_per_atom[:, 1:])
-    cum_hazard_per_atom = (avg * dgrid_unsq).sum(dim=1).clamp(min=0.0)  # (B, A)
+    cum_hazard_per_atom = (avg * dgrid_unsq).sum(dim=1).clamp(min=0.0)
 
-    # Λ_total(τ) computed from the SAME clamped log_hazard_total used
-    # above — guarantees consistency of the ratio so score ∈ [0, 1].
-    hazard_total = log_hazard_total.exp()  # (B, G)
+    hazard_total = log_hazard_total.exp()
     cum_hazard_total = (
         0.5 * (hazard_total[:, :-1] + hazard_total[:, 1:]) * dgrid
-    ).sum(dim=1).clamp(min=1e-12)  # (B,)
+    ).sum(dim=1).clamp(min=1e-300)
 
-    cum_hazard_set = cum_hazard_per_atom @ set_membership.t().float()  # (B, D)
-    # α = 0.5: partial rate normalization. See docstring for the trade-off.
+    cum_hazard_set = cum_hazard_per_atom @ set_membership.t().double()
     score_per_set = cum_hazard_set / cum_hazard_total.sqrt().unsqueeze(-1)
     score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1e8, neginf=0.0)
-    return score_per_set
+    diag["score_std"] = float(score_per_set.std().item())
+    diag["score_mean"] = float(score_per_set.mean().item())
+
+    # Fallback: if the hazard pipeline collapsed (score variance is
+    # effectively zero across this batch), the C-index would just rank
+    # by `gap_days` and produce a weight-invariant output. Switch to
+    # mark-marginal scoring at the landmark — uses the mark head + embed
+    # directly, which are trained even when the TPP head is degenerate
+    # under a distribution shift.
+    if diag["score_std"] < 1e-12:
+        landmark_dt = gap_to_landmark_days.clamp(min=1.0).float()
+        landmark_mark_lp = tpp.mark_log_probs(h_last.float(), landmark_dt).double()
+        landmark_mark_p = landmark_mark_lp.exp()
+        landmark_per_atom = landmark_mark_p.index_select(-1, flat_atoms_t)
+        score_per_set = landmark_per_atom @ set_membership.t().double()
+        score_per_set = torch.nan_to_num(score_per_set, nan=0.0, posinf=1e8, neginf=0.0)
+        diag["fallback"] = 1.0
+        diag["score_std"] = float(score_per_set.std().item())
+        diag["score_mean"] = float(score_per_set.mean().item())
+
+    return score_per_set.float(), diag
 
 
 def _harrell_cindex(risks: np.ndarray, time_to_event: np.ndarray, observed: np.ndarray) -> tuple[float, int]:
@@ -943,6 +986,14 @@ def _score_risks(
     all_risks = np.zeros((len(cohort.subjects), len(cohort.disease_names)), dtype=np.float64)
     cursor = 0
     use_autocast = autocast_dtype is not None and device.type == "cuda"
+    # Saturation telemetry — accumulated across batches and reported once at
+    # eval end so the user can immediately see when the TPP has collapsed and
+    # the fallback path was needed. Without this, the eval looks fine
+    # (numbers come out) but is silently weight-invariant.
+    diag_accum: dict[str, list[float]] = {}
+    fallback_batches = 0
+    total_subjects = 0
+    h_last_signature: list[float] = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(cohort.loader):
             batch_on_device = {
@@ -969,14 +1020,50 @@ def _score_risks(
             last_idx = (lengths - 1).view(-1, 1, 1).expand(-1, 1, hidden.shape[-1])
             h_last = hidden.gather(1, last_idx).squeeze(1)
             n_b = h_last.shape[0]
+            if batch_idx == 0:
+                # Fingerprint the first batch's hidden state so callers can
+                # tell if the transformer forward is producing different
+                # outputs across evals (weight-sensitive) or not.
+                h_last_signature.append(float(h_last.detach().float().sum().item()))
+                h_last_signature.append(float(h_last.detach().float().norm().item()))
             gap_b = torch.from_numpy(cohort.gaps_days[cursor : cursor + n_b].astype(np.float32)).to(device)
-            risk = _compute_disease_risks(
+            risk, diag = _compute_disease_risks(
                 model, h_last, gap_b, flat_atoms_t, set_membership_t, HORIZON_DAYS, N_QUAD_POINTS
             )
             all_risks[cursor : cursor + n_b] = risk.float().cpu().numpy()
             cursor += n_b
+            total_subjects += int(diag.get("B", n_b))
+            if diag.get("fallback", 0.0) > 0.0:
+                fallback_batches += 1
+            for key, value in diag.items():
+                diag_accum.setdefault(key, []).append(float(value))
             if progress_every and batch_idx % progress_every == 0:
                 print(f"  scored {cursor:,}/{len(cohort.subjects):,} subjects")
+    # Eval-time saturation summary. Surfaces silent weight-invariance —
+    # if log_hazard_floor_frac or log_lambda_floor_frac trends above 0.1
+    # or fallback_batches > 0, the TPP head has collapsed and risk
+    # scoring fell back to the mark-marginal path.
+    def _summary(key: str) -> str:
+        values = diag_accum.get(key, [])
+        if not values:
+            return "n/a"
+        arr = np.asarray(values, dtype=np.float64)
+        return f"min={arr.min():.3g} mean={arr.mean():.3g} max={arr.max():.3g}"
+    sig_str = (
+        f"h_last[0].sum={h_last_signature[0]:.6e} h_last[0].norm={h_last_signature[1]:.6e}"
+        if len(h_last_signature) >= 2 else "h_last[0]=n/a"
+    )
+    print(
+        f"[cindex-saturation] batches={len(diag_accum.get('B', []))} "
+        f"subjects={total_subjects} fallback_batches={fallback_batches} "
+        f"{sig_str} | "
+        f"log_sigma_min[{_summary('log_sigma_min')}] log_sigma_max[{_summary('log_sigma_max')}] "
+        f"|mu|_max[{_summary('mu_abs_max')}] "
+        f"log_hazard[{_summary('log_hazard_min')}→{_summary('log_hazard_max')}] "
+        f"hazard_floor_frac[{_summary('log_hazard_floor_frac')}] "
+        f"lambda_floor_frac[{_summary('log_lambda_floor_frac')}] "
+        f"score_std[{_summary('score_std')}]"
+    )
     return all_risks
 
 
