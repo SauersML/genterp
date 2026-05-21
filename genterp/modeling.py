@@ -229,8 +229,17 @@ class CausalRoPEAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, heads: int, rope: ContinuousTimeRoPE, mlp_mult: int = 4, dropout: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        rope: ContinuousTimeRoPE,
+        n_layers: int,
+        mlp_mult: int = 4,
+        dropout: float = 0.0,
+    ):
         super().__init__()
+        self.res_scale = (2 * max(int(n_layers), 1)) ** -0.5
         self.norm1 = RMSNorm(dim)
         self.attn = CausalRoPEAttention(dim, heads, rope, dropout)
         self.norm2 = RMSNorm(dim)
@@ -245,17 +254,18 @@ class Block(nn.Module):
         event_lengths: torch.Tensor | list[int] | tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (post_block_residual, pre_mlp_residual, mlp_additive_output)."""
-        x = x + self.attn(self.norm1(x), angles, event_pad, static_len, event_lengths)
+        x = x + self.res_scale * self.attn(self.norm1(x), angles, event_pad, static_len, event_lengths)
         mlp_out = self.mlp(self.norm2(x))
-        return x + mlp_out, x, mlp_out
+        return x + self.res_scale * mlp_out, x, mlp_out
 
 
 class _MAB(nn.Module):
     """Multihead attention block, set-style (no positional encoding)."""
 
-    def __init__(self, dim: int, heads: int, mlp_mult: int = 4):
+    def __init__(self, dim: int, heads: int, residual_blocks: int, mlp_mult: int = 4):
         super().__init__()
         self.heads = heads
+        self.res_scale = (2 * max(int(residual_blocks), 1)) ** -0.5
         self.norm_q = RMSNorm(dim)
         self.norm_kv = RMSNorm(dim)
         self.q_proj = nn.Linear(dim, dim, bias=False)
@@ -272,8 +282,8 @@ class _MAB(nn.Module):
         v = rearrange(v, "b s (h d) -> b h s d", h=self.heads)
         attn_mask = (~ctx_pad)[:, None, None, :] if ctx_pad is not None else None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        x = x + self.o_proj(rearrange(out, "b h s d -> b s (h d)"))
-        return x + self.ff(self.norm_ff(x))
+        x = x + self.res_scale * self.o_proj(rearrange(out, "b h s d -> b s (h d)"))
+        return x + self.res_scale * self.ff(self.norm_ff(x))
 
 
 class SetTransformer(nn.Module):
@@ -281,9 +291,10 @@ class SetTransformer(nn.Module):
 
     def __init__(self, dim: int, heads: int, n_blocks: int, k_summary: int, mlp_mult: int = 4):
         super().__init__()
-        self.sab = nn.ModuleList([_MAB(dim, heads, mlp_mult) for _ in range(n_blocks)])
+        residual_blocks = n_blocks + 1
+        self.sab = nn.ModuleList([_MAB(dim, heads, residual_blocks, mlp_mult) for _ in range(n_blocks)])
         self.seeds = nn.Parameter(torch.randn(1, k_summary, dim) * 0.02)
-        self.pma = _MAB(dim, heads, mlp_mult)
+        self.pma = _MAB(dim, heads, residual_blocks, mlp_mult)
 
     def forward(self, x: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
         for blk in self.sab:
@@ -313,7 +324,14 @@ class AtomEmbedding(nn.Module):
     (same module name, same shape) so existing state-dicts deserialize cleanly.
     """
 
-    def __init__(self, n_atoms: int, dim: int, padding_idx: int = 0, n_ancestor_rows: int = 0):
+    def __init__(
+        self,
+        n_atoms: int,
+        dim: int,
+        padding_idx: int = 0,
+        n_ancestor_rows: int = 0,
+        n_ancestor_cols: int = 0,
+    ):
         super().__init__()
         self.padding_idx = padding_idx
         self.embedding = nn.Embedding(n_atoms, dim, padding_idx=padding_idx)
@@ -321,14 +339,55 @@ class AtomEmbedding(nn.Module):
         with torch.no_grad():
             self.embedding.weight[padding_idx].zero_()
         # ancestor_embedding shape is fixed at construction so checkpoints
-        # round-trip cleanly (loading happens before set_ancestor_ids; the
-        # parameter is already the right shape). n_ancestor_rows = 0 means
-        # "flat mode": a 1-row zero placeholder that never gets indexed (the
-        # ancestor_ids buffer below has zero columns).
+        # round-trip cleanly. n_ancestor_rows = 0 means "flat mode": a 1-row
+        # zero placeholder that never gets indexed.
         rows = max(n_ancestor_rows + 1, 1)
         self.ancestor_embedding = nn.Embedding(rows, dim, padding_idx=0)
         nn.init.zeros_(self.ancestor_embedding.weight)
-        self.register_buffer("ancestor_ids", torch.zeros(n_atoms, 0, dtype=torch.long), persistent=False)
+        # Persist the attached closure so resumed checkpoints keep the exact
+        # hierarchy table that trained the ancestor embeddings.
+        self.register_buffer(
+            "ancestor_ids",
+            torch.zeros(n_atoms, n_ancestor_cols, dtype=torch.long),
+            persistent=True,
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Reshape ``ancestor_ids`` to match the saved closure before the default copy.
+
+        ``ancestor_ids`` is registered with width 0 at construction (the real
+        width comes from the ETL ``ancestors.npz`` and varies per build). The
+        default ``_load_from_state_dict`` does an in-place ``copy_``, which
+        rejects any shape mismatch — so HF's ``from_pretrained`` would otherwise
+        fail every time the saved closure had width > 0. Swap in a same-shape
+        zero buffer here, then let the base class copy the saved tensor into
+        it. ``ancestor_embedding`` is intentionally fixed-shape (Parameter) and
+        is handled by the default path.
+        """
+        key = prefix + "ancestor_ids"
+        saved = state_dict.get(key)
+        if saved is not None and saved.shape != self.ancestor_ids.shape:
+            self.ancestor_ids = torch.zeros(
+                *saved.shape, dtype=self.ancestor_ids.dtype, device=self.ancestor_ids.device
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @torch.no_grad()
     def set_ancestor_ids(self, ancestor_ids: torch.Tensor) -> None:
@@ -378,7 +437,9 @@ class AtomEmbedding(nn.Module):
             return leaf
         anc_emb = self.ancestor_embedding(self.ancestor_ids)
         anc_mask = (self.ancestor_ids != 0).to(anc_emb.dtype).unsqueeze(-1)
-        return leaf + (anc_emb * anc_mask).sum(dim=-2)
+        anc_count = anc_mask.sum(dim=-2).clamp(min=1.0)
+        anc = (anc_emb * anc_mask).sum(dim=-2) * anc_count.rsqrt()
+        return leaf + anc
 
     @property
     def weight(self) -> torch.Tensor:
@@ -391,7 +452,9 @@ class AtomEmbedding(nn.Module):
         anc_ids = self.ancestor_ids[atoms]
         anc_emb = self.ancestor_embedding(anc_ids)
         anc_mask = (anc_ids != 0).to(anc_emb.dtype).unsqueeze(-1)
-        return leaf + (anc_emb * anc_mask).sum(dim=-2)
+        anc_count = anc_mask.sum(dim=-2).clamp(min=1.0)
+        anc = (anc_emb * anc_mask).sum(dim=-2) * anc_count.rsqrt()
+        return leaf + anc
 
 
 def _log1p_signed(z: torch.Tensor) -> torch.Tensor:
@@ -514,10 +577,14 @@ class MarkedTPPHead(nn.Module):
         self,
         dim: int,
         n_marks: int,
-        embed_module: "AtomEmbedding",
+        embed_module: AtomEmbedding,
         n_mix: int = 8,
         time_dim: int = 32,
         sampled_mark_negatives: int = 4096,
+        exact_mark_loss_weight: float = 0.1,
+        exact_mark_loss_max_tokens: int = 256,
+        mark_z_loss_weight: float = 1e-4,
+        mark_z_loss_max_tokens: int = 256,
     ):
         super().__init__()
         assert time_dim % 2 == 0
@@ -527,6 +594,10 @@ class MarkedTPPHead(nn.Module):
         self.n_marks = n_marks
         self.n_mix = n_mix
         self.sampled_mark_negatives = sampled_mark_negatives
+        self.exact_mark_loss_weight = float(exact_mark_loss_weight)
+        self.exact_mark_loss_max_tokens = int(exact_mark_loss_max_tokens)
+        self.mark_z_loss_weight = float(mark_z_loss_weight)
+        self.mark_z_loss_max_tokens = int(mark_z_loss_max_tokens)
         self.time_proj = nn.Linear(dim, 3 * n_mix)
         self.mark_h_proj = nn.Linear(dim, dim, bias=False)
         self.mark_time_proj = nn.Linear(time_dim, dim, bias=False)
@@ -610,14 +681,33 @@ class MarkedTPPHead(nn.Module):
         return embed.effective_weight()
 
     def mark_log_probs(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-        return self.mark_logits(hidden, delta_t).log_softmax(dim=-1)
+        logits = self.mark_logits(hidden, delta_t).float()
+        logits[:, 0] = float("-inf")
+        return logits.log_softmax(dim=-1)
 
     def mark_logits(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
         return self.mark_features(hidden, delta_t) @ self._output_weight().T
 
-    def sampled_mark_nll(self, hidden: torch.Tensor, delta_t: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _sample_logits(logits: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+        probs = logits.float().softmax(dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        total = probs.sum(dim=-1, keepdim=True)
+        if not torch.all(total > 0):
+            raise RuntimeError("cannot sample from logits with no finite probability mass")
+        probs = probs / total
+        return torch.multinomial(probs, 1, generator=generator).squeeze(-1)
+
+    def sampled_mark_nll(
+        self,
+        hidden: torch.Tensor,
+        delta_t: torch.Tensor,
+        target: torch.Tensor,
+        reduction: str = "sum",
+    ) -> torch.Tensor:
         if target.numel() == 0:
-            return hidden.sum() * 0.0
+            zero = hidden.sum() * 0.0
+            return zero if reduction != "none" else zero.expand(0)
         features = self.mark_features(hidden, delta_t)
         k = min(self.sampled_mark_negatives, max(self.n_marks - 1, 1))
         negatives = self._sample_mark_negatives(k)
@@ -632,7 +722,28 @@ class MarkedTPPHead(nn.Module):
         negative_logits = negative_logits - (k * q_neg).log().to(negative_logits.dtype)
         logits = torch.cat([target_logits, negative_logits], dim=-1).float()
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-        return F.cross_entropy(logits, labels, reduction="sum")
+        return F.cross_entropy(logits, labels, reduction=reduction)
+
+    def exact_mark_nll(
+        self,
+        hidden: torch.Tensor,
+        delta_t: torch.Tensor,
+        target: torch.Tensor,
+        reduction: str = "sum",
+    ) -> torch.Tensor:
+        if target.numel() == 0:
+            zero = hidden.sum() * 0.0
+            return zero if reduction != "none" else zero.expand(0)
+        logits = self.mark_logits(hidden, delta_t).float()
+        logits[:, 0] = float("-inf")
+        return F.cross_entropy(logits, target.long(), reduction=reduction)
+
+    def mark_z_loss(self, hidden: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+        if hidden.numel() == 0 or self.mark_z_loss_weight <= 0.0:
+            return hidden.sum() * 0.0
+        logits = self.mark_logits(hidden, delta_t).float()
+        z = logits[:, 1:].logsumexp(dim=-1)
+        return z.pow(2).mean()
 
     @torch.no_grad()
     def sample(self, hidden: torch.Tensor, generator: torch.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -648,7 +759,7 @@ class MarkedTPPHead(nn.Module):
         # log_sigma is already clamped to [-5, 5] inside time_params; nan_to_num
         # belt-and-suspenders for the NaN case (clamp doesn't sanitize NaN).
         log_sigma = torch.nan_to_num(log_sigma, nan=0.0)
-        k = torch.distributions.Categorical(logits=log_w).sample()
+        k = self._sample_logits(log_w, generator)
         mu_k = mu.gather(-1, k.unsqueeze(-1)).squeeze(-1)
         sigma_k = log_sigma.gather(-1, k.unsqueeze(-1)).squeeze(-1).exp()
         noise = torch.randn(mu_k.shape, generator=generator, device=mu_k.device, dtype=mu_k.dtype)
@@ -666,7 +777,7 @@ class MarkedTPPHead(nn.Module):
         mark_logits = self.mark_logits(hidden, delta_t).clone()
         mark_logits = torch.nan_to_num(mark_logits, nan=-1e4, posinf=1e4, neginf=-1e4)
         mark_logits[..., 0] = float("-inf")
-        mark = torch.distributions.Categorical(logits=mark_logits).sample()
+        mark = self._sample_logits(mark_logits, generator)
         return delta_t, mark
 
 
@@ -689,12 +800,41 @@ class GenterpConfig:
     value_head_hidden: int = 64
     value_head_df: float = 4.0
     sampled_mark_negatives: int = 4096
+    exact_mark_loss_weight: float = 0.1
+    exact_mark_loss_max_tokens: int = 256
+    mark_z_loss_weight: float = 1e-4
+    mark_z_loss_max_tokens: int = 256
+    min_time_delta_days: float = 1e-4
     # Hierarchical embedding: number of distinct ancestor *nodes* across the
     # vocabulary (excluding the pad row at index 0). 0 keeps the flat path —
     # ancestor_embedding is a single zero row that's never indexed. Fixed at
     # construction time so checkpoints round-trip cleanly; flipping it on for
     # an existing run is a vocab-class change and forces optimizer rebuild.
     n_ancestor_rows: int = 0
+    # Width of the per-atom ancestor closure (the ``max_anc`` axis of
+    # ``ancestor_ids``). Carried in the config so the persistent buffer is
+    # constructed at the saved width and HF ``from_pretrained`` shape-checks
+    # pass. Refreshed from ``ancestors.npz`` at train-time before model
+    # construction. 0 keeps the flat path; the buffer is then (n_atoms, 0).
+    n_ancestor_cols: int = 0
+    # Bag-NLL auxiliary loss over same-time atom sets. Same-timestamp atoms
+    # in OMOP have no semantic ordering, but the AR mark loss for any
+    # intra-group transition asks the model to predict an arbitrary
+    # serialization of co-occurring labs, diagnoses, etc. This loss reuses the
+    # existing mark projection weights to score the next time-group's atom set;
+    # it does not add another prediction head.
+    bag_loss_weight: float = 0.0
+    bag_loss_negatives: int = 256
+    # Per-subject loss normalization (off by default).
+    # False = event-weighted: every emitted token contributes equally to the
+    # loss, so high-utilizer subjects (many events in window) dominate the
+    # gradient. True = subject-weighted: within each subject, token losses are
+    # averaged first; then those per-subject means are averaged across the
+    # batch. Heavy utilizers no longer dwarf typical patients in the gradient.
+    # Applied uniformly to time, mark, value, and censor heads. Eval metrics
+    # still report the event-weighted means under the same names so curves are
+    # comparable to prior runs; the change is to ``loss`` only.
+    per_subject_loss_norm: bool = False
 
 
 class Genterp(nn.Module):
@@ -708,6 +848,7 @@ class Genterp(nn.Module):
             cfg.dim,
             padding_idx=cfg.pad_atom_idx,
             n_ancestor_rows=cfg.n_ancestor_rows,
+            n_ancestor_cols=cfg.n_ancestor_cols,
         )
         self.sex_embedding = nn.Embedding(cfg.n_sexes, cfg.dim)
         nn.init.normal_(self.sex_embedding.weight, std=0.02)
@@ -715,7 +856,7 @@ class Genterp(nn.Module):
         self.static_encoder = SetTransformer(cfg.dim, cfg.n_heads, cfg.n_static_blocks, cfg.k_static_summary, cfg.mlp_mult)
         self.rope = ContinuousTimeRoPE(cfg.dim // cfg.n_heads)
         self.blocks = nn.ModuleList(
-            Block(cfg.dim, cfg.n_heads, self.rope, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
+            Block(cfg.dim, cfg.n_heads, self.rope, cfg.n_layers, cfg.mlp_mult, cfg.dropout) for _ in range(cfg.n_layers)
         )
         self.norm = RMSNorm(cfg.dim)
         self.tpp = MarkedTPPHead(
@@ -725,6 +866,10 @@ class Genterp(nn.Module):
             cfg.n_time_mix,
             cfg.time_phi_dim,
             cfg.sampled_mark_negatives,
+            cfg.exact_mark_loss_weight,
+            cfg.exact_mark_loss_max_tokens,
+            cfg.mark_z_loss_weight,
+            cfg.mark_z_loss_max_tokens,
         )
         self.value_head = ValueHead(cfg.dim, cfg.value_head_hidden, cfg.value_head_df)
         self._static_mask_cache: dict[tuple[int, int, str, int | None], torch.Tensor] = {}
@@ -806,6 +951,9 @@ class Genterp(nn.Module):
         event_values: torch.Tensor,
         **batch,
     ) -> dict[str, torch.Tensor]:
+        # Pop bag-loss inputs before passing the rest to ``forward``; they
+        # are only consumed by the loss path, not by the encoder.
+        event_groups = batch.pop("event_groups", None)
         out = self.forward(
             event_ages=event_ages,
             event_pad=event_pad,
@@ -824,7 +972,106 @@ class Genterp(nn.Module):
             event_values,
             event_pad,
             censor_age,
+            self.cfg.min_time_delta_days,
+            event_groups=event_groups,
+            bag_loss_weight=self.cfg.bag_loss_weight,
+            bag_loss_negatives=self.cfg.bag_loss_negatives,
+            pad_atom_idx=self.cfg.pad_atom_idx,
+            per_subject_norm=self.cfg.per_subject_loss_norm,
         )
+
+
+def bag_nll_same_time(
+    hidden: torch.Tensor,
+    event_atoms: torch.Tensor,
+    event_groups: torch.Tensor,
+    event_pad: torch.Tensor,
+    output_weight: torch.Tensor,
+    mark_noise_probs: torch.Tensor,
+    n_negatives: int,
+    pad_atom_idx: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sampled multi-label BCE over same-time atom sets.
+
+    For each (subject, group) transition g → g+1, the predictor is the hidden
+    state at the last position of group g, and the bag target is the set of
+    atoms in group g+1. Loss = -Σ_pos log σ(h·e_pos) - Σ_neg log(1 - σ(h·e_neg))
+    with k unigram-sampled negatives shared across predictors (de-duplicated
+    against actual positives so a sampled "negative" that's really in the bag
+    isn't penalized).
+
+    Returns ``(per-predictor loss, n_predictors)``. ``loss`` is 0 (with a
+    differentiable zero) when no group transitions exist in the batch.
+    """
+    B, T = event_atoms.shape
+    zero_loss = hidden.sum() * 0.0
+    zero_count = hidden.new_tensor(0, dtype=torch.long)
+    if T < 2 or hidden.numel() == 0:
+        return zero_loss, zero_count
+    real = (~event_pad) & (event_groups >= 0) & (event_atoms != pad_atom_idx)
+    # Boundary at (b, s): real[s] & real[s+1] & groups[s] != groups[s+1].
+    boundary = torch.zeros_like(real)
+    boundary[:, :-1] = (
+        real[:, :-1]
+        & real[:, 1:]
+        & (event_groups[:, 1:] != event_groups[:, :-1])
+    )
+    pred_b, pred_s = boundary.nonzero(as_tuple=True)
+    P = pred_b.numel()
+    if P == 0:
+        return zero_loss, zero_count
+    h_pred = hidden[pred_b, pred_s]  # (P, d)
+
+    # Map each atom at (b, t) with group >= 1 to its predictor index.
+    # Predictors are listed in (b ascending, s ascending) order — same as
+    # the natural row-major flatten that ``nonzero`` returns. Within a row
+    # the (g-1)-th boundary is the predictor for group g.
+    valid_atom = real & (event_groups >= 1)
+    atom_b, atom_t = valid_atom.nonzero(as_tuple=True)
+    if atom_b.numel() == 0:
+        return zero_loss, zero_count
+    atom_g = event_groups[atom_b, atom_t]  # (A,)
+    atom_ids = event_atoms[atom_b, atom_t].long()
+    boundaries_per_row = boundary.long().sum(dim=1)  # (B,)
+    row_offset = torch.zeros(B, dtype=torch.long, device=hidden.device)
+    if B > 1:
+        row_offset[1:] = boundaries_per_row[:-1].cumsum(0)
+    pred_idx = row_offset[atom_b] + (atom_g.long() - 1)
+    # Defensive clamp: any (b, t) whose predictor index escapes [0, P) would
+    # indicate a group-numbering bug upstream. Drop those rather than write
+    # past the end of h_pred.
+    keep = (pred_idx >= 0) & (pred_idx < P)
+    if not bool(keep.all()):
+        atom_ids = atom_ids[keep]
+        pred_idx = pred_idx[keep]
+    if atom_ids.numel() == 0:
+        return zero_loss, zero_count
+
+    # Positive logits and BCE.
+    pos_logits = (h_pred[pred_idx] * output_weight[atom_ids]).sum(dim=-1).float()
+    pos_loss = F.binary_cross_entropy_with_logits(
+        pos_logits, torch.ones_like(pos_logits), reduction="sum"
+    )
+
+    # Sampled negatives shared across predictors.
+    V = output_weight.shape[0]
+    k = max(1, min(n_negatives, V - 1))
+    neg_atoms = torch.multinomial(mark_noise_probs, k, replacement=True)
+    neg_logits = (h_pred @ output_weight[neg_atoms].T).float()  # (P, k)
+    # Unmask negatives that coincide with this predictor's actual positives
+    # so we don't penalize the model for predicting a true bag member.
+    eq = atom_ids.unsqueeze(1) == neg_atoms.unsqueeze(0)  # (A, k)
+    neg_mask = torch.ones_like(neg_logits, dtype=torch.bool)
+    if eq.any():
+        a_idx, j_idx = eq.nonzero(as_tuple=True)
+        neg_mask[pred_idx[a_idx], j_idx] = False
+    neg_bce = F.binary_cross_entropy_with_logits(
+        neg_logits, torch.zeros_like(neg_logits), reduction="none"
+    )
+    neg_loss = (neg_bce * neg_mask.float()).sum()
+
+    bag_loss = (pos_loss + neg_loss) / max(P, 1)
+    return bag_loss, hidden.new_tensor(P, dtype=torch.long)
 
 
 def marked_tpp_value_loss(
@@ -838,6 +1085,12 @@ def marked_tpp_value_loss(
     event_values: torch.Tensor,
     event_pad: torch.Tensor,
     censor_age: torch.Tensor,
+    min_time_delta_days: float,
+    event_groups: torch.Tensor | None = None,
+    bag_loss_weight: float = 0.0,
+    bag_loss_negatives: int = 256,
+    pad_atom_idx: int = 0,
+    per_subject_norm: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Joint NLL: marked-TPP (time + mark) + value (robust z-space density) + right-censoring.
 
@@ -850,9 +1103,11 @@ def marked_tpp_value_loss(
     target_real = target_atoms[:, 1:].clamp(min=0)
     value_real = event_values[:, 1:]
     real_mask = (~event_pad[:, :-1]) & (~event_pad[:, 1:])
+    time_real_mask = real_mask & (delta_real > float(min_time_delta_days))
     censor_mask = (~event_pad[:, :-1]) & event_pad[:, 1:]
-    any_mask = real_mask | censor_mask
+    any_mask = time_real_mask | censor_mask
     n_real = real_mask.sum()
+    n_time = time_real_mask.sum()
     n_censor = censor_mask.sum()
 
     delta_any = torch.where(real_mask, delta_real, delta_censor).clamp(min=1e-6)[any_mask]
@@ -864,7 +1119,7 @@ def marked_tpp_value_loss(
     z = (log_dt - mu) * inv_sigma
     time_ls = torch.logsumexp(log_w + _log_ndtr(-z), dim=-1)
 
-    real_any = real_mask[any_mask]
+    real_any = time_real_mask[any_mask]
     real_time_lp = time_lp[real_any]
     censor_time_ls = time_ls[~real_any]
 
@@ -872,12 +1127,27 @@ def marked_tpp_value_loss(
     n_mag = mag_mask.sum()
 
     delta_mark = delta_real.clamp(min=1e-6)[real_mask]
+    mark_hidden = h_pred[real_mask]
+    mark_target = target_real[real_mask]
     if tpp.training:
-        mark_loss = tpp.sampled_mark_nll(h_pred[real_mask], delta_mark, target_real[real_mask])
+        sampled_mark_loss = tpp.sampled_mark_nll(mark_hidden, delta_mark, mark_target)
+        rho = min(max(tpp.exact_mark_loss_weight, 0.0), 1.0)
+        if rho > 0.0 and mark_target.numel() > 0:
+            exact_tokens = min(max(tpp.exact_mark_loss_max_tokens, 1), mark_target.numel())
+            exact_mark_loss = tpp.exact_mark_nll(
+                mark_hidden[:exact_tokens],
+                delta_mark[:exact_tokens],
+                mark_target[:exact_tokens],
+            ) * (mark_target.numel() / exact_tokens)
+        else:
+            exact_mark_loss = sampled_mark_loss.detach() * 0.0
+        mark_loss = (1.0 - rho) * sampled_mark_loss + rho * exact_mark_loss
     else:
-        mark_log_probs = tpp.mark_log_probs(h_pred[real_mask], delta_mark)
-        mark_lp = torch.gather(mark_log_probs, -1, target_real[real_mask].unsqueeze(-1)).squeeze(-1)
+        sampled_mark_loss = h_pred.sum() * 0.0
+        mark_log_probs = tpp.mark_log_probs(mark_hidden, delta_mark)
+        mark_lp = torch.gather(mark_log_probs, -1, mark_target.unsqueeze(-1)).squeeze(-1)
         mark_loss = -mark_lp.sum()
+        exact_mark_loss = mark_loss
 
     leaf_mag = target_real[mag_mask]
     z_target = value_mod.z_score(leaf_mag, value_real[mag_mask])
@@ -890,25 +1160,130 @@ def marked_tpp_value_loss(
     time_loss = -real_time_lp.sum()
     censor_loss = -censor_time_ls.sum()
     time_nll = time_loss / n_real.clamp(min=1)
+    time_modeled_nll = time_loss / n_time.clamp(min=1)
     mark_nll = mark_loss / n_real.clamp(min=1)
+    sampled_mark_nll = sampled_mark_loss / n_real.clamp(min=1)
+    exact_mark_nll = exact_mark_loss / n_real.clamp(min=1)
     value_nll = value_loss / n_mag.clamp(min=1)
     censor_nll = censor_loss / n_censor.clamp(min=1)
-    # Each component is averaged over its own token population (n_real, n_real, n_mag, n_censor)
-    # before summing, so each per-token NLL contributes equally to the gradient. Pooling the raw
-    # sums over n_any would heavily underweight value (n_mag << n_real) and censor (one per subject).
-    total = time_nll + mark_nll + value_nll + censor_nll
+    n_real_f = n_real.clamp(min=1).float()
+    value_weight = (n_mag.float() / n_real_f).detach()
+    censor_weight = (n_censor.float() / n_real_f).detach()
+    if tpp.mark_z_loss_weight > 0.0 and mark_target.numel() > 0:
+        z_tokens = min(max(tpp.mark_z_loss_max_tokens, 1), mark_target.numel())
+        mark_z_loss = tpp.mark_z_loss(mark_hidden[:z_tokens], delta_mark[:z_tokens])
+    else:
+        mark_z_loss = hidden.sum() * 0.0
+    weighted_mark_z_loss = tpp.mark_z_loss_weight * mark_z_loss
+
+    # Same-time bag NLL (auxiliary, gated by config). When disabled (weight
+    # 0.0 or no event_groups in the batch) it short-circuits to a
+    # differentiable zero that contributes nothing to the gradient.
+    if bag_loss_weight > 0.0 and event_groups is not None:
+        bag_nll, n_bag_predictors = bag_nll_same_time(
+            hidden=hidden,
+            event_atoms=target_atoms,
+            event_groups=event_groups,
+            event_pad=event_pad,
+            output_weight=tpp._output_weight(),
+            mark_noise_probs=tpp.mark_noise_probs,
+            n_negatives=bag_loss_negatives,
+            pad_atom_idx=pad_atom_idx,
+        )
+    else:
+        bag_nll = hidden.sum() * 0.0
+        n_bag_predictors = hidden.new_tensor(0, dtype=torch.long)
+    weighted_bag_nll = float(bag_loss_weight) * bag_nll
+
+    if per_subject_norm:
+        # Subject-weighted total: avoid event-weighted aggregation that lets
+        # heavy utilizers (4096-event windows) dominate the gradient. For each
+        # subject in the batch we compute the mean per-token NLL of every head
+        # over the tokens that came from that subject, then average those
+        # subject-level means over subjects that emitted at least one token in
+        # the head. Diagnostic per-token means above are kept event-weighted so
+        # logged metrics remain directly comparable across reduction modes.
+        B = real_mask.shape[0]
+        device = hidden.device
+        b_grid = torch.arange(B, device=device).unsqueeze(1).expand_as(real_mask)
+        b_idx_any = b_grid[any_mask]
+        b_idx_real_time = b_idx_any[real_any]
+        b_idx_censor = b_idx_any[~real_any]
+        b_idx_mark = b_grid[real_mask]
+        b_idx_mag = b_grid[mag_mask]
+
+        def _per_subject_mean(token_loss: torch.Tensor, b_idx: torch.Tensor) -> torch.Tensor:
+            if token_loss.numel() == 0:
+                return hidden.sum() * 0.0
+            sums = hidden.new_zeros(B, dtype=torch.float32).scatter_add_(
+                0, b_idx, token_loss.float()
+            )
+            counts = hidden.new_zeros(B, dtype=torch.float32).scatter_add_(
+                0, b_idx, torch.ones_like(token_loss, dtype=torch.float32)
+            )
+            active = counts > 0
+            if not bool(active.any()):
+                return hidden.sum() * 0.0
+            return (sums[active] / counts[active].clamp(min=1.0)).mean().to(hidden.dtype)
+
+        time_total = _per_subject_mean(-real_time_lp, b_idx_real_time)
+        censor_total = _per_subject_mean(-censor_time_ls, b_idx_censor)
+
+        # Mark: rebuild per-token NLL. The exact-mark refinement is sampled
+        # over only the first ``exact_tokens`` mark targets, which has no
+        # well-defined per-subject decomposition (it's a bias correction on
+        # the global sum). Under per-subject normalization we therefore
+        # restrict the mark loss to the sampled-softmax NLL, which is the
+        # dominant term anyway. The exact_mark log metric is still reported.
+        if mark_target.numel() > 0:
+            if tpp.training:
+                mark_token_loss = tpp.sampled_mark_nll(mark_hidden, delta_mark, mark_target, reduction="none")
+            else:
+                mark_token_loss = -mark_lp
+            mark_total = _per_subject_mean(mark_token_loss, b_idx_mark)
+        else:
+            mark_total = hidden.sum() * 0.0
+
+        if n_mag.item() > 0:
+            value_total = _per_subject_mean(value_nll_tokens, b_idx_mag)
+        else:
+            value_total = hidden.sum() * 0.0
+        # Value/censor heads contribute proportionally to how often their
+        # tokens appear per-subject. Re-use the event-weighted weights so the
+        # multi-head balance does not change between reduction modes.
+        total = (
+            time_total
+            + mark_total
+            + value_weight * value_total
+            + censor_weight * censor_total
+            + weighted_mark_z_loss
+            + weighted_bag_nll
+        )
+    else:
+        total = time_nll + mark_nll + value_weight * value_nll + censor_weight * censor_nll + weighted_mark_z_loss + weighted_bag_nll
 
     return {
         "loss": total,
         "time_nll": time_nll,
+        "time_modeled_nll": time_modeled_nll,
         "mark_nll": mark_nll,
+        "sampled_mark_nll": sampled_mark_nll,
+        "exact_mark_nll": exact_mark_nll,
+        "mark_z_loss": mark_z_loss,
+        "weighted_mark_z_loss": weighted_mark_z_loss,
         "value_nll": value_nll,
         "value_nll_max": value_nll_max,
         "value_z_abs_max": value_z_abs_max,
         "value_z_clipped": value_z_clipped,
         "censor_nll": censor_nll,
         "n_real": n_real,
+        "n_time": n_time,
         "n_censor": n_censor,
         "n_mag": n_mag,
+        "value_loss_weight": value_weight,
+        "censor_loss_weight": censor_weight,
+        "bag_nll": bag_nll,
+        "weighted_bag_nll": weighted_bag_nll,
+        "n_bag_predictors": n_bag_predictors,
         "n_subject": hidden.new_tensor(hidden.shape[0]),
     }

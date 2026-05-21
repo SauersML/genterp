@@ -123,6 +123,23 @@ def _best_cuda_device(props: list[Any]) -> int:
     return max(range(len(props)), key=lambda index: _cuda_score(index, props[index]))
 
 
+def _distributed_world_size() -> int:
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        return 1
+
+
+def _distributed_local_rank() -> int | None:
+    raw = os.environ.get("LOCAL_RANK")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _cuda_dataloader_workers(active_device_count: int) -> int:
     cpu_count = os.cpu_count() or 8
     if active_device_count > 1:
@@ -165,8 +182,10 @@ def get_torch_runtime() -> TorchRuntime:
         if device_count <= 0:
             return _non_cuda_runtime()
         all_props = [torch.cuda.get_device_properties(index) for index in range(device_count)]
-        use_data_parallel = _cuda_devices_are_homogeneous(all_props)
-        device_index = 0 if use_data_parallel else _best_cuda_device(all_props)
+        local_rank = _distributed_local_rank()
+        distributed = local_rank is not None and _distributed_world_size() > 1
+        use_data_parallel = False if distributed else _cuda_devices_are_homogeneous(all_props)
+        device_index = (local_rank % device_count) if distributed else 0 if use_data_parallel else _best_cuda_device(all_props)
         torch.cuda.set_device(device_index)
         props: Any = all_props[device_index]
         capability = _cuda_capability(device_index, props)
@@ -283,10 +302,14 @@ def accelerator_label(runtime: TorchRuntime) -> str:
     if runtime.device.type != "cuda":
         return runtime.device.type
     capability = runtime.cuda_capability or (0, 0)
+    if _distributed_world_size() > 1:
+        strategy = "ddp"
+    else:
+        strategy = "data_parallel" if runtime.use_data_parallel else "single_gpu"
     return (
         f"{runtime.device.type}:{runtime.device.index} {runtime.cuda_name} "
         f"cc={capability[0]}.{capability[1]} visible_gpus={runtime.cuda_device_count} "
-        f"strategy={'data_parallel' if runtime.use_data_parallel else 'single_gpu'}"
+        f"strategy={strategy}"
     )
 
 

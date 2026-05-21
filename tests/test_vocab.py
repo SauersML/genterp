@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from genterp.vocab import collapse_vocabulary
+from genterp.vocab import build_atom_registry, collapse_targets, collapse_vocabulary, materialize_atom_indices
 
 
 def test_high_count_leaf_keeps_specificity():
@@ -76,3 +76,26 @@ def test_dense_atoms():
     coverage = {"A": 1000, "B": 1000, "C": 1000}
     atom_idx = collapse_vocabulary(own, coverage, {}, threshold=500)
     assert sorted(atom_idx.values()) == [1, 2, 3]
+
+
+def test_atom_registry_preserves_shared_ids_and_appends_new_atoms():
+    old_registry = {"B": 1, "D": 2}
+    new_registry = build_atom_registry(["A", "B", "C"], old_registry)
+
+    assert new_registry["B"] == 1
+    assert new_registry["D"] == 2
+    assert new_registry["A"] == 3
+    assert new_registry["C"] == 4
+
+
+def test_collapse_materializes_ids_from_registry_not_sorted_order():
+    old_registry = {"Z": 1}
+    own = {"A": 1000, "Z": 1000}
+    coverage = {"A": 1000, "Z": 1000}
+    targets = collapse_targets(own, coverage, {}, threshold=500)
+    registry = build_atom_registry(targets.values(), old_registry)
+
+    atom_idx = materialize_atom_indices(targets, registry)
+
+    assert atom_idx["Z"] == 1
+    assert atom_idx["A"] == 2

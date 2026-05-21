@@ -30,6 +30,32 @@ def _batch_with_length(n_atoms: int, *, seed: int = 0) -> dict:
     return batch
 
 
+def _extend_batch(b: dict, new_atom: torch.Tensor, new_age: torch.Tensor, advance_mask: torch.Tensor | None = None) -> dict:
+    B = int(b["event_atoms"].shape[0])
+    if advance_mask is None:
+        advance_mask = torch.ones(B, dtype=torch.bool)
+    new = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b.items()}
+    zeros_long = torch.zeros(B, 1, dtype=torch.long)
+    zeros_f = torch.zeros(B, 1, dtype=torch.float32)
+    nan_f = torch.full((B, 1), float("nan"))
+    true_pad = torch.ones(B, 1, dtype=torch.bool)
+    new["event_atoms"] = torch.cat([new["event_atoms"], zeros_long], dim=1)
+    new["target_atoms"] = torch.cat([new["target_atoms"], zeros_long], dim=1)
+    new["event_ages"] = torch.cat([new["event_ages"], zeros_f], dim=1)
+    new["event_values"] = torch.cat([new["event_values"], nan_f], dim=1)
+    new["event_pad"] = torch.cat([new["event_pad"], true_pad], dim=1)
+
+    old_len = new["length"]
+    rows = torch.arange(B)[advance_mask]
+    insert = old_len[advance_mask].view(-1, 1)
+    new["event_atoms"][rows, insert.squeeze(1)] = new_atom[advance_mask]
+    new["target_atoms"][rows, insert.squeeze(1)] = new_atom[advance_mask]
+    new["event_ages"][rows, insert.squeeze(1)] = new_age[advance_mask]
+    new["event_pad"][rows, insert.squeeze(1)] = False
+    new["length"] = old_len + advance_mask.long()
+    return new
+
+
 def _h_last_from_forward(model: Genterp, batch: dict) -> torch.Tensor:
     out = model(**batch)
     hidden = out["hidden"]
@@ -68,33 +94,6 @@ def test_decode_step_matches_extended_forward():
     extra_marks_step2 = torch.tensor([7, 4, 6, 3][:B], dtype=torch.long)[:B]
     extra_dt_step2 = torch.tensor([1.1, 4.0, 2.7, 0.5][:B], dtype=torch.float32)[:B]
 
-    # Reference: extend the batch by both new events and run a fresh forward.
-    def _extend(b: dict, new_atom: torch.Tensor, new_dt: torch.Tensor) -> dict:
-        new = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b.items()}
-        T = new["event_atoms"].shape[1]
-        new_T = T + 1
-        zeros_long = torch.zeros(B, 1, dtype=torch.long)
-        zeros_f = torch.zeros(B, 1, dtype=torch.float32)
-        nan_f = torch.full((B, 1), float("nan"))
-        true_pad = torch.ones(B, 1, dtype=torch.bool)
-        new["event_atoms"] = torch.cat([new["event_atoms"], zeros_long], dim=1)
-        new["target_atoms"] = torch.cat([new["target_atoms"], zeros_long], dim=1)
-        new["event_ages"] = torch.cat([new["event_ages"], zeros_f], dim=1)
-        new["event_values"] = torch.cat([new["event_values"], nan_f], dim=1)
-        new["event_pad"] = torch.cat([new["event_pad"], true_pad], dim=1)
-        del new_T  # silence
-        # Insert per-row at position length[r].
-        old_len = new["length"]
-        insert = old_len.clamp(min=0).view(-1, 1)
-        prev_age = new["event_ages"].gather(1, (old_len.clamp(min=1) - 1).view(-1, 1))
-        absolute_new_age = prev_age.squeeze(1) + new_dt
-        new["event_atoms"].scatter_(1, insert, new_atom.view(-1, 1))
-        new["target_atoms"].scatter_(1, insert, new_atom.view(-1, 1))
-        new["event_ages"].scatter_(1, insert, absolute_new_age.view(-1, 1))
-        new["event_pad"].scatter_(1, insert, torch.zeros(B, 1, dtype=torch.bool))
-        new["length"] = old_len + 1
-        return new
-
     with torch.no_grad():
         h0_forward = _h_last_from_forward(model, batch)
         h_init_decode, cache = decode_init(model, batch)
@@ -106,16 +105,46 @@ def test_decode_step_matches_extended_forward():
         ).squeeze(1)
         new_age1 = prev_age + extra_dt_step1
         h_step1 = decode_step(model, cache, extra_marks_step1, new_age1)
-        batch1 = _extend(batch, extra_marks_step1, extra_dt_step1)
+        batch1 = _extend_batch(batch, extra_marks_step1, new_age1)
         h1_forward = _h_last_from_forward(model, batch1)
         torch.testing.assert_close(h_step1, h1_forward, rtol=1e-4, atol=1e-4)
 
         # Step 2
         new_age2 = new_age1 + extra_dt_step2
         h_step2 = decode_step(model, cache, extra_marks_step2, new_age2)
-        batch2 = _extend(batch1, extra_marks_step2, extra_dt_step2)
+        batch2 = _extend_batch(batch1, extra_marks_step2, new_age2)
         h2_forward = _h_last_from_forward(model, batch2)
         torch.testing.assert_close(h_step2, h2_forward, rtol=1e-4, atol=1e-4)
+
+
+def test_decode_step_matches_forward_with_variable_length_batch():
+    torch.manual_seed(11)
+    cfg = tiny_config()
+    model = Genterp(cfg).eval()
+    batch = _batch_with_length(n_atoms=cfg.n_atoms, seed=12)
+    B, T = batch["event_atoms"].shape
+    assert B >= 2 and T >= 5
+    batch["length"] = torch.tensor([3, 5], dtype=torch.long)
+    for key in ("event_atoms", "target_atoms"):
+        batch[key][0, 3:] = 0
+    batch["event_ages"][0, 3:] = 0.0
+    batch["event_values"][0, 3:] = float("nan")
+    batch["event_pad"][0, 3:] = True
+    batch["event_pad"][1, :5] = False
+    batch["event_pad"][1, 5:] = True
+
+    marks = torch.tensor([9, 10], dtype=torch.long)
+    prev_age = batch["event_ages"].gather(
+        1, (batch["length"].clamp(min=1) - 1).view(-1, 1)
+    ).squeeze(1)
+    new_age = prev_age + torch.tensor([2.0, 3.0])
+
+    with torch.no_grad():
+        _h0, cache = decode_init(model, batch)
+        h_step = decode_step(model, cache, marks, new_age)
+        h_forward = _h_last_from_forward(model, _extend_batch(batch, marks, new_age))
+
+    torch.testing.assert_close(h_step, h_forward, rtol=1e-4, atol=1e-4)
 
 
 def test_rollout_multi_horizon_snapshot_is_cumulative():
@@ -123,7 +152,7 @@ def test_rollout_multi_horizon_snapshot_is_cumulative():
     H1 < H2 < H3 should be counted at all three horizon snapshots, not just
     the one closest in age. Catches an off-by-one in the horizon-mask logic.
     """
-    from genterp.eval_rollout import _rollout_subject_batch, _build_atom_to_disease
+    from genterp.eval_rollout import _rollout_subject_batch
 
     torch.manual_seed(3)
     cfg = tiny_config()
@@ -154,6 +183,10 @@ def test_rollout_multi_horizon_snapshot_is_cumulative():
 
     # Cap a single subject so n_chains×B stays small.
     one_subject_batch = {k: (v[:1] if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] >= 1 else v) for k, v in batch.items()}
+    last_age = one_subject_batch["event_ages"].gather(
+        1, (one_subject_batch["length"].clamp(min=1) - 1).view(-1, 1)
+    ).squeeze(1)
+    one_subject_batch["landmark_age"] = last_age + 1.0
     horizon_offsets = (365.25, 5 * 365.25, 10 * 365.25)
 
     risk = _rollout_subject_batch(
@@ -168,11 +201,58 @@ def test_rollout_multi_horizon_snapshot_is_cumulative():
     assert risk.shape == (1, 3, 1)
     # Cumulative: longer horizons can only have ≥ risk than shorter ones.
     risks_per_horizon = risk[0, :, 0].cpu().tolist()
-    for short, longer in zip(risks_per_horizon, risks_per_horizon[1:]):
+    for short, longer in zip(risks_per_horizon[:-1], risks_per_horizon[1:], strict=True):
         assert longer >= short - 1e-6, (
             f"risk at longer horizon must be ≥ shorter (got {risks_per_horizon})"
         )
     _ = B  # silence
+
+
+def test_rollout_counts_hits_from_landmark_not_last_prefix_event():
+    from genterp.eval_rollout import _rollout_subject_batch
+
+    torch.manual_seed(13)
+    cfg = tiny_config()
+    model_inner = Genterp(cfg).eval()
+
+    class _Wrapper:
+        def __init__(self, inner):
+            self.model = inner
+            self.training = False
+
+    model = _Wrapper(model_inner)
+    batch = _batch_with_length(n_atoms=cfg.n_atoms, seed=14)
+    one_subject_batch = {
+        k: (v[:1].clone() if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] >= 1 else v)
+        for k, v in batch.items()
+    }
+    last_age = one_subject_batch["event_ages"].gather(
+        1, (one_subject_batch["length"].clamp(min=1) - 1).view(-1, 1)
+    ).squeeze(1)
+    one_subject_batch["landmark_age"] = last_age + 10.0
+
+    disease_atom = 3
+    atom_to_disease = torch.zeros(cfg.n_atoms, 1, dtype=torch.bool)
+    atom_to_disease[disease_atom, 0] = True
+
+    def sample(_hidden, generator=None):
+        del generator
+        return torch.full((1,), 5.0), torch.full((1,), disease_atom, dtype=torch.long)
+
+    model_inner.tpp.sample = sample  # type: ignore[method-assign]
+    risk = _rollout_subject_batch(
+        model,
+        one_subject_batch,
+        n_chains=1,
+        max_steps=1,
+        horizon_offsets_days=(20.0,),
+        atom_to_disease=atom_to_disease,
+        autocast_dtype=None,
+        device=torch.device("cpu"),
+    )
+
+    assert risk.shape == (1, 1, 1)
+    assert risk[0, 0, 0].item() == 0.0
 
 
 def test_decode_step_respects_advance_mask():

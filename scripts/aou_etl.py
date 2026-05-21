@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import polars as pl
 import psutil
 import pyarrow as pa
@@ -40,7 +41,7 @@ from google.cloud import bigquery, bigquery_storage, storage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genterp.progress import ProgressLogger
-from genterp.vocab import collapse_vocabulary
+from genterp.vocab import build_atom_registry, collapse_targets, materialize_atom_indices, validate_atom_registry
 
 
 _PROC = psutil.Process()
@@ -480,6 +481,7 @@ def _stream_query_to_parquet(client: bigquery.Client, sql: str, label: str, out_
 
 THRESHOLD = 500
 TEST_SPLIT_PERCENT = 20
+VALIDATION_SPLIT_PERCENT = 10
 TINY_PERSON_MOD = 10  # --tiny samples 1 in N person_ids end-to-end
 TINY = False  # set by main() from --tiny; module-level so SQL builders read it
 
@@ -495,27 +497,59 @@ def _tiny_predicate(person_col: str) -> str:
 
 
 def split_for_subject(subject_id: int) -> str:
-    """Deterministic per-person 80/20 split, stable across CDR refreshes."""
+    """Deterministic per-person train/validation/test split, stable across CDR refreshes."""
     digest = hashlib.sha256(str(int(subject_id)).encode()).digest()
     bucket = int.from_bytes(digest[:8], "big") % 100
-    return "test" if bucket < TEST_SPLIT_PERCENT else "train"
+    if bucket < TEST_SPLIT_PERCENT:
+        return "test"
+    if bucket < TEST_SPLIT_PERCENT + VALIDATION_SPLIT_PERCENT:
+        return "validation"
+    return "train"
 
 # Tables whose only cid-bearing column is the *_concept_id and whose events
 # carry no associated value. Observation is handled separately so we can emit
 # both the question concept (observation_concept_id) AND the answer concept
 # (value_as_concept_id) — see _observation_events_sql below.
+#
+# The trailing int is the ``role`` enum carried into events.parquet. Roles
+# are how downstream code splits static-prefix tokens (demographic, race,
+# ethnicity, death) from event-stream tokens without falling back to the
+# ``delta_days <= 0.5`` heuristic. See ``ROLE_*`` constants below.
+ROLE_UNKNOWN = 255
+ROLE_CONDITION = 0
+ROLE_PROCEDURE = 1
+ROLE_VISIT = 2
+ROLE_DEVICE = 3
+ROLE_DRUG_INGREDIENT = 4
+ROLE_MEASUREMENT = 5
+ROLE_OBSERVATION_QUESTION = 6
+ROLE_OBSERVATION_ANSWER = 7
+ROLE_OBSERVATION_STRING = 8
+ROLE_DEATH = 9
+ROLE_DEMOGRAPHIC_RACE = 10
+ROLE_DEMOGRAPHIC_ETHNICITY = 11
+
+# Roles that must be routed to the static prefix regardless of timestamp.
+# Demographics are emitted at birth-time today, but the dataset should treat
+# them as static by *role*, not by ``delta_days <= 0.5`` — that heuristic
+# silently mis-buckets genuine neonatal clinical events.
+STATIC_ROLES = frozenset({
+    ROLE_DEMOGRAPHIC_RACE,
+    ROLE_DEMOGRAPHIC_ETHNICITY,
+})
+
 NON_DRUG_TABLES = [
-    ("condition_occurrence", "condition_concept_id", "condition_start_datetime"),
-    ("procedure_occurrence", "procedure_concept_id", "procedure_datetime"),
-    ("visit_occurrence", "visit_concept_id", "visit_start_datetime"),
-    ("device_exposure", "device_concept_id", "device_exposure_start_datetime"),
+    ("condition_occurrence", "condition_concept_id", "condition_start_datetime", ROLE_CONDITION),
+    ("procedure_occurrence", "procedure_concept_id", "procedure_datetime", ROLE_PROCEDURE),
+    ("visit_occurrence", "visit_concept_id", "visit_start_datetime", ROLE_VISIT),
+    ("device_exposure", "device_concept_id", "device_exposure_start_datetime", ROLE_DEVICE),
 ]
 
 
 def _cache_key(cdr: str) -> str:
     key = re.sub(r"[^A-Za-z0-9_.-]+", "_", cdr).strip("_")
     suffix = f"_tiny{TINY_PERSON_MOD}x" if TINY else ""
-    return f"{key}_threshold-{THRESHOLD}_values-v4{suffix}"
+    return f"{key}_threshold-{THRESHOLD}_values-v5{suffix}"
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -715,43 +749,91 @@ def _cache_json(path: Path, build: Callable[[], object]) -> object:
     return data
 
 
-def _non_drug_events_cte(cdr: str, with_time: bool) -> str:
-    sel = "person_id, {c} AS cid, {t} AS t" if with_time else "person_id, {c} AS cid"
+def _non_drug_events_cte(cdr: str, with_time: bool, with_role: bool = False) -> str:
+    """Combined non-drug, non-measurement, non-observation event stream.
+
+    ``with_time`` controls whether each row carries ``t`` (the source datetime).
+    ``with_role`` controls whether each row also carries the integer ``role``
+    enum (see ``ROLE_*`` constants). Coverage / own-counts callers never need
+    role — they only key on ``cid`` / ``code``. Event-emission callers do, so
+    role survives the UNION ALL into ``all_events.parquet`` and the final
+    DuckDB sort/dedup.
+    """
+    cols = "person_id, {c} AS cid"
+    if with_time:
+        cols += ", {t} AS t"
+    if with_role:
+        cols += ", {r} AS role"
     where = "{c} > 0 AND {t} IS NOT NULL" if with_time else "{c} > 0"
     tiny = _tiny_predicate("person_id")
     parts = [
-        f"SELECT {sel.format(c=col, t=tcol)} FROM `{cdr}.{tbl}` WHERE {where.format(c=col, t=tcol)}{tiny}"
-        for tbl, col, tcol in NON_DRUG_TABLES
+        f"SELECT {cols.format(c=col, t=tcol, r=role)} FROM `{cdr}.{tbl}` "
+        f"WHERE {where.format(c=col, t=tcol)}{tiny}"
+        for tbl, col, tcol, role in NON_DRUG_TABLES
     ]
     return "\n  UNION ALL ".join(parts)
 
 
+def _drug_ingredient_events_cte(cdr: str, with_time: bool) -> str:
+    """Drug event concept stream, shared by event emission and vocab counts.
+
+    Medication tokens are RxNorm ingredients, not source drug_concept_id rows.
+    Keep this helper as the single source of truth so coverage/own counts and
+    final emitted events stay in the same concept space.
+    """
+    time_col = ", de.drug_exposure_start_datetime AS t" if with_time else ""
+    time_filter = " AND de.drug_exposure_start_datetime IS NOT NULL" if with_time else ""
+    return f"""
+      SELECT de.person_id, ds.ingredient_concept_id AS cid{time_col}
+      FROM `{cdr}.drug_exposure` de
+      JOIN `{cdr}.drug_strength` ds ON ds.drug_concept_id = de.drug_concept_id
+      WHERE de.drug_concept_id > 0
+        AND ds.ingredient_concept_id > 0{time_filter}{_tiny_predicate("de.person_id")}
+    """
+
+
+def _normalized_observation_string_expr(alias: str = "o") -> str:
+    return f"TRIM(REGEXP_REPLACE(LOWER({alias}.value_as_string), r'\\s+', ' '))"
+
+
+def _safe_observation_string_predicate(value_expr: str) -> str:
+    return f"""
+      AND {value_expr} != ''
+      AND LENGTH({value_expr}) <= 64
+      AND NOT REGEXP_CONTAINS({value_expr}, r'@')
+      AND NOT REGEXP_CONTAINS({value_expr}, r'\\d{{7,}}')
+    """
+
+
 def _drug_events_sql(cdr: str) -> str:
     return f"""
+    WITH drug_ingredient_events AS (
+      {_drug_ingredient_events_cte(cdr, with_time=True)}
+    )
     SELECT
-      CAST(de.person_id AS INT64) AS subject_id,
-      UNIX_SECONDS(de.drug_exposure_start_datetime) AS time_seconds,
+      CAST(drug_ingredient_events.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(drug_ingredient_events.t) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
-      ds.ingredient_concept_id AS cid,
-      CAST(NULL AS FLOAT64) AS value
-    FROM `{cdr}.drug_exposure` de
-    JOIN `{cdr}.drug_strength` ds ON ds.drug_concept_id = de.drug_concept_id
-    JOIN `{cdr}.concept` c ON c.concept_id = ds.ingredient_concept_id
-    WHERE de.drug_concept_id > 0 AND de.drug_exposure_start_datetime IS NOT NULL{_tiny_predicate("de.person_id")}
+      drug_ingredient_events.cid AS cid,
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_DRUG_INGREDIENT} AS role
+    FROM drug_ingredient_events
+    JOIN `{cdr}.concept` c ON c.concept_id = drug_ingredient_events.cid
     """
 
 
 def _non_drug_events_sql(cdr: str) -> str:
     return f"""
     WITH events AS (
-      {_non_drug_events_cte(cdr, with_time=True)}
+      {_non_drug_events_cte(cdr, with_time=True, with_role=True)}
     )
     SELECT
       CAST(events.person_id AS INT64) AS subject_id,
       UNIX_SECONDS(events.t) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       events.cid AS cid,
-      CAST(NULL AS FLOAT64) AS value
+      CAST(NULL AS FLOAT64) AS value,
+      events.role AS role
     FROM events JOIN `{cdr}.concept` c ON c.concept_id = events.cid
     """
 
@@ -763,7 +845,8 @@ def _measurement_events_sql(cdr: str) -> str:
       UNIX_SECONDS(m.measurement_datetime) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       m.measurement_concept_id AS cid,
-      m.value_as_number AS value
+      m.value_as_number AS value,
+      {ROLE_MEASUREMENT} AS role
     FROM `{cdr}.measurement` m JOIN `{cdr}.concept` c ON c.concept_id = m.measurement_concept_id
     WHERE m.measurement_concept_id > 0 AND m.measurement_datetime IS NOT NULL{_tiny_predicate("m.person_id")}
     """
@@ -788,19 +871,31 @@ def _observation_string_value_events_sql(cdr: str) -> str:
     count clears the threshold — at AoU scale, Zip3 buckets and frequently-
     chosen "other" responses do. Rare strings get dropped.
     """
+    value_expr = _normalized_observation_string_expr("o")
+    safe_predicate = _safe_observation_string_predicate("n.normalized_value")
     return f"""
+    WITH normalized AS (
+      SELECT
+        o.person_id,
+        o.observation_datetime,
+        o.observation_concept_id,
+        {value_expr} AS normalized_value
+      FROM `{cdr}.observation` o
+      WHERE o.observation_concept_id > 0
+        AND o.observation_datetime IS NOT NULL
+        AND o.value_as_string IS NOT NULL{_tiny_predicate("o.person_id")}
+    )
     SELECT
-      CAST(o.person_id AS INT64) AS subject_id,
-      UNIX_SECONDS(o.observation_datetime) AS time_seconds,
-      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', o.value_as_string) AS code,
+      CAST(n.person_id AS INT64) AS subject_id,
+      UNIX_SECONDS(n.observation_datetime) AS time_seconds,
+      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', n.normalized_value) AS code,
       CAST(NULL AS INT64) AS cid,
-      CAST(NULL AS FLOAT64) AS value
-    FROM `{cdr}.observation` o
-    JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
-    WHERE o.observation_concept_id > 0
-      AND o.observation_datetime IS NOT NULL
-      AND o.value_as_string IS NOT NULL
-      AND o.value_as_string != ''{_tiny_predicate("o.person_id")}
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_OBSERVATION_STRING} AS role
+    FROM normalized n
+    JOIN `{cdr}.concept` c ON c.concept_id = n.observation_concept_id
+    WHERE n.observation_concept_id > 0
+      {safe_predicate}
     """
 
 
@@ -811,15 +906,27 @@ def _observation_string_value_counts_sql(cdr: str) -> str:
     synthesized code strings. Used to feed `collapse_vocabulary` so the
     threshold cut is applied consistently with the rest of the vocab.
     """
+    value_expr = _normalized_observation_string_expr("o")
+    safe_predicate = _safe_observation_string_predicate("n.normalized_value")
     return f"""
+    WITH normalized AS (
+      SELECT
+        o.person_id,
+        o.observation_datetime,
+        o.observation_concept_id,
+        {value_expr} AS normalized_value
+      FROM `{cdr}.observation` o
+      WHERE o.observation_concept_id > 0
+        AND o.observation_datetime IS NOT NULL
+        AND o.value_as_string IS NOT NULL{_tiny_predicate("o.person_id")}
+    )
     SELECT
-      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', o.value_as_string) AS code,
-      COUNT(DISTINCT o.person_id) AS n
-    FROM `{cdr}.observation` o
-    JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
-    WHERE o.observation_concept_id > 0
-      AND o.value_as_string IS NOT NULL
-      AND o.value_as_string != ''{_tiny_predicate("o.person_id")}
+      CONCAT(c.vocabulary_id, '/', c.concept_code, '=str:', n.normalized_value) AS code,
+      COUNT(DISTINCT n.person_id) AS n
+    FROM normalized n
+    JOIN `{cdr}.concept` c ON c.concept_id = n.observation_concept_id
+    WHERE n.observation_concept_id > 0
+      {safe_predicate}
     GROUP BY code
     """
 
@@ -844,7 +951,8 @@ def _observation_events_sql(cdr: str) -> str:
       UNIX_SECONDS(o.observation_datetime) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       o.observation_concept_id AS cid,
-      CAST(o.value_as_number AS FLOAT64) AS value
+      CAST(o.value_as_number AS FLOAT64) AS value,
+      {ROLE_OBSERVATION_QUESTION} AS role
     FROM `{cdr}.observation` o
     JOIN `{cdr}.concept` c ON c.concept_id = o.observation_concept_id
     WHERE o.observation_concept_id > 0 AND o.observation_datetime IS NOT NULL{_tiny_predicate("o.person_id")}
@@ -854,7 +962,8 @@ def _observation_events_sql(cdr: str) -> str:
       UNIX_SECONDS(o.observation_datetime) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       o.value_as_concept_id AS cid,
-      CAST(NULL AS FLOAT64) AS value
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_OBSERVATION_ANSWER} AS role
     FROM `{cdr}.observation` o
     JOIN `{cdr}.concept` c ON c.concept_id = o.value_as_concept_id
     WHERE o.value_as_concept_id IS NOT NULL AND o.value_as_concept_id > 0
@@ -898,7 +1007,8 @@ def _death_events_sql(cdr: str) -> str:
       UNIX_SECONDS(TIMESTAMP(r.death_date)) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       {death_concept} AS cid,
-      CAST(NULL AS FLOAT64) AS value
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_DEATH} AS role
     FROM ranked r
     JOIN `{cdr}.concept` c ON c.concept_id = {death_concept}
     WHERE r.row_num = 1
@@ -925,7 +1035,8 @@ def _demographics_events_sql(cdr: str) -> str:
       UNIX_SECONDS({birth_ts}) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       p.race_concept_id AS cid,
-      CAST(NULL AS FLOAT64) AS value
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_DEMOGRAPHIC_RACE} AS role
     FROM `{cdr}.person` p
     JOIN `{cdr}.concept` c ON c.concept_id = p.race_concept_id
     WHERE p.race_concept_id > 0{_tiny_predicate("p.person_id")}
@@ -935,7 +1046,8 @@ def _demographics_events_sql(cdr: str) -> str:
       UNIX_SECONDS({birth_ts}) AS time_seconds,
       CONCAT(c.vocabulary_id, '/', c.concept_code) AS code,
       p.ethnicity_concept_id AS cid,
-      CAST(NULL AS FLOAT64) AS value
+      CAST(NULL AS FLOAT64) AS value,
+      {ROLE_DEMOGRAPHIC_ETHNICITY} AS role
     FROM `{cdr}.person` p
     JOIN `{cdr}.concept` c ON c.concept_id = p.ethnicity_concept_id
     WHERE p.ethnicity_concept_id > 0{_tiny_predicate("p.person_id")}
@@ -963,7 +1075,7 @@ def _all_events_sql(cdr: str) -> str:
       UNION ALL ({_death_events_sql(cdr)})
       UNION ALL ({_demographics_events_sql(cdr)})
     )
-    SELECT subject_id, time_seconds, code, cid, value
+    SELECT subject_id, time_seconds, code, cid, value, role
     FROM events
     """
 
@@ -992,7 +1104,7 @@ def _coverage_sql(cdr: str) -> str:
     return f"""
     WITH events AS (
       {_non_drug_events_cte(cdr, with_time=False)}
-      UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
+      UNION ALL {_drug_ingredient_events_cte(cdr, with_time=False)}
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
       UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
       UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
@@ -1520,7 +1632,7 @@ def _own_counts_sql(cdr: str) -> str:
     return f"""
     WITH events AS (
       {_non_drug_events_cte(cdr, with_time=False)}
-      UNION ALL SELECT person_id, drug_concept_id AS cid FROM `{cdr}.drug_exposure` WHERE drug_concept_id > 0
+      UNION ALL {_drug_ingredient_events_cte(cdr, with_time=False)}
       UNION ALL SELECT person_id, measurement_concept_id AS cid FROM `{cdr}.measurement` WHERE measurement_concept_id > 0
       UNION ALL SELECT person_id, observation_concept_id AS cid FROM `{cdr}.observation` WHERE observation_concept_id > 0
       UNION ALL SELECT person_id, value_as_concept_id AS cid FROM `{cdr}.observation` WHERE value_as_concept_id IS NOT NULL AND value_as_concept_id > 0
@@ -1605,42 +1717,162 @@ def _duckdb_connection(cache_dir: Path, label: str) -> duckdb.DuckDBPyConnection
     return con
 
 
+VALUE_STATS_SHRINKAGE_KAPPA = 50.0
+
+
+def _train_subject_ids_parquet(all_events_path: Path, cache_dir: Path, source_key: str) -> Path:
+    """Materialize the train-split subject_id list to parquet for downstream JOINs.
+
+    Same SHA-256 / mod-100 recipe as :func:`split_for_subject`. We pre-filter
+    here (rather than computing the hash in SQL) because DuckDB's portable
+    hashing primitives don't reproduce hashlib.sha256 byte-for-byte, and we
+    want the value-stats split to be bit-identical to the subject split used
+    in subjects.parquet.
+    """
+    out_path = cache_dir / f"train_subject_ids-{source_key}.parquet"
+    if out_path.exists():
+        _log(f"cache hit:  {out_path.name} ({out_path.stat().st_size/1e6:.2f}MB)")
+        return out_path
+    _log(f"cache miss: {out_path.name}; enumerating distinct subject_ids")
+    con = _duckdb_connection(cache_dir, "train_subject_ids")
+    try:
+        sids_table = con.execute(
+            f"SELECT DISTINCT subject_id FROM read_parquet('{all_events_path.as_posix()}')"
+        ).fetch_arrow_table()
+    finally:
+        con.close()
+    sid_array = sids_table.column("subject_id").combine_chunks().to_numpy(zero_copy_only=False)
+    keep = np.fromiter(
+        (split_for_subject(int(s)) == "train" for s in sid_array),
+        dtype=bool,
+        count=len(sid_array),
+    )
+    train_ids = sid_array[keep]
+    table = pa.table({"subject_id": pa.array(train_ids)})
+    pq.write_table(table, out_path, compression="zstd")
+    _log(
+        f"cache write: {out_path.name} (train_subjects={len(train_ids):,} "
+        f"of total={len(sid_array):,}; {len(train_ids)/max(len(sid_array),1):.1%})"
+    )
+    return out_path
+
+
 def _cached_value_stats(
     all_events_path: Path,
     atom_idx: dict[str, int],
     cache_dir: Path,
     source_key: str,
     vocab_key: str,
+    shrinkage_kappa: float = VALUE_STATS_SHRINKAGE_KAPPA,
 ) -> dict[str, dict[str, float]]:
+    """Robust per-atom value stats: train-only median + 1.4826·MAD with shrinkage.
+
+    Three changes vs the AVG / STDDEV_SAMP version:
+
+      1. Train-only: rows from validation/test subjects are dropped before any
+         aggregation, so held-out NLL is computed against normalizers the
+         training data didn't see.
+      2. Robust: median is insensitive to long-tailed lab values; 1.4826·MAD
+         is the Gaussian-consistent scale (Var ≈ (1.4826·MAD)² for N(μ,σ²)),
+         and outliers no longer dominate σ̂.
+      3. Shrinkage: low-count atoms get pulled toward a global (median, MAD)
+         prior with weight κ. For κ = 50 an atom with n = 500 contributes
+         n/(n+κ) ≈ 0.91 of its own signal; an atom with n = 50 contributes
+         ~0.50. Without this, rare codes can land arbitrary μ̂/σ̂ from a
+         handful of observations.
+
+    All numeric work happens inside DuckDB on the train subset; the JSON
+    cache key is bumped to ``robust-v1`` so a stale AVG/STDDEV stats file
+    on disk won't be re-read.
+    """
+    train_ids_path = _train_subject_ids_parquet(all_events_path, cache_dir, source_key)
+
     def build() -> dict[str, dict[str, float]]:
         con = _duckdb_connection(cache_dir, "value_stats")
         try:
             t0 = time.monotonic()
-            rows = con.execute(
+            # filtered_events: train-split rows with finite numeric values.
+            # Materialized once so the per-code MEDIAN/MAD passes don't each
+            # re-scan all_events.parquet (a B+-row table). DuckDB respects
+            # the memory_limit set by _duckdb_connection and spills to the
+            # configured temp_directory if the materialized set is large.
+            con.execute(
                 f"""
-                SELECT code,
-                       AVG(value)         AS mu,
-                       STDDEV_SAMP(value) AS sigma,
-                       COUNT(*)           AS n
-                FROM read_parquet('{all_events_path.as_posix()}')
-                WHERE value IS NOT NULL
-                  AND value = value                 -- NaN check (NaN != NaN)
-                  AND ABS(value) < 1e308            -- ±inf check
+                CREATE TEMP TABLE filtered_events AS
+                SELECT e.code, e.value
+                FROM read_parquet('{all_events_path.as_posix()}') e
+                JOIN read_parquet('{train_ids_path.as_posix()}') t
+                  USING (subject_id)
+                WHERE e.value IS NOT NULL
+                  AND e.value = e.value
+                  AND ABS(e.value) < 1e308
+                """
+            )
+            (n_filt,) = con.execute("SELECT COUNT(*) FROM filtered_events").fetchone()
+            mu_global_row = con.execute("SELECT MEDIAN(value) FROM filtered_events").fetchone()
+            mu_global = float(mu_global_row[0] or 0.0)
+            mad_global_row = con.execute(
+                "SELECT MEDIAN(ABS(value - ?)) FROM filtered_events",
+                [mu_global],
+            ).fetchone()
+            sigma_global = max(1.4826 * float(mad_global_row[0] or 0.0), 1e-6)
+            con.execute(
+                f"""
+                CREATE TEMP TABLE code_med AS
+                SELECT code, MEDIAN(value) AS mu, COUNT(*) AS n
+                FROM filtered_events
                 GROUP BY code
                 HAVING COUNT(*) >= {THRESHOLD}
                 """
+            )
+            rows = con.execute(
+                """
+                SELECT m.code,
+                       m.mu,
+                       1.4826 * COALESCE(MEDIAN(ABS(f.value - m.mu)), 0.0) AS sigma_raw,
+                       m.n
+                FROM code_med m
+                JOIN filtered_events f USING (code)
+                GROUP BY m.code, m.mu, m.n
+                """
             ).fetchall()
-            _log(f"duckdb[value_stats] aggregated rows={len(rows):,} in {time.monotonic()-t0:.1f}s")
+            _log(
+                f"duckdb[value_stats] train_rows={int(n_filt):,} codes={len(rows):,} "
+                f"mu_global={mu_global:.3g} sigma_global={sigma_global:.3g} "
+                f"shrinkage_kappa={shrinkage_kappa} in {time.monotonic()-t0:.1f}s"
+            )
         finally:
             con.close()
-        return {
-            row[0]: {"mu": float(row[1]), "sigma": float(row[2] or 1.0)}
-            for row in rows
-            if row[0] in atom_idx
-        }
 
-    payload = _cache_json(cache_dir / f"value_stats-{source_key}-{vocab_key}.json", build)
-    return {str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])} for code, stats in payload.items()}
+        out: dict[str, dict[str, float]] = {}
+        for code, mu, sigma_raw, n in rows:
+            if code not in atom_idx:
+                continue
+            n_f = float(n)
+            mu_raw = float(mu)
+            sigma_clean = max(float(sigma_raw), 1e-6)
+            mu_shrunk = (n_f * mu_raw + shrinkage_kappa * mu_global) / (n_f + shrinkage_kappa)
+            var_shrunk = (
+                n_f * sigma_clean * sigma_clean
+                + shrinkage_kappa * sigma_global * sigma_global
+            ) / (n_f + shrinkage_kappa)
+            sigma_shrunk = max(var_shrunk**0.5, 1e-6)
+            out[code] = {
+                "mu": mu_shrunk,
+                "sigma": sigma_shrunk,
+                "mu_raw": mu_raw,
+                "sigma_raw": sigma_clean,
+                "n": int(n),
+            }
+        return out
+
+    payload = _cache_json(
+        cache_dir / f"value_stats-robust-v1-{source_key}-{vocab_key}.json", build
+    )
+    return {
+        str(code): {"mu": float(stats["mu"]), "sigma": float(stats["sigma"])}
+        for code, stats in payload.items()
+    }
 
 
 FINAL_EVENTS_SHARDS = 128
@@ -1666,7 +1898,7 @@ def _build_final_events_with_duckdb(
          ``CAST(subject_id % K AS INTEGER)``. No ORDER BY — single linear pass,
          minimal spill. Output is K parquet directories.
 
-      2. For each shard k = 0..K-1, run an ORDER BY (subject_id, time_seconds)
+      2. For each shard k = 0..K-1, run an ORDER BY (subject_id, time_seconds, atom)
          over that shard alone. Each shard holds ~1/K of the data, so sort
          working set is ~30GB / K — fits in memory at K=128.
 
@@ -1717,6 +1949,7 @@ def _build_final_events_with_duckdb(
                        e.time_seconds,
                        am.atom AS atom,
                        e.value,
+                       CAST(e.role AS UTINYINT) AS role,
                        CAST(e.subject_id % {K} AS INTEGER) AS shard
                 FROM read_parquet('{all_events_path.as_posix()}') e
                 JOIN atom_map am USING (code)
@@ -1749,13 +1982,24 @@ def _build_final_events_with_duckdb(
             # combo drug row. After atom encoding those all share
             # (subject_id, time_seconds, atom). MAX(value) keeps the numeric
             # value if any row carried one (NULLs are ignored).
+            # ``MIN(role)`` deterministically picks a single role when the
+            # same (subject, time, atom) triple is asserted by more than one
+            # source. The role ordering puts the most specific source first
+            # (condition < procedure < ... < demographic), so the chosen role
+            # is the one we'd want a downstream model to see — e.g. an OMOP
+            # value_as_concept_id that coincidentally equals a measurement
+            # concept_id keeps the measurement role, not the answer role.
             con.execute(
                 f"""
                 COPY (
-                    SELECT subject_id, time_seconds, atom, MAX(value) AS value
+                    SELECT subject_id,
+                           time_seconds,
+                           atom,
+                           MAX(value) AS value,
+                           CAST(MIN(role) AS UTINYINT) AS role
                     FROM read_parquet({shard_list_sql})
                     GROUP BY subject_id, time_seconds, atom
-                    ORDER BY subject_id, time_seconds
+                    ORDER BY subject_id, time_seconds, role, atom
                 ) TO '{sorted_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """
             )
@@ -1863,13 +2107,16 @@ def main(argv: list[str] | None = None) -> None:
         f"unique concept_ids={len(own_by_cid):,} string_value_codes={len(string_value_counts):,}",
     )
 
-    _WORK.start_unit("collapse vocabulary", f"threshold={THRESHOLD:,}; resolving ancestors and concept codes if cache is cold")
-    vocab_cache = cache_dir / f"collapsed_vocab-{source_key}.json"
-    if vocab_cache.exists():
-        _log(f"vocab cache hit: {vocab_cache.name}; loading collapsed code-to-atom map")
-        atom_idx = {str(code): int(atom) for code, atom in json.loads(vocab_cache.read_text()).items()}
+    _WORK.start_unit(
+        "collapse vocabulary",
+        f"threshold={THRESHOLD:,}; resolving targets then applying append-only atom registry",
+    )
+    target_cache = cache_dir / f"collapsed_targets-{source_key}.json"
+    if target_cache.exists():
+        _log(f"target cache hit: {target_cache.name}; loading collapsed code-to-canonical-atom targets")
+        target_of = {str(code): str(target) for code, target in json.loads(target_cache.read_text()).items()}
     else:
-        _log("vocab cache miss; running coverage+ancestors queries and threshold collapse")
+        _log("target cache miss; running coverage+ancestors queries and threshold collapse")
         cov, anc = _cached_coverage_and_ancestors(client, cdr, list(own_by_cid), cache_dir)
         _log(f"coverage+ancestor payload ready: coverage_concepts={len(cov):,} descendant_maps={len(anc):,}")
 
@@ -1889,9 +2136,23 @@ def main(argv: list[str] | None = None) -> None:
             for d, ancs in anc.items() if d in code_of
         }
 
-        atom_idx = collapse_vocabulary(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
-        _log(f"collapsed vocab: atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
-        _write_json(vocab_cache, atom_idx)
+        target_of = collapse_targets(own_by_code, cov_by_code, anc_by_code, threshold=THRESHOLD)
+        _log(f"collapsed targets: atoms={len(set(target_of.values())):,} covered_codes={len(target_of):,}")
+        _write_json(target_cache, target_of)
+
+    registry_path = out_dir / "atom_registry.json"
+    existing_registry: dict[str, int] | None = None
+    if registry_path.exists():
+        existing_registry = {str(code): int(atom) for code, atom in json.loads(registry_path.read_text()).items()}
+        validate_atom_registry(existing_registry)
+        _log(f"atom registry loaded: atoms={len(existing_registry):,} max_id={max(existing_registry.values(), default=0):,}")
+    atom_registry = build_atom_registry(target_of.values(), existing_registry)
+    atom_idx = materialize_atom_indices(target_of, atom_registry)
+    _log(
+        f"stable atom registry applied: registry_atoms={len(atom_registry):,} "
+        f"active_atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}"
+    )
+    _write_json(registry_path, atom_registry)
     _write_json(out_dir / "vocab.json", atom_idx)
     _WORK.finish_unit("collapse vocabulary", f"atoms={len(set(atom_idx.values())):,} covered_codes={len(atom_idx):,}")
 
@@ -1936,7 +2197,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _WORK.start_unit(
         "compute per-atom value stats",
-        "DuckDB mean/stddev/count GROUP BY code with HAVING n>=THRESHOLD; spills to disk under PRAGMA memory_limit",
+        "DuckDB train-split median + 1.4826·MAD per code (HAVING n>=THRESHOLD) with global shrinkage; spills to disk under PRAGMA memory_limit",
     )
     vocab_key = _stable_json_fingerprint(atom_idx)
     stats = _cached_value_stats(all_events_path, atom_idx, cache_dir, source_key, vocab_key)
@@ -2034,7 +2295,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         .sort("subject_id")
     )
-    subjects_path = cache_dir / f"subjects-{source_key}-{vocab_key}-split{TEST_SPLIT_PERCENT}.parquet"
+    subjects_path = cache_dir / (
+        f"subjects-{source_key}-{vocab_key}-"
+        f"split_test{TEST_SPLIT_PERCENT}_validation{VALIDATION_SPLIT_PERCENT}.parquet"
+    )
     subjects = _cache_parquet(subjects_path, lambda: subjects)
     _publish(subjects_path, out_dir / "subjects.parquet")
     _WORK.finish_unit("build subject metadata", f"subjects={subjects.height:,}")

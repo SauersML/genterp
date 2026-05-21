@@ -10,12 +10,12 @@ from transformers.trainer_pt_utils import LengthGroupedSampler
 from genterp.runtime import TorchRuntime
 from genterp.train import (
     EVAL_STEPS,
-    GenterpForCausalLM,
-    GenterpHFConfig,
-    GenterpTrainer,
     LOGGING_STEPS,
     SAVE_STEPS,
     SAVE_TOTAL_LIMIT,
+    GenterpForCausalLM,
+    GenterpHFConfig,
+    GenterpTrainer,
     _limit_eval_worker,
     build_training_args,
     checkpoint_is_complete,
@@ -160,9 +160,9 @@ def test_training_args_use_wsd_and_cuda_gradient_checkpointing(tmp_path: Path):
     args = build_training_args(tmp_path, runtime)
 
     assert gradient_checkpointing_enabled(runtime)
-    from genterp.train import MAX_STEPS, WSD_DECAY_STEPS
+    from genterp.train import MAX_STEPS, WARMUP_STEPS, WSD_DECAY_STEPS
     assert args["lr_scheduler_type"] == "warmup_stable_decay"
-    assert args["warmup_steps"] == 500
+    assert args["warmup_steps"] == WARMUP_STEPS
     assert args["max_steps"] == MAX_STEPS
     assert args["lr_scheduler_kwargs"] == {
         "num_decay_steps": WSD_DECAY_STEPS,
@@ -212,7 +212,7 @@ def test_trainer_skips_incompatible_optimizer_and_scaler_state(tmp_path: Path, m
     trainer._load_scaler(str(tmp_path))
 
 
-def _tiny_genterp_model(n_atoms: int) -> GenterpForCausalLM:
+def _tiny_genterp_model(n_atoms: int, *, n_ancestor_rows: int = 0) -> GenterpForCausalLM:
     cfg_dict = {
         "n_atoms": n_atoms,
         "dim": 16,
@@ -222,65 +222,48 @@ def _tiny_genterp_model(n_atoms: int) -> GenterpForCausalLM:
         "k_static_summary": 2,
         "n_time_mix": 2,
         "time_phi_dim": 4,
+        "n_ancestor_rows": n_ancestor_rows,
     }
     return GenterpForCausalLM(GenterpHFConfig(genterp_cfg=cfg_dict))
 
 
-def test_load_state_dict_partial_prefix_copy_on_vocab_growth(capsys):
-    """Vocab-grown checkpoint loads into a larger model without raising; the
-    vocab-shaped params get a partial-prefix copy (existing atoms keep their
-    trained vectors, new atoms keep their fresh init) and the rest of the
-    weights copy in cleanly.
-
-    Critical for the death + demographics ETL change: those add new atoms to
-    the vocab, but the existing 27k atoms' trained embeddings must survive
-    the resume. The prior behavior dropped ALL embedding rows on any shape
-    mismatch — destroying every step of training. The partial-prefix path
-    preserves the prefix and only the new atoms reset.
-    """
-    n_old, n_new = 4, 10
+def test_load_state_dict_remaps_vocab_rows_by_atom_registry(capsys):
+    """Shared atoms load by canonical code even when numeric ids changed."""
+    n_old, n_new = 4, 5
     old = _tiny_genterp_model(n_atoms=n_old)
     new = _tiny_genterp_model(n_atoms=n_new)
+    old_registry = {"diabetes": 1, "ckd": 2, "copd": 3}
+    new_registry = {"ckd": 1, "diabetes": 2, "hf": 3, "copd": 4}
+    new.configure_atom_registry_remap(old_registry, new_registry)
 
     norm_key = "model.norm.weight"
     emb_key = "model.embed.embedding.weight"
     assert norm_key in new.state_dict() and emb_key in new.state_dict()
 
-    # Set known values so we can verify per-row preservation.
     with torch.no_grad():
         old.state_dict()[norm_key].fill_(0.42)
-        # Sentinel: row 0..n_old-1 set to row-index values so we can verify
-        # they survive the partial copy.
         for i in range(n_old):
             old.state_dict()[emb_key][i].fill_(float(i) + 1.0)
 
-    snapshot_new_tail = new.state_dict()[emb_key][n_old:].clone()
+    hf_row_before = new.state_dict()[emb_key][3].clone()
     result = new.load_state_dict(old.state_dict(), strict=True)
 
-    # Vocab prefix: copied from checkpoint.
-    for i in range(n_old):
-        assert torch.allclose(
-            new.state_dict()[emb_key][i],
-            torch.full_like(new.state_dict()[emb_key][i], float(i) + 1.0),
-        ), f"row {i} should have been copied from checkpoint"
-    # Vocab suffix (new atoms): kept their fresh init.
-    assert torch.equal(new.state_dict()[emb_key][n_old:], snapshot_new_tail)
-    # Shape-compatible param did load normally.
+    # PAD copies from PAD, then canonical codes move to their current ids.
+    assert torch.allclose(new.state_dict()[emb_key][0], torch.full_like(new.state_dict()[emb_key][0], 1.0))
+    assert torch.allclose(new.state_dict()[emb_key][1], torch.full_like(new.state_dict()[emb_key][1], 3.0))
+    assert torch.allclose(new.state_dict()[emb_key][2], torch.full_like(new.state_dict()[emb_key][2], 2.0))
+    assert torch.allclose(new.state_dict()[emb_key][4], torch.full_like(new.state_dict()[emb_key][4], 4.0))
+    assert torch.equal(new.state_dict()[emb_key][3], hf_row_before)
     assert torch.allclose(
         new.state_dict()[norm_key], torch.full_like(new.state_dict()[norm_key], 0.42)
     )
-    # The partial-prefix-copied key is in the filtered set passed to load,
-    # so it's NOT in missing_keys. (Only dimensionally-incompatible keys
-    # would be reported as missing.)
     assert emb_key not in set(result.missing_keys)
     captured = capsys.readouterr().out
     assert "[warm-start]" in captured
-    assert "prefix-copied" in captured
+    assert "registry-remapped" in captured
 
 
-def test_load_state_dict_partial_prefix_copy_on_vocab_shrink(capsys):
-    """Shrinking vocab (rare but possible if a CDR refresh removes concepts)
-    also takes the prefix-copy path: copy the first min(old, new) rows."""
+def test_load_state_dict_drops_vocab_shape_mismatch_without_registry(capsys):
     n_old, n_new = 10, 4
     old = _tiny_genterp_model(n_atoms=n_old)
     new = _tiny_genterp_model(n_atoms=n_new)
@@ -289,17 +272,13 @@ def test_load_state_dict_partial_prefix_copy_on_vocab_shrink(capsys):
     with torch.no_grad():
         for i in range(n_old):
             old.state_dict()[emb_key][i].fill_(float(i) + 1.0)
+    before = new.state_dict()[emb_key].clone()
 
     new.load_state_dict(old.state_dict(), strict=True)
 
-    # Only the first 4 rows are kept; row 4..9 are gone.
-    for i in range(n_new):
-        assert torch.allclose(
-            new.state_dict()[emb_key][i],
-            torch.full_like(new.state_dict()[emb_key][i], float(i) + 1.0),
-        )
+    assert torch.equal(new.state_dict()[emb_key], before)
     captured = capsys.readouterr().out
-    assert "prefix-copied" in captured
+    assert "dropped (no atom registry remap)" in captured
 
 
 def test_load_state_dict_preserves_strict_when_shapes_match(tmp_path: Path):
@@ -312,6 +291,39 @@ def test_load_state_dict_preserves_strict_when_shapes_match(tmp_path: Path):
     result = b.load_state_dict(a.state_dict(), strict=True)
     assert result.missing_keys == []
     assert result.unexpected_keys == []
+
+
+def test_ancestor_ids_persist_and_load_with_checkpoint_state():
+    model = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 0] = 2
+    ancestor_ids[2, 1] = 3
+    model.model.embed.set_ancestor_ids(ancestor_ids)
+
+    state = model.state_dict()
+    assert "model.embed.ancestor_ids" in state
+
+    loaded = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    loaded.load_state_dict(state, strict=True)
+
+    assert loaded.model.embed.has_ancestors()
+    assert torch.equal(loaded.model.embed.ancestor_ids.cpu(), ancestor_ids)
+
+
+def test_ancestor_ids_round_trip_through_save_pretrained(tmp_path: Path):
+    model = _tiny_genterp_model(n_atoms=8, n_ancestor_rows=3)
+    ancestor_ids = torch.zeros(8, 2, dtype=torch.long)
+    ancestor_ids[1, 0] = 1
+    ancestor_ids[2, 1] = 3
+    model.model.embed.set_ancestor_ids(ancestor_ids)
+
+    model.save_pretrained(tmp_path)
+    loaded = GenterpForCausalLM.from_pretrained(tmp_path)
+
+    assert loaded.config.genterp_cfg["n_ancestor_cols"] == 2
+    assert loaded.model.embed.has_ancestors()
+    assert torch.equal(loaded.model.embed.ancestor_ids.cpu(), ancestor_ids)
 
 
 def test_checkpoint_n_atoms_reads_config(tmp_path: Path):
@@ -346,6 +358,7 @@ def test_checkpoint_ancestor_rows_distinguishes_absent_from_unreadable(tmp_path:
     should be conservative.
     """
     from safetensors.torch import save_file
+
     from genterp.train import (
         _ANCESTOR_ROWS_ABSENT,
         _ANCESTOR_ROWS_UNREADABLE,

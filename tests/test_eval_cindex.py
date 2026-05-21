@@ -16,6 +16,7 @@ import numpy as np
 from genterp.eval_cindex import (
     DEFAULT_SWEEP_TOP_N,
     DiseasePhenotype,
+    LandmarkDataset,
     SubjectIndex,
     _build_outcome_table,
     build_cohort_condition_phenotypes,
@@ -27,6 +28,7 @@ def _write_etl_cache(
     concept_codes: list[list[object]],
     coverage: list[list[int]],
     ancestors: list[list[object]],
+    ohdsi_phenotypes: list[dict[str, object]] | None = None,
 ) -> None:
     """Build the minimum ETL cache layout that eval_cindex looks for."""
     cache_dir = etl_dir / "cache" / "fake-cdr"
@@ -34,6 +36,8 @@ def _write_etl_cache(
     (cache_dir / "concept_codes.json").write_text(json.dumps(concept_codes))
     payload = {"coverage": coverage, "ancestors": ancestors}
     (cache_dir / "coverage_and_ancestors-deadbeef.json").write_text(json.dumps(payload))
+    if ohdsi_phenotypes is not None:
+        (cache_dir / "ohdsi_disease_phenotypes.json").write_text(json.dumps(ohdsi_phenotypes))
 
 
 def test_build_cohort_condition_phenotypes_filters_and_ranks(tmp_path: Path):
@@ -58,7 +62,17 @@ def test_build_cohort_condition_phenotypes_filters_and_ranks(tmp_path: Path):
     # Empty ancestor closure — descendants_of will just have self-references
     # which is fine for this test (the function only needs concept_meta +
     # coverage to pick candidates).
-    _write_etl_cache(tmp_path, concept_codes, coverage, ancestors=[])
+    _write_etl_cache(
+        tmp_path,
+        concept_codes,
+        coverage,
+        ancestors=[],
+        ohdsi_phenotypes=[
+            {"concept_code": "SNOMED/A", "concept_name": "Disease A"},
+            {"concept_code": "SNOMED/B", "concept_name": "Disease B"},
+            {"concept_code": "SNOMED/C", "concept_name": "Disease C"},
+        ],
+    )
 
     phenotypes = build_cohort_condition_phenotypes(tmp_path, top_n=10)
 
@@ -75,7 +89,16 @@ def test_build_cohort_condition_phenotypes_applies_top_n_cap(tmp_path: Path):
         for cid in range(1, 101)
     ]
     coverage = [[cid, 100 - cid] for cid in range(1, 101)]
-    _write_etl_cache(tmp_path, concept_codes, coverage, ancestors=[])
+    _write_etl_cache(
+        tmp_path,
+        concept_codes,
+        coverage,
+        ancestors=[],
+        ohdsi_phenotypes=[
+            {"concept_code": f"SNOMED/{cid}", "concept_name": f"Disease {cid}"}
+            for cid in range(1, 101)
+        ],
+    )
 
     phenotypes = build_cohort_condition_phenotypes(tmp_path, top_n=5)
     assert len(phenotypes) == 5
@@ -113,8 +136,8 @@ class _SyntheticEventStore:
     construction quirks."""
 
     class _Col:
-        def __init__(self, data: list[int]):
-            self._data = np.asarray(data, dtype=np.int64)
+        def __init__(self, data: list[int] | list[float]):
+            self._data = np.asarray(data)
 
         def slice(self, offset: int, length: int) -> "_SyntheticEventStore._Sub":
             return _SyntheticEventStore._Sub(self._data[offset : offset + length])
@@ -126,9 +149,45 @@ class _SyntheticEventStore:
         def to_numpy(self) -> np.ndarray:
             return self._arr
 
-    def __init__(self, atoms: list[int], time_seconds: list[int]):
+    def __init__(
+        self,
+        atoms: list[int],
+        time_seconds: list[int],
+        values: list[float] | None = None,
+        roles: list[int] | None = None,
+    ):
         self.atom = self._Col(atoms)
         self.time_seconds = self._Col(time_seconds)
+        self.value = self._Col(values or [float("nan")] * len(atoms))
+        self.role = self._Col(roles or [0] * len(atoms))
+
+
+def test_landmark_dataset_uses_role_for_static_split():
+    subject = SubjectIndex(
+        subject_id=0,
+        start=0,
+        end=2,
+        birth_seconds=0.0,
+        censor_seconds=float(86400 * 100),
+        sex=0,
+        last_event_idx_local=2,
+        last_event_age_days=2.0,
+        first_event_age_days=0.0,
+        landmark_age_days=10.0,
+        gap_to_landmark_days=8.0,
+        censor_age_days=100.0,
+    )
+    events = _SyntheticEventStore(
+        atoms=[11, 22, 33],
+        time_seconds=[0, 86400, 2 * 86400],
+        roles=[0, 10, 0],
+    )
+
+    item = LandmarkDataset(events, [subject], max_events=16)[0]
+
+    assert item["static_atoms"] == [22]
+    assert item["event_atoms"] == [11, 33]
+    assert item["event_groups"].tolist() == [0, 1]
 
 
 def test_build_outcome_table_basic_phenotype_resolution():

@@ -23,6 +23,7 @@ from genterp.runtime import GIB, TorchRuntime, accelerator_label, configure_torc
 from genterp.train import (
     GenterpForCausalLM,
     atomic_write_json,
+    ensure_loaded_ancestors,
     final_model_path,
     tensor_core_padding_multiple,
 )
@@ -555,19 +556,30 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("load frozen Genterp model", f"path={model_dir}")
     model = GenterpForCausalLM.from_pretrained(model_dir).to(runtime.device)
+    ancestor_source = ensure_loaded_ancestors(model, data_dir)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
     base = unwrap_genterp_model(model)
     setup.finish_unit(
         "load frozen Genterp model",
-        f"layers={base.cfg.n_layers} dim={base.cfg.dim} params={count_parameters(model):,}",
+        f"layers={base.cfg.n_layers} dim={base.cfg.dim} params={count_parameters(model):,} "
+        f"ancestors={ancestor_source}",
     )
 
     setup.start_unit("build CLT datasets", f"data_dir={data_dir}")
     event_store = EventStore.from_parquet(data_dir / "events.parquet")
-    train_dataset = CohortDataset(data_dir, split="train", events=event_store)
-    eval_dataset = CohortDataset(data_dir, split="test", events=event_store)
+    train_dataset = CohortDataset(
+        data_dir,
+        split="train",
+        events=event_store,
+        window_policy="mixed",
+        mixed_tail_weight=0.35,
+        max_windows_per_subject=8,
+        same_time_shuffle=True,
+        event_drop_prob=0.02,
+    )
+    eval_dataset = CohortDataset(data_dir, split="validation", events=event_store, window_policy="last")
     setup.finish_unit("build CLT datasets", f"train={len(train_dataset):,} eval={len(eval_dataset):,}")
 
     subject_batch_size = runtime.per_device_train_batch_size

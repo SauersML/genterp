@@ -79,6 +79,33 @@ def _attn_mask_for_cache(valid_length: torch.Tensor, cache_T: int) -> torch.Tens
     return positions >= valid_length.view(-1, 1, 1, 1)
 
 
+def _insert_new_kv(
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    insert_pos: torch.Tensor,
+    advance_mask: torch.Tensor,
+    *,
+    grow_cache: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if grow_cache:
+        pad_shape = (*cache_k.shape[:2], 1, cache_k.shape[3])
+        cache_k = torch.cat([cache_k, cache_k.new_zeros(pad_shape)], dim=2)
+        cache_v = torch.cat([cache_v, cache_v.new_zeros(pad_shape)], dim=2)
+    else:
+        cache_k = cache_k.clone()
+        cache_v = cache_v.clone()
+
+    rows = torch.arange(cache_k.shape[0], device=cache_k.device)[advance_mask]
+    if rows.numel() == 0:
+        return cache_k, cache_v
+    cols = insert_pos[advance_mask]
+    cache_k[rows, :, cols, :] = k_new[advance_mask, :, 0, :]
+    cache_v[rows, :, cols, :] = v_new[advance_mask, :, 0, :]
+    return cache_k, cache_v
+
+
 @torch.no_grad()
 def decode_init(model: Genterp, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, DecodeCache]:
     """Run the full prefix through the model and build a KV cache.
@@ -130,9 +157,9 @@ def decode_init(model: Genterp, batch: dict[str, torch.Tensor]) -> tuple[torch.T
             q, k, v, K, event_pad, event_lengths_list
         )
         attn_out = blk.attn._project_out(attn_out)
-        x = x + attn_out
+        x = x + blk.res_scale * attn_out
         mlp_out = blk.mlp(blk.norm2(x))
-        x = x + mlp_out
+        x = x + blk.res_scale * mlp_out
         # Cache rotated K, V in SDPA-friendly (B, H, S, D) layout. The whole
         # static_len + event tensor goes in; per-row validity is tracked via
         # cache.valid_length so short-prefix rows don't pollute attention.
@@ -156,13 +183,17 @@ def _block_decode_step(
     angles: torch.Tensor,
     cache_k: torch.Tensor,
     cache_v: torch.Tensor,
+    insert_pos: torch.Tensor,
+    advance_mask: torch.Tensor,
     attn_mask: torch.Tensor,
+    grow_cache: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-token block forward with KV cache. Returns (out, new_k, new_v).
 
     ``x`` is (B, 1, dim); ``angles`` is (B, 1, head_dim/2) for the new token
-    only. ``cache_k/cache_v`` are (B, H, T_prev, D); the function appends the
-    new token's rotated K/V to produce the updated cache.
+    only. ``cache_k/cache_v`` are (B, H, T_prev, D); the function writes the
+    new token's rotated K/V into each row's first invalid slot, growing the
+    cache only when at least one row has no free slot left.
 
     Attention is plain SDPA — no flash-attn varlen — because for a single
     query the kernel choice doesn't matter and SDPA's ``attn_mask`` cleanly
@@ -174,17 +205,24 @@ def _block_decode_step(
     q_t = q.transpose(1, 2)
     k_new = k.transpose(1, 2)
     v_new = v.transpose(1, 2)
-    new_k_cache = torch.cat([cache_k, k_new], dim=2)
-    new_v_cache = torch.cat([cache_v, v_new], dim=2)
+    new_k_cache, new_v_cache = _insert_new_kv(
+        cache_k,
+        cache_v,
+        k_new,
+        v_new,
+        insert_pos,
+        advance_mask,
+        grow_cache=grow_cache,
+    )
     attn = F.scaled_dot_product_attention(q_t, new_k_cache, new_v_cache, attn_mask=~attn_mask)
     # ~attn_mask: SDPA's bool attn_mask treats True as "keep"; our DecodeCache
     # mask is True for "drop". Invert here so the rest of the code reads in
     # "True == invalid" terms.
     # (B, H, 1, D) -> (B, 1, H, D)
     out = blk.attn._project_out(attn.transpose(1, 2))
-    x = x + out
+    x = x + blk.res_scale * out
     mlp_out = blk.mlp(blk.norm2(x))
-    return x + mlp_out, new_k_cache, new_v_cache
+    return x + blk.res_scale * mlp_out, new_k_cache, new_v_cache
 
 
 @torch.no_grad()
@@ -236,18 +274,27 @@ def decode_step(
     is_static_new = torch.zeros(B, 1, dtype=torch.bool, device=device)
     angles = model.rope.angles(new_age_days.unsqueeze(1), is_static_new)
 
-    # Compute attention mask BEFORE appending. ``cached_length`` is the
-    # current cache size; after this step it becomes cached_length + 1. For
-    # alive chains, the new position (index cached_length) is valid; for
-    # finished chains it's not. Build the post-append mask now so we don't
-    # have to redo it inside the per-block loop.
-    post_append_T = cache.cached_length + 1
+    # New K/V land in each row's first invalid slot. Short rows reuse their
+    # existing pad slots; the cache grows only when an alive row is already at
+    # the global end.
+    cached_T = cache.cached_length
+    grow_cache = bool((advance_mask & (cache.valid_length >= cached_T)).any().item())
+    post_append_T = cached_T + int(grow_cache)
+    insert_pos = cache.valid_length.clamp(max=post_append_T - 1)
     post_valid_length = cache.valid_length + advance_mask.to(cache.valid_length.dtype)
     attn_mask = _attn_mask_for_cache(post_valid_length, post_append_T)
 
     for layer_idx, blk in enumerate(model.blocks):
         x, new_k, new_v = _block_decode_step(
-            blk, x, angles, cache.k[layer_idx], cache.v[layer_idx], attn_mask
+            blk,
+            x,
+            angles,
+            cache.k[layer_idx],
+            cache.v[layer_idx],
+            insert_pos,
+            advance_mask,
+            attn_mask,
+            grow_cache,
         )
         cache.k[layer_idx] = new_k
         cache.v[layer_idx] = new_v

@@ -57,10 +57,10 @@ import torch
 from sksurv.metrics import concordance_index_censored
 from torch.utils.data import DataLoader, Dataset
 
-from genterp.data import AtomVocab, EventStore, PAD_ATOM, collate
+from genterp.data import PAD_ATOM, STATIC_ROLES, AtomVocab, EventStore, _derive_event_groups, collate
 from genterp.modeling import _log_ndtr
 from genterp.progress import ProgressLogger
-from genterp.runtime import configure_torch_runtime, accelerator_label
+from genterp.runtime import accelerator_label, configure_torch_runtime
 from genterp.train import GenterpForCausalLM, ensure_loaded_ancestors, final_model_path
 
 
@@ -133,16 +133,16 @@ class SubjectIndex:
     censor_age_days: float
 
 
-def _build_subject_index(events: EventStore, etl_dir: Path) -> list[SubjectIndex]:
+def _build_subject_index(events: EventStore, etl_dir: Path, *, split: str = "test") -> list[SubjectIndex]:
     rows = pq.read_table(etl_dir / "subjects.parquet").to_pylist()
-    test = [r for r in rows if r.get("split") == "test"]
+    split_rows = [r for r in rows if r.get("split") == split]
     eligible: list[SubjectIndex] = []
     skipped_no_history = 0
     skipped_short_history = 0
     skipped_short_followup = 0
     skipped_stale_gap = 0
     skipped_no_window = 0
-    for r in test:
+    for r in split_rows:
         start, end = int(r["start"]), int(r["end"])
         birth_seconds = float(r["birth_seconds"])
         censor_seconds = float(r["censor_seconds"])
@@ -202,7 +202,7 @@ def _build_subject_index(events: EventStore, etl_dir: Path) -> list[SubjectIndex
             censor_age_days=float(censor_age),
         ))
     print(
-        f"[eval_cindex] cohort: test_total={len(test):,}  eligible={len(eligible):,}  "
+        f"[eval_cindex] cohort: split={split} total={len(split_rows):,}  eligible={len(eligible):,}  "
         f"skipped_no_history={skipped_no_history:,}  "
         f"skipped_short_history<{MIN_PRE_LANDMARK_HISTORY_DAYS/30:.0f}mo={skipped_short_history:,}  "
         f"skipped_short_followup<{MIN_FOLLOWUP_DAYS/365.25:.1f}y={skipped_short_followup:,}  "
@@ -238,18 +238,23 @@ class LandmarkDataset(Dataset):
         atoms = self.events.atom.slice(s.start, n_rows).to_numpy()
         times = self.events.time_seconds.slice(s.start, n_rows).to_numpy()
         values = self.events.value.slice(s.start, n_rows).to_numpy()
+        roles = self.events.role.slice(s.start, n_rows).to_numpy()
         delta_days = (times - s.birth_seconds) / 86400.0
         real_atom = atoms != PAD_ATOM
-        static_mask = (delta_days <= 0.5) & real_atom
-        event_mask = (delta_days > 0.5) & real_atom & (delta_days < s.landmark_age_days)
+        is_static = np.isin(roles, list(STATIC_ROLES))
+        static_mask = is_static & real_atom
+        event_mask = (~is_static) & real_atom & (delta_days >= 0.0) & (delta_days < s.landmark_age_days)
         event_idx_local = np.where(event_mask)[0][-self.max_events:]
+        event_times = times[event_idx_local]
         return {
             "sex": s.sex,
             "static_atoms": atoms[static_mask].astype(np.int64).tolist(),
             "event_atoms": atoms[event_idx_local].astype(np.int64).tolist(),
             "event_ages": delta_days[event_idx_local].astype(np.float32),
             "event_values": values[event_idx_local].astype(np.float32),
+            "event_groups": _derive_event_groups(event_times).astype(np.int32, copy=False),
             "censor_age_days": float(s.censor_age_days),
+            "landmark_age_days": float(s.landmark_age_days),
             "length": int(event_idx_local.size),
         }
 
@@ -387,7 +392,7 @@ def build_cohort_condition_phenotypes(
     if pl_path is None or not pl_path.exists():
         print(
             f"  [sweep] OHDSI disease phenotype list missing "
-            f"({pl_path}); re-run scripts/aou_etl.py to build it."
+            f"({pl_path}); re-run aou_etl (scripts/aou_etl.py) to build it."
         )
         return []
 
@@ -425,7 +430,7 @@ def build_cohort_condition_phenotypes(
         print(f"    ... {len(selected) - 10} more")
 
     phenotypes: list[DiseasePhenotype] = []
-    for cid, code, entry in selected:
+    for _cid, code, entry in selected:
         name = str(entry.get("concept_name") or code)
         phenotypes.append(DiseasePhenotype(
             name=name,
@@ -825,13 +830,14 @@ def prepare_cindex_cohort(
     phenotypes: list[DiseasePhenotype],
     max_subjects: int | None = None,
     subsample_seed: int = 0,
+    split: str = "test",
 ) -> CindexCohort:
     """Build the eval cohort, outcome table, and disease atom membership.
 
     ``phenotypes`` is required — typically from
     :func:`build_cohort_condition_phenotypes` (OHDSI Condition sweep).
 
-    ``max_subjects`` caps the eligible test cohort to a deterministic random
+    ``max_subjects`` caps the eligible cohort to a deterministic random
     subsample. The in-loop training eval passes a small cap (~2048) so each
     eval pass finishes in seconds instead of the ~30+ minutes a full 30k+
     subject scan would take. Standalone CLI evals leave it at None to score
@@ -839,7 +845,7 @@ def prepare_cindex_cohort(
     """
     if events is None:
         events = EventStore.from_parquet(etl_dir / "events.parquet")
-    subjects = _build_subject_index(events, etl_dir)
+    subjects = _build_subject_index(events, etl_dir, split=split)
     if max_subjects is not None and max_subjects > 0 and len(subjects) > max_subjects:
         order = np.random.default_rng(subsample_seed).permutation(len(subjects))[:max_subjects]
         subjects = [subjects[int(i)] for i in order]
@@ -851,7 +857,7 @@ def prepare_cindex_cohort(
         vocab, etl_dir, phenotypes=phenotypes, verbose=False,
     )
     if not subjects:
-        raise SystemExit("no eligible test subjects after filters")
+        raise SystemExit(f"no eligible {split} subjects after filters")
     if not resolved:
         raise SystemExit("no disease phenotypes resolved (no SNOMED descendants in cohort)")
 

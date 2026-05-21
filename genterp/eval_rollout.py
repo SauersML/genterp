@@ -67,7 +67,7 @@ from genterp.eval_cindex import (
 )
 from genterp.progress import ProgressLogger
 from genterp.runtime import accelerator_label, configure_torch_runtime
-from genterp.train import GenterpForCausalLM, final_model_path
+from genterp.train import GenterpForCausalLM, ensure_loaded_ancestors, final_model_path
 
 # Rollout cost knobs — set as module constants so the CLI stays flag-free.
 # n_chains × subject_batch is the effective batch size for decode forwards;
@@ -113,6 +113,7 @@ def _expand_to_chains(batch: dict, n_chains: int, device: torch.device) -> dict:
         "event_pad": rep(batch["event_pad"]),
         "censor_age": rep(batch["censor_age"].float()),
         "length": rep(batch["length"]).to(torch.long),
+        "landmark_age": rep(batch["landmark_age"].float()),
     }
 
 
@@ -161,9 +162,10 @@ def _rollout_subject_batch(
     expanded = _expand_to_chains(batch, n_chains, device)
     BC = B * n_chains
 
-    landmark_age = expanded["event_ages"].gather(
+    last_event_age = expanded["event_ages"].gather(
         1, (expanded["length"].clamp(min=1) - 1).unsqueeze(1)
     ).squeeze(1)
+    landmark_age = expanded["landmark_age"]
     # Sort horizon offsets so the LAST one is the rollout limit and earlier
     # ones are intermediate snapshots. Use the original index order to
     # restore the caller's horizon order in the returned tensor.
@@ -178,7 +180,7 @@ def _rollout_subject_batch(
 
     disease_hit = torch.zeros(n_horizons, BC, n_diseases, dtype=torch.bool, device=device)
     finished = torch.zeros(BC, dtype=torch.bool, device=device)
-    current_age = landmark_age.clone()
+    current_age = last_event_age.clone()
 
     use_autocast = autocast_dtype is not None and device.type == "cuda"
     ac_ctx = (
@@ -200,9 +202,14 @@ def _rollout_subject_batch(
         # Mask for "in the longest-horizon window" — chains past this stop.
         in_max_horizon = alive & (new_age <= max_horizon_age)
 
+        after_landmark = new_age >= landmark_age
         # Per-horizon "this event lands inside this snapshot's window."
         # (n_horizons, BC): bool. Vectorized — no Python loop over horizons.
-        in_horizon_h = in_max_horizon.unsqueeze(0) & (new_age.unsqueeze(0) <= horizon_ages)
+        in_horizon_h = (
+            in_max_horizon.unsqueeze(0)
+            & after_landmark.unsqueeze(0)
+            & (new_age.unsqueeze(0) <= horizon_ages)
+        )
 
         # Per-event disease membership.
         # mark may carry junk values for dead chains but we mask them out via
@@ -270,6 +277,7 @@ def score_rollout_risks(
             subject_order = np.arange(n_subjects_total)
 
         from torch.utils.data import DataLoader, Subset
+
         from genterp.data import collate
         scored_loader = DataLoader(
             Subset(cohort.dataset, subject_order.tolist()),
@@ -428,9 +436,13 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("load frozen model", f"path={final}")
     model = GenterpForCausalLM.from_pretrained(final).to(device).eval()
+    ancestor_source = ensure_loaded_ancestors(model, etl_dir)
     for p in model.parameters():
         p.requires_grad_(False)
-    setup.finish_unit("load frozen model", f"params={sum(p.numel() for p in model.parameters()):,}")
+    setup.finish_unit(
+        "load frozen model",
+        f"params={sum(p.numel() for p in model.parameters()):,} ancestors={ancestor_source}",
+    )
 
     setup.start_unit("load vocab", f"vocab={etl_dir / 'vocab.json'}")
     vocab = AtomVocab(dict(json.loads((etl_dir / "vocab.json").read_text())))

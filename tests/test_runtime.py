@@ -54,6 +54,34 @@ def test_cuda_runtime_uses_all_homogeneous_bf16_devices(monkeypatch):
     assert "strategy=data_parallel" in accelerator_label(runtime)
 
 
+def test_cuda_runtime_respects_accelerate_local_rank(monkeypatch):
+    set_devices = []
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", set_devices.append)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda index: SimpleNamespace(
+            total_memory=64 * GIB,
+            name=f"accelerator-{index}",
+            major=8,
+            minor=0,
+            multi_processor_count=80,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+
+    runtime = get_torch_runtime()
+
+    assert runtime.device == torch.device("cuda", 2)
+    assert not runtime.use_data_parallel
+    assert set_devices == [2]
+    assert "strategy=ddp" in accelerator_label(runtime)
+
+
 def test_cuda_runtime_uses_fp16_without_unsupported_newer_cuda_features(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
