@@ -340,11 +340,56 @@ class GenterpForCausalLM(transformers.PreTrainedModel):
             print(f"[warm-start] handled {len(actions)} shape-mismatched param(s): {preview}")
             if self._atom_id_remap_summary:
                 print(f"[warm-start] atom registry remap: {self._atom_id_remap_summary}")
-        return super().load_state_dict(
+        load_result = super().load_state_dict(
             filtered,
             strict=False if actions else strict,
             assign=assign,
         )
+        # Post-load parameter sanity: scan all parameters and buffers for
+        # NaN/Inf entries. A previously-trained checkpoint that hit Adam
+        # instability (large grad spike → catastrophic update) may have
+        # NaN entries in specific weight rows even when the sum/mean of
+        # the whole tensor looks finite (NaN entries contaminate a few
+        # rows; the surrounding healthy rows hide them under
+        # ``param.sum()`` because NaN propagates only when those specific
+        # rows are read). Forward then produces NaN whenever an input
+        # routes through a contaminated weight row — exactly the symptom
+        # we have (training loss finite because grad masking keeps most
+        # backward steps clean, but eval forward hits the contaminated
+        # rows and produces NaN h_last).
+        #
+        # Sanitize in place: replace NaN/Inf with 0. Mark embedding rows
+        # that get zeroed for future debugging. Better to lose a few
+        # contaminated rows than to keep poisoning every forward.
+        bad_param_count = 0
+        bad_param_names: list[str] = []
+        with torch.no_grad():
+            for name, p in self.named_parameters():
+                bad = torch.isnan(p).any() | torch.isinf(p).any()
+                if bool(bad):
+                    n_bad_entries = int((torch.isnan(p) | torch.isinf(p)).sum().item())
+                    p.data = torch.nan_to_num(p.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    bad_param_count += n_bad_entries
+                    bad_param_names.append(f"{name}({n_bad_entries})")
+            for name, b in self.named_buffers():
+                if not torch.is_floating_point(b):
+                    continue
+                bad = torch.isnan(b).any() | torch.isinf(b).any()
+                if bool(bad):
+                    n_bad_entries = int((torch.isnan(b) | torch.isinf(b)).sum().item())
+                    b.data = torch.nan_to_num(b.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    bad_param_count += n_bad_entries
+                    bad_param_names.append(f"{name}(buffer:{n_bad_entries})")
+        if bad_param_count > 0:
+            preview = ", ".join(bad_param_names[:8])
+            if len(bad_param_names) > 8:
+                preview += f", +{len(bad_param_names) - 8} more"
+            print(
+                f"[load_state_dict] sanitized {bad_param_count:,} NaN/Inf entries across "
+                f"{len(bad_param_names)} tensors: {preview}",
+                flush=True,
+            )
+        return load_result
 
 
 class RuntimeStateCallback(transformers.TrainerCallback):
