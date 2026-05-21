@@ -929,21 +929,22 @@ class Genterp(nn.Module):
         K = self.cfg.k_static_summary
         device = event_ages.device
 
-        # Per-layer NaN guards. When training destabilizes (e.g., a value-head
-        # blow-up under the Student-t NLL × clipped z_target × extreme mu has
-        # been observed pushing log_sigma to a clamp boundary and producing
-        # gradient spikes large enough that Adam takes a catastrophic step,
-        # leaving some weight rows in a degenerate state), specific input
-        # combinations trigger NaN in one of the intermediate tensors. The
-        # NaN then propagates through every downstream layer and the eval
-        # comes out uniformly NaN → 0.5 C-index. Guards replace NaN/Inf with
-        # 0.0 at each stage and, only when in eval mode, log the first layer
-        # to fire so we know the source instead of guessing.
+        # Per-layer NaN guards. Active in BOTH train and eval — the cost of
+        # a per-layer ``torch.isnan(t).any()`` test is negligible vs the
+        # attention compute, and we have evidence the model is producing
+        # NaN in eval forward while training still reports finite loss
+        # (gradient checkpointing forward + dropout-off difference is the
+        # only delta, and dropout is 0 anyway, so the NaN source must be
+        # input-dependent — likely a specific subject combination in the
+        # validation cohort that the train cohort never hits). Replace
+        # NaN/Inf with zeros at every stage so a single bad layer can't
+        # poison the whole forward, and log the first layer to fire (once
+        # per forward, both modes) so the next eval pinpoints the source.
         nan_layers: list[str] = []
         def _guard(t: torch.Tensor, label: str) -> torch.Tensor:
-            if torch.isnan(t).any() or torch.isinf(t).any():
-                if not self.training:
-                    nan_layers.append(label)
+            bad = torch.isnan(t).any() | torch.isinf(t).any()
+            if bool(bad):
+                nan_layers.append(label)
                 return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
             return t
 
@@ -974,17 +975,20 @@ class Genterp(nn.Module):
                 mlp_outs.append(mlp_out[:, K:])
 
         hidden = _guard(self.norm(x[:, K:]), "norm")
-        if not self.training and nan_layers:
-            # First layer to fire is the root cause; the rest are downstream
-            # propagation (or the inputs already had NaN by the time the
-            # block ran). Print once per forward.
+        # Final hard guarantee that h_last consumers (eval_cindex, loss
+        # heads) never see NaN. Cheap in absolute terms; nothing else in
+        # the forward path can produce NaN after this line.
+        hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+        if nan_layers:
+            mode = "eval" if not self.training else "train"
             first = nan_layers[0]
             rest = len(nan_layers) - 1
             print(
-                f"[genterp-forward] NaN detected — first_layer={first} "
+                f"[genterp-forward] NaN detected ({mode}) — first_layer={first} "
                 f"downstream_layers_also_hit={rest} B={B} T={T} "
                 f"event_ages.max={float(event_ages.max().item()) if event_ages.numel() else 0.0:.3g} "
-                f"event_values.absmax={float(event_values.abs().max().item()) if event_values.numel() else 0.0:.3g}"
+                f"event_values.absmax={float(event_values.abs().max().item()) if event_values.numel() else 0.0:.3g}",
+                flush=True,
             )
         out: dict[str, torch.Tensor] = {"hidden": hidden}
         if return_transcoder_acts:
