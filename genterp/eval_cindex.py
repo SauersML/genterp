@@ -61,7 +61,7 @@ from genterp.data import AtomVocab, EventStore, PAD_ATOM, collate
 from genterp.modeling import _log_ndtr
 from genterp.progress import ProgressLogger
 from genterp.runtime import configure_torch_runtime, accelerator_label
-from genterp.train import GenterpForCausalLM, final_model_path
+from genterp.train import GenterpForCausalLM, ensure_loaded_ancestors, final_model_path
 
 
 @dataclass(frozen=True)
@@ -992,11 +992,37 @@ def run_cindex(
     """
     was_training = model.training
     model.eval()
+    # Diagnostic: fingerprint a few key parameters + first-batch outputs so we
+    # can tell, when two consecutive evals come back bit-identical, whether
+    # the cause is (a) frozen params, (b) frozen forward outputs, or (c)
+    # frozen risk scores. If embed_sum changes but h_last_sum doesn't, the
+    # transformer is somehow not seeing the updated embed. If h_last_sum
+    # changes but risk_sum doesn't, _compute_disease_risks is caching.
+    with torch.no_grad():
+        inner = model.model if hasattr(model, "model") else model
+        embed_sum = float(inner.embed.embedding.weight.detach().float().sum().item())
+        if hasattr(inner.embed, "ancestor_embedding"):
+            anc_sum = float(inner.embed.ancestor_embedding.weight.detach().float().sum().item())
+        else:
+            anc_sum = 0.0
+        tpp_proj_sum = float(inner.tpp.time_proj.weight.detach().float().sum().item())
+        print(
+            f"[cindex-debug] param fingerprint: "
+            f"embed.sum={embed_sum:.6e} anc.sum={anc_sum:.6e} tpp.time_proj.sum={tpp_proj_sum:.6e} "
+            f"training_mode={was_training}"
+        )
     try:
         all_risks = _score_risks(model, cohort, device, autocast_dtype, progress_every)
     finally:
         if was_training:
             model.train()
+    # Fingerprint the resulting risks too — these are what the C-index sees.
+    print(
+        f"[cindex-debug] risk fingerprint: "
+        f"all_risks.sum={float(all_risks.sum()):.6e} "
+        f"all_risks[0,0]={float(all_risks[0, 0]):.6e} "
+        f"all_risks[-1,-1]={float(all_risks[-1, -1]):.6e}"
+    )
 
     rng = np.random.default_rng(rng_seed)
     results: dict[str, dict[str, object]] = {}
@@ -1062,9 +1088,13 @@ def main(argv: list[str] | None = None) -> None:
 
     setup.start_unit("load frozen model", f"path={final}")
     model = GenterpForCausalLM.from_pretrained(final).to(device).eval()
+    ancestor_source = ensure_loaded_ancestors(model, etl_dir)
     for p in model.parameters():
         p.requires_grad_(False)
-    setup.finish_unit("load frozen model", f"params={sum(p.numel() for p in model.parameters()):,}")
+    setup.finish_unit(
+        "load frozen model",
+        f"params={sum(p.numel() for p in model.parameters()):,} ancestors={ancestor_source}",
+    )
 
     setup.start_unit("load vocab", f"vocab={etl_dir / 'vocab.json'}")
     vocab = AtomVocab(dict(json.loads((etl_dir / "vocab.json").read_text())))
