@@ -2,6 +2,8 @@
 name = "genterp"
 version = "0.0.1"
 description = "Clinical foundation model trained on All of Us OMOP."
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11,<3.14"
 # AoU's workspace ships Python 3.14, but no released PyTorch has cp314 wheels
 # yet (2.5.x: cp311-cp313; 2.7.x: cp310-cp313). With this bound uv installs a
